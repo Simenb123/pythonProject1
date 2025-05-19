@@ -1,0 +1,19 @@
+# PyCharm
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# Bygg/utdata
+dist/
+build/
+*.parquet
+*.xlsx
+*.csv
+
+# Virtuelle miljøer
+.venv/
+env/

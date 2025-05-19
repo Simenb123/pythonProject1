@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""
+lov2excel.py – Hent lov fra lovdata.no og lagre som Excel
+
+Bruk:
+    python lov2excel.py --law-id LOV-2020-11-20-128 --out revisorloven.xlsx
+"""
+
+import argparse
+import re
+from pathlib import Path
+
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+
+# ---------- 1. Last ned HTML for én lov ----------
+def fetch_law_html(law_id: str) -> str:
+    """
+    law_id  = LOV-YYYY-MM-DD-nr
+    Lovdata bruker samme ID, bare uten 'LOV-' foran i URL-en.
+    """
+    url = f"https://lovdata.no/nav/lov/{law_id[4:].lower()}"
+    headers = {
+        "User-Agent": "lov2excel (github.com/<din-bruker>) – kontakt ved behov"
+    }
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.text
+
+
+# ---------- 2. Parse HTML til DataFrame ----------
+def parse_law(html: str, law_id: str) -> pd.DataFrame:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Tittel – finnes både som <title> og i hoved-H1
+    title_el = soup.find("h1") or soup.find("title")
+    law_title = re.sub(r"\s+", " ", title_el.get_text(strip=True))
+
+    rows = []
+    current_chapter = ""
+
+    # Lovdatas HTML er (som regel) <h2> = kapittel, <section> = paragraf
+    for el in soup.select("h2, section"):
+        if el.name == "h2":
+            # Kapitteloverskriften starter som regel med "Kapittel"
+            current_chapter = re.sub(r"\s+", " ", el.get_text(strip=True))
+            continue
+
+        # Nå er vi i et <section> (= én paragraf)
+        section_id = el.get("id", "")
+        if not section_id.startswith("§"):
+            continue
+
+        heading_el = el.find("h3")
+        heading = heading_el.get_text(strip=True) if heading_el else ""
+
+        # Brødtekst for paragrafen (kun direkte <p>, så vi unngår under-elementer)
+        text_parts = [p.get_text(" ", strip=True) for p in el.find_all("p", recursive=False)]
+        text = " ".join(text_parts)
+
+        rows.append(
+            {
+                "law_id": law_id,
+                "law_title": law_title,
+                "chapter": current_chapter,
+                "section": section_id,  # f.eks. § 1-1
+                "heading": heading,
+                "text": text,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ---------- 3. CLI / main ----------
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Hent lovtekst fra Lovdata og lagre som Excel")
+    ap.add_argument(
+        "--law-id",
+        required=True,
+        help="LOV-id (f.eks. LOV-2020-11-20-128 for revisorloven)",
+    )
+    ap.add_argument(
+        "--out",
+        default="lov.xlsx",
+        help="Filnavn på Excel-filen som skrives (default: lov.xlsx)",
+    )
+    args = ap.parse_args()
+
+    html = fetch_law_html(args.law_id)
+    df = parse_law(html, args.law_id)
+
+    out_path = Path(args.out)
+    df.to_excel(out_path, index=False)
+    print(f"✅ Skrev {len(df):,} paragrafer til {out_path.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
