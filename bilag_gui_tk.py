@@ -115,20 +115,32 @@ class App(tk.Tk):
         ttk.Button(self,text="Trekk utvalg",command=self._run)\
             .grid(row=5,column=2,pady=6)
 
+        # start periodic update of hit statistics
+        self.after(300, self._hits)
+
     # live-counter
     def _save_refs(self, df, m):
         self._k=pd.to_numeric(df[m["konto"]], errors="coerce")
         self._b=pd.to_numeric(df[m["beløp"]]
                               .astype(str).str.replace(r"[^0-9,.-]","",regex=True)
                               .str.replace(",","."), errors="coerce")
-    def _hits(self,*_):
-        if not hasattr(self,'_k'): return
+    def _hits(self, *_):
+        if not hasattr(self, '_k'):
+            self.after(300, self._hits)
+            return
         try:
-            lo_k,hi_k=int(self.k_lo.get()),int(self.k_hi.get())
-            lo_b,hi_b=float(self.b_lo.get()),float(self.b_hi.get())
-            self.hit.set(f"Linjer som treffer: "
-                         f"{((self._k.between(lo_k,hi_k))&(self._b.between(lo_b,hi_b))).sum()}")
-        except ValueError: self.hit.set(" ")
+            lo_k, hi_k = int(self.k_lo.get()), int(self.k_hi.get())
+            lo_b, hi_b = float(self.b_lo.get()), float(self.b_hi.get())
+            mask = self._k.between(lo_k, hi_k) & self._b.between(lo_b, hi_b)
+            cnt = mask.sum()
+            tot = self._b[mask].sum()
+            avg = tot / cnt if cnt else 0
+            self.hit.set(
+                f"Linjer: {cnt}   Sum: {tot:,.0f} kr   Snitt: {avg:,.0f} kr".replace(',', ' ')
+            )
+        except ValueError:
+            self.hit.set(" ")
+        self.after(300, self._hits)
 
     # ----------------------------------------------------------------------
     def _run(self):
