@@ -1,0 +1,10 @@
+pandas
+openpyxl
+chardet
+pyarrow
+numpy
+matplotlib
+lxml
+tqdm
+pywin32
+requests
