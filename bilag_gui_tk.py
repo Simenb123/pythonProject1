@@ -116,6 +116,7 @@ class App(tk.Tk):
             .grid(row=5,column=2,pady=6)
 
         # start periodic update of hit statistics
+        self.hits_job = None
         self.after(300, self._hits)
 
     # live-counter
@@ -126,7 +127,6 @@ class App(tk.Tk):
                               .str.replace(",","."), errors="coerce")
     def _hits(self, *_):
         if not hasattr(self, '_k'):
-            self.after(300, self._hits)
             return
         try:
             lo_k, hi_k = int(self.k_lo.get()), int(self.k_hi.get())
@@ -140,7 +140,12 @@ class App(tk.Tk):
             )
         except ValueError:
             self.hit.set(" ")
-        self.after(300, self._hits)
+        if self.hits_job is not None:
+            try:
+                self.after_cancel(self.hits_job)
+            except Exception:
+                pass
+        self.hits_job = self.after(300, self._hits)
 
     # ----------------------------------------------------------------------
     def _run(self):
