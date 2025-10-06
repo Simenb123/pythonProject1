@@ -83,17 +83,19 @@ def read_regnskapslinjer(path: Path) -> pd.DataFrame:
 
 
 # ------------- Mapping standard kontoplan.xlsx (Intervall) -------------
-def _try_read_intervall(path: Path, *, sheet_hint: str = "Intervall") -> pd.DataFrame:
+def _try_read_intervall(path: Path, *, sheet_hint: str = "Intervall") -> tuple[pd.DataFrame, str]:
+    """Returner (DataFrame, sheet_name) for intervall-arket."""
     # 1) prøv med eksplisitt "Intervall"
     try:
-        return pd.read_excel(path, engine="openpyxl", sheet_name=sheet_hint, header=0)
+        df = pd.read_excel(path, engine="openpyxl", sheet_name=sheet_hint, header=0)
+        return df, sheet_hint
     except Exception:
         pass
     # 2) prøv å finne et ark som *inneholder* "inter" i navnet
     try:
         x = pd.ExcelFile(path, engine="openpyxl")
         cand = next((s for s in x.sheet_names if "inter" in s.lower()), x.sheet_names[0])
-        return x.parse(cand, header=0)
+        return x.parse(cand, header=0), cand
     except Exception as exc:
         raise RuntimeError(f"Kunne ikke lese Intervall-ark i {path.name}: {type(exc).__name__}: {exc}")
 
@@ -104,12 +106,14 @@ def read_konto_intervaller(path: Path) -> pd.DataFrame:
     """
     # prøv flere header-rader (0..3)
     df_raw = None
+    sheet_name = "Intervall"
     last_exc: Exception | None = None
     for hdr in (0, 1, 2, 3):
         try:
-            df_raw = _try_read_intervall(Path(path))
+            if hdr == 0 or df_raw is None:
+                df_raw, sheet_name = _try_read_intervall(Path(path))
             if hdr != 0:
-                df_raw = pd.read_excel(Path(path), engine="openpyxl", sheet_name="Intervall", header=hdr)
+                df_raw = pd.read_excel(Path(path), engine="openpyxl", sheet_name=sheet_name, header=hdr)
             # fant vi nødvendige kolonner?
             c_lo  = _first_of(df_raw.columns, "fra", "lo", "konto fra", "konto fra nr", "start")
             c_hi  = _first_of(df_raw.columns, "til", "hi", "konto til", "konto til nr", "slutt", "stop")
