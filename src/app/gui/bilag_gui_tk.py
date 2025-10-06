@@ -51,6 +51,15 @@ def _import_all():
  year_paths,
  DataTable) = _import_all()
 
+# --- regnskapslinjer (valgbar) ---
+try:
+    from app.services.regnskapslinjer import try_map_saldobalanse_to_regnskapslinjer
+except Exception:
+    try:
+        from services.regnskapslinjer import try_map_saldobalanse_to_regnskapslinjer  # type: ignore
+    except Exception:
+        try_map_saldobalanse_to_regnskapslinjer = None  # type: ignore
+
 # -------------------------------------------------------------
 # Hjelpere
 # -------------------------------------------------------------
@@ -215,9 +224,11 @@ class App(tk.Tk):
         ttk.Button(top, text="Søk", command=self._apply_search).pack(side="left", padx=(0,6))
         ttk.Button(top, text="Tøm", command=self._reset_view).pack(side="left", padx=(0,12))
 
-        # --- NYTT: mapping-knapper ---
-        ttk.Button(top, text="Map til regnskapslinjer …", command=self._map_to_regnskapslinjer)\
-            .pack(side="left", padx=(0,6))
+        # SB: mappe konto -> regnskapslinjer
+        if self.source == "saldobalanse" and try_map_saldobalanse_to_regnskapslinjer:
+            ttk.Button(top, text="Map til regnskapslinjer …",
+                       command=self._map_regn).pack(side="left", padx=(8, 0))
+
         ttk.Button(top, text="Sett regnr …", command=self._set_regnr_manual)\
             .pack(side="left")
 
@@ -578,6 +589,57 @@ class App(tk.Tk):
         else:
             out["regnskapslinje"] = ""
         return out
+
+    def _map_regn(self):
+        """Kjør intervall-mapping (konto -> regnr/regnskapslinje) og oppdater tabellen."""
+        if try_map_saldobalanse_to_regnskapslinjer is None:
+            messagebox.showwarning("Ikke tilgjengelig", "Modul for regnskapslinje-mapping mangler.", parent=self)
+            return
+        try:
+            # kall tjenesten – finner 'F:\\Dokument\\Kildefiler' selv og husker sti i settings
+            rows_df, _, meta = try_map_saldobalanse_to_regnskapslinjer(self.df_full)
+            if rows_df is None:
+                reason = (meta or {}).get("reason", "ukjent")
+                messagebox.showwarning("Ingen mapping", f"Fant ikke kildefiler for regnskapslinjer.\nDetalj: {reason}", parent=self)
+                return
+
+            # rows_df har bare mappede rader; flett inn i originalen for å beholde evt. umappede
+            lut = rows_df[["konto","regnskapsnr","regnskapsnavn"]].dropna(subset=["regnskapsnr"]).copy()
+            # sørg for int konto
+            lut["konto"] = pd.to_numeric(lut["konto"], errors="coerce").astype("Int64")
+            base = self.df_full.copy()
+            base["konto"] = pd.to_numeric(base["konto"], errors="coerce").astype("Int64")
+
+            out = base.merge(lut, how="left", on="konto")
+
+            # vis som tekst uten desimaler i tabellen
+            out["regnr"] = out["regnskapsnr"].astype("Int64").astype("string")
+            out["regnskapslinje"] = out["regnskapsnavn"].astype("string")
+
+            # oppdater interne mappinger og lagre for senere bruk
+            reg_map = lut.dropna(subset=["konto","regnskapsnr"]).copy()
+            for _, row in reg_map.iterrows():
+                konto_val = row["konto"]
+                regnr_val = row["regnskapsnr"]
+                if pd.isna(konto_val) or pd.isna(regnr_val):
+                    continue
+                self._konto2regnr[str(int(konto_val))] = int(regnr_val)
+                if not pd.isna(row.get("regnskapsnavn")):
+                    self._regnr2name[int(regnr_val)] = str(row["regnskapsnavn"])
+            self._save_regnr_map()
+
+            # rydd og vis
+            self.df_full = out.drop(columns=[c for c in ("regnskapsnr","regnskapsnavn") if c in out.columns])
+            cols = [c for c in ("konto","kontonavn","regnr","regnskapslinje") if c in self.df_full.columns]
+            cols += [c for c in self.df_full.columns if c not in cols and not str(c).startswith("__")]
+            self.table.set_dataframe(self.df_full[cols], reset=True)
+            self.table.refresh()
+
+            mapped = int(lut["konto"].nunique())
+            total  = int(base["konto"].dropna().nunique())
+            messagebox.showinfo("OK", f"Mappet {mapped} av {total} konti (lagret sti til kildefiler i settings).", parent=self)
+        except Exception as exc:
+            messagebox.showerror("Mapping feilet", f"{type(exc).__name__}: {exc}", parent=self)
 
     def _map_to_regnskapslinjer(self):
         """
