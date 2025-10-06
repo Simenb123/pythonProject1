@@ -184,6 +184,10 @@ class App(tk.Tk):
         self._konto2regnr: dict[str, int] = self._load_regnr_map()
         self._regnr2name: dict[int, str] = {}  # fylles første gang du mapper/overstyrer
 
+        # sørg for at self.df_full også har regnr/linje-kolonner fra start slik at
+        # de dukker opp i søkemenyen og andre operasjoner som bruker self.df_full
+        self.df_full = self._with_regnskapslinjer_cols(self.df_full)
+
         df_initial = self._with_regnskapslinjer_cols(df_initial)
 
         # 5) Bygg UI
