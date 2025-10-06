@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # src/app/gui/bilag_gui_tk.py
 from __future__ import annotations
-import argparse, os, re, sys, subprocess
+
+import argparse, os, re, sys, subprocess, json
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
@@ -22,9 +23,11 @@ def _import_all():
         from services.ingest import ensure_parquet_fresh, load_canonical_dataset  # type: ignore
 
     try:
-        from app.services.clients import get_clients_root
+        from app.services.clients import (
+            get_clients_root, load_meta, save_meta, year_paths
+        )
     except Exception:
-        from services.clients import get_clients_root  # type: ignore
+        from services.clients import get_clients_root, load_meta, save_meta, year_paths  # type: ignore
 
     # DataTable
     DataTable = None
@@ -38,22 +41,15 @@ def _import_all():
             continue
     if DataTable is None:
         raise ImportError("Fant ikke DataTable-klassen.")
+    return ensure_parquet_fresh, load_canonical_dataset, get_clients_root, load_meta, save_meta, year_paths, DataTable
 
-    # SB→regnskap-mapping
-    try:
-        from app.services.sb_regnskapsmapping import (
-            MapSources, map_saldobalanse_df, load_overrides, save_overrides, apply_overrides, read_regnskapslinjer
-        )
-    except Exception:
-        from services.sb_regnskapsmapping import (  # type: ignore
-            MapSources, map_saldobalanse_df, load_overrides, save_overrides, apply_overrides, read_regnskapslinjer
-        )
-
-    return (ensure_parquet_fresh, load_canonical_dataset, get_clients_root, DataTable,
-            MapSources, map_saldobalanse_df, load_overrides, save_overrides, apply_overrides, read_regnskapslinjer)
-
-(ensure_parquet_fresh, load_canonical_dataset, get_clients_root, DataTable,
- MapSources, map_saldobalanse_df, load_overrides, save_overrides, apply_overrides, read_regnskapslinjer) = _import_all()
+(ensure_parquet_fresh,
+ load_canonical_dataset,
+ get_clients_root,
+ load_meta,
+ save_meta,
+ year_paths,
+ DataTable) = _import_all()
 
 # -------------------------------------------------------------
 # Hjelpere
@@ -83,9 +79,18 @@ _CANON_PRIORITY = {
     "tekst":     ["tekst","beskrivelse","description","post text","mottaker","faktura","narrative"],
 }
 
+# fil‑pref‑nøkler i meta["years"][år]["ui_prefs"]
+_PREF_KILDE_DIR = "kildefiler_dir"
+_PREF_RL_PATH   = "regnskapslinjer_path"
+_PREF_MAP_PATH  = "kontoplan_mapping_path"
+
 def _preferred_order(df: pd.DataFrame) -> list[str]:
+    """
+    Vis 'konto', 'kontonavn' først – og inkluder 'regnr' og 'regnskapslinje'
+    rett etter, dersom de finnes.
+    """
     cols = [c for c in df.columns if not str(c).startswith("__")]
-    front = [c for c in ("konto","kontonavn","regnr","regnskapslinje") if c in cols]
+    front = [c for c in ("konto", "kontonavn", "regnr", "regnskapslinje") if c in cols]
     rest  = [c for c in cols if c not in front]
     return front + rest
 
@@ -122,6 +127,9 @@ class App(tk.Tk):
         if not self.root_dir:
             messagebox.showerror("Mangler klient‑rot", "Fant ikke klient‑rot i settings.")
             self.destroy(); return
+
+        # meta (for persist av UI‑pref og filbaner)
+        self.meta = load_meta(self.root_dir, self.client)
 
         self.title(f"Bilagsanalyse – {client} ({year}, {source}/{vtype})")
         self.geometry("1220x780"); self.minsize(1024, 660)
@@ -171,9 +179,12 @@ class App(tk.Tk):
                 u = uniq[0] if len(uniq)==1 else ""
                 self._dataset_note = f" • Advarsel: datasettet har {len(uniq)} unik konto ({u}). Sjekk at aktiv HB‑fil er hele hovedboken."
 
-        # 4) Re‑ordne kolonnene (konto/kononavn først)
-        cols = _preferred_order(df_initial)
-        df_initial = df_initial[cols].copy()
+        # 4) Last ev. tidligere regnr‑mapping fra disk og legg på kolonnene
+        self._regnr_map_path = year_paths(self.root_dir, self.client, self.year).mapping / "sb_regnr.json"
+        self._konto2regnr: dict[str, int] = self._load_regnr_map()
+        self._regnr2name: dict[int, str] = {}  # fylles første gang du mapper/overstyrer
+
+        df_initial = self._with_regnskapslinjer_cols(df_initial)
 
         # 5) Bygg UI
         self._build_ui(df_initial)
@@ -198,11 +209,13 @@ class App(tk.Tk):
         self.ent_q.bind("<Return>", lambda e: self._apply_search()); self.ent_q.focus_set()
 
         ttk.Button(top, text="Søk", command=self._apply_search).pack(side="left", padx=(0,6))
-        ttk.Button(top, text="Tøm", command=self._reset_view).pack(side="left", padx=(0,6))
+        ttk.Button(top, text="Tøm", command=self._reset_view).pack(side="left", padx=(0,12))
 
-        if self.source == "saldobalanse":
-            ttk.Button(top, text="Map til regnskapslinjer …", command=self._map_regnskapslinjer).pack(side="left", padx=(6,0))
-            ttk.Button(top, text="Sett regnr …", command=self._manual_set_regnr).pack(side="left", padx=(6,0))
+        # --- NYTT: mapping-knapper ---
+        ttk.Button(top, text="Map til regnskapslinjer …", command=self._map_to_regnskapslinjer)\
+            .pack(side="left", padx=(0,6))
+        ttk.Button(top, text="Sett regnr …", command=self._set_regnr_manual)\
+            .pack(side="left")
 
         # Info-linje
         info_txt = f"Kilde: {Path(self.src_path).name}"
@@ -222,7 +235,7 @@ class App(tk.Tk):
         self.ent_q.delete(0, tk.END)
         self.cmb_col.set("Alle kolonner")
         cols = _preferred_order(self.df_full)
-        self.table.set_dataframe(self.df_full[cols], reset=True)
+        self.table.set_dataframe(self._with_regnskapslinjer_cols(self.df_full[cols]), reset=True)
         self.table.refresh()
         info_txt = f"Kilde: {Path(self.src_path).name}"
         if self._dataset_note: info_txt += self._dataset_note
@@ -232,7 +245,7 @@ class App(tk.Tk):
     def _apply_search(self):
         col  = (self.cmb_col.get() or "Alle kolonner").strip()
         expr = (self.ent_q.get()  or "").strip()
-        df   = self.df_full
+        df   = self._with_regnskapslinjer_cols(self.df_full)
 
         if not expr:
             self._reset_view(); return
@@ -372,82 +385,281 @@ class App(tk.Tk):
         if bilagsnr: args += ["--bilagsnr", bilagsnr]
         subprocess.Popen(args, shell=False, cwd=str(SRC), env=env)
 
-    # ------------------------- SB → Regnskap ----------------------
-    def _map_regnskapslinjer(self):
+    # ------------------------- Regnskapslinjer (NYTT) ----------------------
+    def _prefs_node(self) -> dict:
+        """Returner (og opprett ved behov) meta->years[år]->ui_prefs."""
+        years = self.meta.setdefault("years", {})
+        y = years.setdefault(str(self.year), {"ui_prefs": {}})
+        y.setdefault("ui_prefs", {})
+        return y["ui_prefs"]
+
+    def _save_prefs(self):
         try:
-            # Be om kildefiler
-            p_reg = filedialog.askopenfilename(
-                title="Velg «Regnskapslinjer.xlsx»",
-                filetypes=[("Excel", "*.xlsx *.xls")]
-            )
-            if not p_reg: return
-            p_int = filedialog.askopenfilename(
-                title="Velg «Mapping standard kontoplan.xlsx»",
-                filetypes=[("Excel", "*.xlsx *.xls")]
-            )
-            if not p_int: return
-
-            sources = MapSources(Path(p_reg), Path(p_int))
-            df_mapped, _defs = map_saldobalanse_df(self.df_full.copy(), sources)
-
-            # last evt. overstyringer og anvend dem
-            overrides = load_overrides(self.root_dir, self.client, self.year)
-            df_mapped = apply_overrides(df_mapped, overrides)
-
-            self.df_full = df_mapped.copy()
-            cols = _preferred_order(self.df_full)
-            self.table.set_dataframe(self.df_full[cols], reset=True)
-            self.table.refresh()
-
-            # lagre «basis»-mapping (uten å overskrive manuelle) – vi lagrer kun det som faktisk fikk regnr
-            base_map = {str(int(k)): str(v) for k, v in zip(
-                self.df_full["konto"].dropna().astype(int),
-                self.df_full["regnr"].fillna("").astype(str)
-            ) if v}
-            # slå sammen med eksisterende overstyringer (overstyringer vinner)
-            merged = {**base_map, **overrides}
-            save_overrides(self.root_dir, self.client, self.year, merged)
-
-            messagebox.showinfo("OK", "Mapping fullført og lagret pr. konto.\nDu kan overstyre enkeltkonti med «Sett regnr …».", parent=self)
-        except Exception as exc:
-            messagebox.showerror("Lesing av kildefiler feilet",
-                                 f"{type(exc).__name__}: {exc}",
-                                 parent=self)
-
-    def _manual_set_regnr(self):
-        rows = self.table.selected_rows()
-        if rows is None or rows.empty:
-            messagebox.showwarning("Velg rader", "Marker én eller flere konti i tabellen.", parent=self); return
-        # foreslå fra første rad
-        cur = str(rows.iloc[0].get("regnr") or "")
-        new_reg = simpledialog.askstring("Sett regnr", "Regnr (f.eks. 585, 660 …):", initialvalue=cur, parent=self)
-        if not new_reg: return
-        new_reg = re.sub(r"\D", "", new_reg)
-        if not new_reg:
-            messagebox.showwarning("Ugyldig", "Regnr må være tall.", parent=self); return
-
-        # Last regnskapslinje-tekst hvis vi kan
-        try:
-            # hent definisjoner via forrige mapping-kjøring (eller be om fil)
-            # En enkel måte: spør ikke på nytt; vi setter bare regnr og lar regnskapslinje bli NaN hvis ikke krysset
-            pass
+            save_meta(self.root_dir, self.client, self.meta)
         except Exception:
             pass
 
-        # Oppdater i DataFrame og lagre overstyring
-        konti = rows["konto"].dropna().astype(int).astype(str).tolist()
-        self.df_full.loc[self.df_full["konto"].astype("Int64").astype(str).isin(konti), "regnr"] = str(new_reg)
+    def _load_regnr_map(self) -> dict[str, int]:
+        p = self._regnr_map_path
+        if p.exists():
+            try:
+                return {str(k): int(v) for k, v in json.loads(p.read_text("utf-8")).items()}
+            except Exception:
+                return {}
+        return {}
 
-        # regnskapslinje-navn: prøv å bevare hvis finnes i tabellen
-        # (den sklår opp neste gang map kjøres – dette er mest for rask overstyring)
-        self.table.set_dataframe(self.df_full[_preferred_order(self.df_full)], reset=True)
+    def _save_regnr_map(self):
+        self._regnr_map_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._regnr_map_path.with_suffix(".tmp")
+        # lagre som {konto(str): regnr(int)}
+        data = {str(k): int(v) for k, v in self._konto2regnr.items() if v is not None}
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+        tmp.replace(self._regnr_map_path)
 
-        # lagre/oppdater overstyringsfil
-        overrides = load_overrides(self.root_dir, self.client, self.year)
-        for k in konti:
-            overrides[str(k)] = str(new_reg)
-        save_overrides(self.root_dir, self.client, self.year, overrides)
-        messagebox.showinfo("Lagret", f"Overstyrte {len(konti)} konto(er) til regnr {new_reg}.", parent=self)
+    def _pick_file(self, title: str, types: tuple[tuple[str, str], ...], pref_key: str) -> Path | None:
+        prefs = self._prefs_node()
+        ini_dir = None
+        if prefs.get(pref_key):
+            ini_dir = str(Path(prefs[pref_key]).parent)
+        elif prefs.get(_PREF_KILDE_DIR):
+            ini_dir = prefs[_PREF_KILDE_DIR]
+        p = filedialog.askopenfilename(title=title, filetypes=list(types), initialdir=ini_dir or "")
+        if not p: return None
+        prefs[pref_key] = p
+        prefs[_PREF_KILDE_DIR] = str(Path(p).parent)
+        self._save_prefs()
+        return Path(p)
+
+    def _ensure_regn_files(self) -> tuple[Path, Path] | None:
+        """
+        Sørg for at vi har stier til:
+          1) Regnskapslinjer.xlsx  (regnr → regnskapslinjenavn)
+          2) Mapping standard kontoplan.xlsx  (intervaller konto → regnr)
+        Bruker/lager persist i meta.ui_prefs slik at samme filer brukes neste gang.
+        """
+        prefs = self._prefs_node()
+        rl_path  = Path(prefs.get(_PREF_RL_PATH, "")) if prefs.get(_PREF_RL_PATH) else None
+        map_path = Path(prefs.get(_PREF_MAP_PATH, "")) if prefs.get(_PREF_MAP_PATH) else None
+
+        if not (rl_path and rl_path.exists()):
+            rl_path = self._pick_file("Velg Regnskapslinjer.xlsx",
+                                      (("Excel", "*.xlsx *.xls"), ("Alle filer", "*.*")), _PREF_RL_PATH)
+            if not rl_path: return None
+        if not (map_path and map_path.exists()):
+            map_path = self._pick_file("Velg Mapping standard kontoplan.xlsx",
+                                       (("Excel", "*.xlsx *.xls"), ("Alle filer", "*.*")), _PREF_MAP_PATH)
+            if not map_path: return None
+        return rl_path, map_path
+
+    def _read_regnskapslinjer_lut(self, p: Path) -> dict[int, str]:
+        """
+        Les 'Regnskapslinjer.xlsx' → {regnr:int -> navn:str}.
+        Robust kolonnefinn: ser etter 'regnr' + tekstkolonne.
+        """
+        df = pd.read_excel(p, engine="openpyxl")
+        low = {c.lower().strip(): c for c in df.columns}
+        # finn regnr‑kolonne
+        reg_col = None
+        for cand in ("regnr", "reg nr", "regn nr", "nr", "nummer", "linjenr"):
+            if cand in low:
+                reg_col = low[cand]; break
+        if not reg_col:
+            # fall-back: første numeriske kolonne
+            for c in df.columns:
+                if pd.api.types.is_numeric_dtype(df[c]):
+                    reg_col = c; break
+        # finn navn‑kolonne
+        name_col = None
+        for cand in ("regnskapslinje", "linje", "regnskapslinjenavn", "navn", "tekst", "beskrivelse"):
+            if cand in low:
+                name_col = low[cand]; break
+        if not name_col:
+            # fall-back: første ikke-numeriske kolonne ulik reg_col
+            for c in df.columns:
+                if c != reg_col and not pd.api.types.is_numeric_dtype(df[c]):
+                    name_col = c; break
+        if not reg_col or not name_col:
+            raise ValueError("Fant ikke passende kolonner i Regnskapslinjer.xlsx")
+
+        out = {}
+        for _, r in df[[reg_col, name_col]].dropna().iterrows():
+            try:
+                rn = int(pd.to_numeric(r[reg_col], errors="coerce"))
+                nm = str(r[name_col]).strip()
+                if rn:
+                    out[rn] = nm
+            except Exception:
+                pass
+        return out
+
+    def _read_intervals(self, p: Path) -> pd.DataFrame:
+        """
+        Les "Mapping standard kontoplan.xlsx" – ark «Intervall».
+        Vi leser uten usecols og håndterer variable kolonneantall for å
+        unngå ParserError usecols/out-of-bounds.
+        Returnerer df med kolonnene: lo(int), hi(int), regnr(int)
+        """
+        try:
+            xl = pd.ExcelFile(p, engine="openpyxl")
+            try:
+                raw = xl.parse("Intervall", header=None)
+            except Exception:
+                # prøv litt ulike skrivemåter
+                names = [s for s in xl.sheet_names if str(s).strip().lower() == "intervall"]
+                raw = xl.parse(names[0], header=None) if names else xl.parse(0, header=None)
+        except Exception as exc:
+            raise RuntimeError(f"Kunne ikke lese mapping-arbeidet: {type(exc).__name__}: {exc}")
+
+        # Heuristikk: antatt layout ~ [lo, form, hi, sumNr, sumNavn, sign, lvl, ...]
+        n = raw.shape[1]
+        def col(i):  # safe extract
+            return raw.iloc[:, i] if i < n else pd.Series([None]*len(raw))
+        lo  = pd.to_numeric(col(0), errors="coerce")
+        hi  = pd.to_numeric(col(2), errors="coerce")
+        reg = pd.to_numeric(col(3), errors="coerce")  # sumNr
+        # fallback hvis ovenstående ga tomt
+        if reg.notna().sum() == 0:
+            # prøv å finne en kolonne som ser ut som regnr (heltall 1–999)
+            for i in range(n):
+                s = pd.to_numeric(col(i), errors="coerce")
+                if s.notna().sum() and (s.dropna().astype(int) == s.dropna()).all():
+                    if s.max() < 10_000:  # rimelig regnr
+                        reg = s; break
+        if hi.notna().sum() == 0 and n >= 2:
+            # antak at kolonne 1 er hi når 2 ikke fantes
+            hi = pd.to_numeric(col(1), errors="coerce")
+
+        df = pd.DataFrame({"lo": lo, "hi": hi, "regnr": reg}).dropna(subset=["regnr"])
+        # fyll manglende grenser med heltall
+        df["lo"] = df["lo"].fillna(0).astype(int)
+        df["hi"] = df["hi"].fillna(df["lo"]).astype(int)
+        df["regnr"] = df["regnr"].astype(int)
+        # fjern åpenbart ugyldige rader
+        df = df[(df["hi"] >= df["lo"])]
+        return df.reset_index(drop=True)
+
+    def _auto_map_from_intervals(self, intervals: pd.DataFrame) -> dict[str, int]:
+        """Bygg {konto(str) -> regnr(int)} for konti i df_full vha intervalltabellen."""
+        if "konto" not in self.df_full.columns:
+            return {}
+        out: dict[str, int] = {}
+        konto_series = pd.to_numeric(self.df_full["konto"], errors="coerce").fillna(-1).astype(int)
+        # Vi lar første treff vinne (typisk layout)
+        assigned = pd.Series([False]*len(konto_series), index=self.df_full.index)
+        for _, r in intervals.iterrows():
+            lo, hi, rn = int(r["lo"]), int(r["hi"]), int(r["regnr"])
+            mask = (~assigned) & (konto_series >= lo) & (konto_series <= hi)
+            idx = konto_series[mask].index
+            for ix in idx:
+                k = str(int(konto_series.loc[ix]))
+                if k not in out:
+                    out[k] = rn
+            assigned.loc[idx] = True
+        return out
+
+    def _with_regnskapslinjer_cols(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Returner df med 'regnr' (STR – for å unngå 2 desimaler i DataTable)
+        og 'regnskapslinje' (STR) basert på self._konto2regnr og self._regnr2name.
+        """
+        out = df.copy()
+        if "konto" not in out.columns:
+            return out
+        ks = pd.to_numeric(out["konto"], errors="coerce").fillna(-1).astype(int).astype(str)
+        rn = ks.map(self._konto2regnr).fillna("")  # int/blank
+        # viktig: regnr som *tekst* (for å unngå 510,00 i DataTable)
+        out["regnr"] = rn.apply(lambda x: "" if x == "" else str(int(x)))
+        if self._regnr2name:
+            out["regnskapslinje"] = rn.apply(lambda x: "" if x == "" else self._regnr2name.get(int(x), ""))
+        else:
+            out["regnskapslinje"] = ""
+        return out
+
+    def _map_to_regnskapslinjer(self):
+        """
+        1) Sørger for stier (persist i meta.ui_prefs)
+        2) Leser regnskapslinje‑navn + intervaller
+        3) Mapper *manglende* konti (bevarer manuelle overstyringer)
+        4) Lagrer per klient/år
+        """
+        files = self._ensure_regn_files()
+        if not files:
+            return
+        rl_path, map_path = files
+        try:
+            self._regnr2name = self._read_regnskapslinjer_lut(rl_path)
+            intervals = self._read_intervals(map_path)
+            auto_map = self._auto_map_from_intervals(intervals)
+        except Exception as exc:
+            messagebox.showerror("Mapping-feil", f"{type(exc).__name__}: {exc}", parent=self)
+            return
+
+        # Bevar manuelle → fyll bare hull
+        added = 0
+        for k, rn in auto_map.items():
+            if k not in self._konto2regnr:
+                self._konto2regnr[k] = int(rn)
+                added += 1
+        self._save_regnr_map()
+
+        # Oppdater tabell
+        self.df_full = self._with_regnskapslinjer_cols(self.df_full)
+        cols = _preferred_order(self.df_full)
+        self.table.set_dataframe(self.df_full[cols], reset=False); self.table.refresh()
+        messagebox.showinfo("OK", "Mapping fullført og lagret pr. konto.\nDu kan overstyre enkeltkonti med «Sett regnr …».", parent=self)
+
+    def _set_regnr_manual(self):
+        """
+        Manuell overstyring: bruker merket(e) rader i tabellen → spør etter regnr
+        (tall eller '510 - Utvikling'), lagrer og oppdaterer skjermbildet.
+        """
+        rows = self.table.selected_rows()
+        if rows is None or rows.empty:
+            messagebox.showwarning("Velg rader", "Marker minst én rad i tabellen.", parent=self)
+            return
+
+        # foreslå dagens regnr hvis felles
+        forslag = ""
+        try:
+            rns = set([str(x) for x in rows.get("regnr","").astype(str).unique() if str(x).strip()])
+            if len(rns) == 1:
+                forslag = list(rns)[0]
+        except Exception:
+            pass
+
+        s = simpledialog.askstring("Sett regnr", "Skriv regnr (f.eks. 510 eller '510 - Utvikling'):", initialvalue=forslag, parent=self)
+        if not s:
+            return
+        m = re.search(r"(\d{1,4})", s)
+        if not m:
+            messagebox.showwarning("Ugyldig", "Fant ikke et tall i inputten.", parent=self); return
+        rn = int(m.group(1))
+
+        # oppdater mapping for valgte konti
+        cnt = 0
+        for _, r in rows.iterrows():
+            k = _digits_only(r.get("konto"))
+            if k:
+                self._konto2regnr[str(int(k))] = rn
+                cnt += 1
+        self._save_regnr_map()
+
+        # navneoppslag (valgfritt – vi bygger fra fil hvis vi har)
+        if rn not in self._regnr2name:
+            # forsøk å koble fra Regnskapslinjer.xlsx (hvis valgt tidligere)
+            try:
+                prefs = self._prefs_node()
+                rp = prefs.get(_PREF_RL_PATH)
+                if rp and Path(rp).exists():
+                    self._regnr2name.update(self._read_regnskapslinjer_lut(Path(rp)))
+            except Exception:
+                pass
+
+        # oppdater tabell
+        self.df_full = self._with_regnskapslinjer_cols(self.df_full)
+        cols = _preferred_order(self.df_full)
+        self.table.set_dataframe(self.df_full[cols], reset=False); self.table.refresh()
+        messagebox.showinfo("OK", f"Satt regnr={rn} på {cnt} konto(er).", parent=self)
 
 # -------------------------------------------------------------
 def main():
