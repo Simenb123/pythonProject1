@@ -23,7 +23,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List
 
 from models import A07Parser, GLAccount, read_gl_csv
-from board import A07Board
+from a07_board import A07Board
 
 
 class A07App(tk.Tk):

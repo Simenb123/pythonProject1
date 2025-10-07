@@ -1,5 +1,5 @@
 """
-board.py
+a07_board.py
 ==========
 
 This module defines a reusable ``A07Board`` widget for displaying and
