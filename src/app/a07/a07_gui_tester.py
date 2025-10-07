@@ -26,6 +26,102 @@ try:
 except Exception:
     from a07_board import A07Board
 
+# Import GLAccount for wrapper board
+try:
+    from .models import GLAccount
+except Exception:
+    from models import GLAccount
+
+class AssignmentBoard(A07Board):
+    """Compatibility wrapper around A07Board to support legacy interface.
+
+    This class adapts the new ``A07Board`` interface to the API expected by
+    ``a07_gui_tester.py``.  It accepts legacy callback parameters
+    ``get_amount_fn``, ``on_drop`` and ``request_suggestions`` and provides a
+    ``supply_data()`` method.  Internally it converts the provided account
+    dictionaries into ``GLAccount`` instances and uses the ``A07Board``
+    update mechanism.  Mapping events are propagated back via the
+    ``on_drop`` callback.  The ``request_suggestions`` callback is
+    stored but not used directly by the board.
+    """
+
+    def __init__(self, master, get_amount_fn, on_drop, request_suggestions):
+        # Store legacy callbacks
+        self.get_amount_fn = get_amount_fn
+        self._on_drop_cb = on_drop
+        self._request_suggestions = request_suggestions
+        # Initialise parent board with our internal mapping callback
+        super().__init__(master, on_map=self._on_map_internal)
+
+    def _on_map_internal(self, account: GLAccount, code: str) -> None:
+        """Internal handler called when the user maps an account to a code.
+
+        Converts the ``GLAccount`` back to a plain account number and
+        invokes the original ``on_drop`` callback passed into the wrapper.
+        Any exceptions from the callback are suppressed to avoid crashing
+        the GUI.
+        """
+        try:
+            self._on_drop_cb(account.konto, code)
+        except Exception:
+            pass
+
+    def supply_data(
+        self,
+        *,
+        accounts: List[Dict[str, Any]],
+        acc_to_code: Dict[str, str],
+        suggestions: Dict[str, Any],
+        a07_sums: Dict[str, float],
+        diff_threshold: float,
+        only_unmapped: bool,
+    ) -> None:
+        """Populate the board with new data.
+
+        Args:
+            accounts: A list of dictionaries representing GL accounts.  Each
+                dictionary must contain at least ``konto`` and ``navn`` keys.
+            acc_to_code: The current mapping from account numbers to A07 codes.
+            suggestions: Not used in this wrapper but kept for API compatibility.
+            a07_sums: Dictionary of A07 code totals from the A07 report.
+            diff_threshold: Not used directly; colour coding is handled by
+                the underlying board.  Kept for API compatibility.
+            only_unmapped: If True, only show accounts that are not yet
+                mapped to a code.
+        """
+        gl_accounts: List[GLAccount] = []
+        # Convert raw account dicts to GLAccount dataclass instances
+        for acc in accounts:
+            try:
+                amount = float(self.get_amount_fn(acc))
+            except Exception:
+                amount = 0.0
+            try:
+                gl = GLAccount(
+                    konto=str(acc.get("konto", "")),
+                    navn=str(acc.get("navn", "")),
+                    ib=float(acc.get("ib", 0.0)),
+                    debet=float(acc.get("debet", 0.0)),
+                    kredit=float(acc.get("kredit", 0.0)),
+                    endring=amount,
+                    ub=amount,
+                    belop=amount,
+                )
+                gl_accounts.append(gl)
+            except Exception:
+                # Skip accounts that cannot be converted
+                pass
+        # Optionally filter to only unmapped accounts
+        if only_unmapped:
+            gl_accounts = [gl for gl in gl_accounts if gl.konto not in acc_to_code]
+        # Update the underlying board.  Use 'belop' as basis since we have
+        # populated all amount fields with the same value.  Any exceptions
+        # from the update are suppressed to avoid crashing the GUI.
+        try:
+            self.update(gl_accounts, a07_sums, acc_to_code, basis="belop")
+        except Exception:
+            pass
+
 
 # ---------- Regelbok / fallback / LP ----------
 try:
@@ -418,8 +514,45 @@ class A07App(tk.Tk):
         data = [r for r in self.rows if str(r["fnr"]) == str(fnr)]
         ttk.Label(win, text=f"Navn: {data[0]['navn'] if data else ''}  •  Antall poster: {len(data)}  •  Sum: {fmt_amount(sum(float(r['beloep']) for r in data))}").pack(side=tk.TOP, anchor="w", padx=8, pady=8)
         frm = ttk.Frame(win); frm.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(0,8))
-        tbl = Table(frm, [("kode","Kode"),("fordel","Fordel"),("beloep","Beløp"),("antall","Antall"),("trekkpliktig","Trekkpl."),("aga","AGA"),("opptj_start","Opptj. start"),("opptj_slutt","Opptj. slutt"),("orgnr","Orgnr")])
-        tbl.set_column_format("beloep", fmt_amount); tbl.insert_rows(data)
+        # Utled periode (år-måned) fra opptjeningsperioden når tilgjengelig
+        rows_with_period = []
+        for r in data:
+            start = r.get("opptj_start") or ""
+            end = r.get("opptj_slutt") or ""
+            periode = ""
+            if isinstance(start, str) and start:
+                # Bruk 'YYYY-MM' fra startdato
+                periode = start[:7]
+            elif isinstance(end, str) and end:
+                # Fallback til sluttdato
+                periode = end[:7]
+            rows_with_period.append({
+                "periode": periode,
+                "kode": r.get("kode", ""),
+                "fordel": r.get("fordel", ""),
+                "beloep": r.get("beloep", 0.0),
+                "antall": r.get("antall", ""),
+                "trekkpliktig": r.get("trekkpliktig", False),
+                "aga": r.get("aga", False),
+                "opptj_start": r.get("opptj_start", ""),
+                "opptj_slutt": r.get("opptj_slutt", ""),
+                "orgnr": r.get("orgnr", ""),
+            })
+        # Legg til periode-kolonne i tabellen for å vise hvilken måned beløpet tilhører
+        tbl = Table(frm, [
+            ("periode","Periode"),
+            ("kode","Kode"),
+            ("fordel","Fordel"),
+            ("beloep","Beløp"),
+            ("antall","Antall"),
+            ("trekkpliktig","Trekkpl."),
+            ("aga","AGA"),
+            ("opptj_start","Opptj. start"),
+            ("opptj_slutt","Opptj. slutt"),
+            ("orgnr","Orgnr"),
+        ])
+        tbl.set_column_format("beloep", fmt_amount)
+        tbl.insert_rows(rows_with_period)
 
     def _refresh_employees_table(self):
         idx = summarize_by_employee(self.rows)
