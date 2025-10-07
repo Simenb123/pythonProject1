@@ -20,7 +20,11 @@ from collections import defaultdict, Counter
 from typing import Any, Dict, List, Tuple, Iterable, Optional, Set
 
 # ---------- DnD-brett ----------
-from .a07_board import A07Board
+# Prøv relativ import hvis vi kjøres som del av pakke; ellers fall tilbake til absolutt import.
+try:
+    from .a07_board import A07Board  # type: ignore[attr-defined]
+except Exception:
+    from a07_board import A07Board
 
 
 # ---------- Regelbok / fallback / LP ----------
