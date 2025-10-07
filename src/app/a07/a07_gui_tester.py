@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-A07 Lønnsavstemming — komplett GUI
------------------------------------
+A07 Lønnsavstemming — komplett GUI (med DnD-board)
+---------------------------------------------------
 - Parser A07 JSON
 - Leser GL (saldobalanse) fra CSV robust
 - Oversikt / Ansatte / Koder / Rådata
-- Kontrolloppstilling: Auto-forslag (regelbok eller fallback) + LP-Optimalisering + drilldown
-- Innstillinger: Laste/Redigere regelbok direkte i GUI + lagre/lese overstyringer (JSON)
-- Husker sist brukte regelbok + UI-innstillinger i ~/.a07_prefs.json
-- Valgfri "Board (DnD)"-fane (hvis a07_board.py finnes)
+- Kontrolloppstilling: Auto-forslag (regelbok/fallback) + LP-Optimalisering + drilldown
+- Innstillinger: Laste/Redigere regelbok + lagre/lese overstyringer (JSON)
+- Ny fane: "Board (DnD)" for interaktiv mapping via drag & drop
+
+Bygger videre på eksisterende prosjektstruktur (regelbok/fallback/LP).
 """
 
 from __future__ import annotations
@@ -18,18 +19,10 @@ from tkinter import ttk, filedialog, messagebox
 from collections import defaultdict, Counter
 from typing import Any, Dict, List, Tuple, Iterable, Optional, Set
 
-# --------------------------- Valgfri Board (DnD) ---------------------------
-try:
-    # Hvis du har a07_board.py i prosjektet ditt plukkes det opp automatisk
-    from a07_board import A07Board  # type: ignore
-    HAVE_BOARD = True
-except Exception:
-    HAVE_BOARD = False
-    A07Board = None  # type: ignore
+# ---------- DnD-brett ----------
+from a07_board import AssignmentBoard  # <-- NY
 
-# --------------------------- Avhengigheter ---------------------------
-
-# Regelbok (kan mangle – da deaktiveres editor/auto)
+# ---------- Regelbok / fallback / LP ----------
 try:
     from a07_rulebook import load_rulebook, suggest_with_rulebook
     HAVE_RULEBOOK = True
@@ -38,13 +31,11 @@ except Exception:
     suggest_with_rulebook = None  # type: ignore
     HAVE_RULEBOOK = False
 
-# Fallback (alltid tilgjengelig i prosjektet)
 try:
     from matcher_fallback import suggest_mapping_for_accounts as fallback_suggest
 except Exception:
     def fallback_suggest(*_a, **_k): return {}
 
-# LP (kandidatbygging + global matching)
 try:
     from a07_optimize import generate_candidates_for_lp, solve_global_assignment_lp
     HAVE_LP = True
@@ -555,16 +546,28 @@ class A07App(tk.Tk):
         for c in ("a07","gl","diff"): self.tbl_ctrl_codes.set_column_format(c, fmt_amount)
         self.tbl_ctrl_codes.bind("<Double-1>", self._on_ctrl_code_drill)
 
-        # Valgfri Board (DnD)
-        if HAVE_BOARD:
-            tabC = ttk.Frame(self.ctrl_nb); self.ctrl_nb.add(tabC, text="Board (DnD)")
-            topC = ttk.Frame(tabC); topC.pack(side=tk.TOP, fill=tk.X)
-            ttk.Button(topC, text="Oppdater forslag", command=self.refresh_board).pack(side=tk.LEFT)
-            self.board = A07Board(tabC)  # type: ignore
-            self.board.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        else:
-            # Vis et hint (ikke bland inn i kontrollfanen – holder GUI stabil)
-            pass
+        # --- NY fane: Board (DnD) ---
+        tabDND = ttk.Frame(self.ctrl_nb)
+        self.ctrl_nb.add(tabDND, text="Board (DnD)")
+
+        def _board_get_amount(acc: Dict[str,Any]) -> float:
+            return self._gl_amount(acc)[0]
+
+        def _on_drop(accno: str, code: str):
+            self.acc_to_code[str(accno)] = str(code)
+            self.use_lp_assignment = False
+            self.refresh_control_tables()
+
+        def _req_suggestions():
+            self.on_auto_map()
+
+        self.board = AssignmentBoard(
+            tabDND,
+            get_amount_fn=_board_get_amount,
+            on_drop=_on_drop,
+            request_suggestions=_req_suggestions
+        )
+        self.board.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
 
     # ----- Innstillinger -----
     def _build_settings(self, root: ttk.Frame):
@@ -650,7 +653,6 @@ class A07App(tk.Tk):
         self.status.configure(text=f"Lest {len(rows)} rader. Feil: {len(errors)}")
         if errors: messagebox.showwarning("Parsing", "\n".join(errors[:12]) + ("\n… (flere)" if len(errors)>12 else ""))
         self._refresh_all_tabs()
-        self.refresh_board()
 
     def on_validate(self):
         if not self.rows or not self.json_root:
@@ -690,7 +692,6 @@ class A07App(tk.Tk):
         self.use_lp_assignment = False; self.lp_assignment.clear(); self.lp_fixed.clear(); self.lp_amounts.clear()
         self.ctrl_status.configure(text=f"Saldobalanse: {len(rows)} konti.  Kolonner: IB={'ja' if meta.get('ib') else 'nei'}, D={'ja' if meta.get('debet') else 'nei'}, K={'ja' if meta.get('kredit') else 'nei'}, Endr={'ja' if meta.get('endring') else 'nei'}, UB={'ja' if meta.get('ub') else 'nei'}  • Enc: {meta.get('encoding')} • Sep: '{meta.get('delimiter')}'")
         self.refresh_control_tables()
-        self.refresh_board()
 
     def on_auto_map(self):
         if not self.gl_accounts: messagebox.showinfo("Mangler saldobalanse", "Last inn saldobalanse (CSV) først."); return
@@ -706,7 +707,6 @@ class A07App(tk.Tk):
             if accno in suggestions: self.acc_to_code[accno] = suggestions[accno]["kode"]
         self.use_lp_assignment = False
         self.refresh_control_tables()
-        self.refresh_board()
 
     def on_set_code(self):
         sel = self.tbl_gl.selection()
@@ -723,7 +723,7 @@ class A07App(tk.Tk):
                 if val: self.acc_to_code[accno] = val
                 else: self.acc_to_code.pop(accno, None)
             self.use_lp_assignment = False
-            win.destroy(); self.refresh_control_tables(); self.refresh_board()
+            win.destroy(); self.refresh_control_tables()
         ttk.Button(box, text="OK", command=ok).pack(side=tk.RIGHT); ttk.Button(box, text="Avbryt", command=win.destroy).pack(side=tk.RIGHT, padx=6)
 
     def on_clear_code(self):
@@ -734,14 +734,12 @@ class A07App(tk.Tk):
             self.acc_to_code.pop(accno, None)
         self.use_lp_assignment = False
         self.refresh_control_tables()
-        self.refresh_board()
 
     def on_reset_mapping(self):
         if messagebox.askyesno("Nullstill mapping", "Fjern all mapping (manuell + auto + LP)?"):
             self.acc_to_code.clear(); self.auto_suggestions.clear()
             self.use_lp_assignment = False; self.lp_assignment.clear(); self.lp_fixed.clear(); self.lp_amounts.clear()
             self.refresh_control_tables()
-            self.refresh_board()
 
     # ---------- LP ----------
     def on_optimize_lp(self):
@@ -752,14 +750,12 @@ class A07App(tk.Tk):
         if not self.rulebook:
             messagebox.showinfo("Regelbok mangler", "Last regelbok under 'Innstillinger' først."); return
 
-        # 1) Beløp per konto iht valgt grunnlag
         amounts: Dict[str,float] = {}
         for acc in self.gl_accounts:
             val, _ = self._gl_amount(acc)
             amounts[str(acc["konto"])] = float(val)
         self.lp_amounts = amounts
 
-        # 2) Special_add fast (eks: -UB/Endring(2940) til feriepenger) og hopp over disse i LP
         fixed = defaultdict(float); skip_edges = set()
         for code, rule in self.rulebook.get("codes", {}).items():
             for spec in rule.get("special_add", []):
@@ -772,11 +768,9 @@ class A07App(tk.Tk):
                         break
         self.lp_fixed = dict(fixed)
 
-        # 3) Mål (targets) = A07-sum justert for special_add
         a07_raw = summarize_by_code(self.rows)
         targets = {c: float(a07_raw.get(c,0.0) - fixed.get(c,0.0)) for c in set(a07_raw)|set(fixed)}
 
-        # 4) Kandidater via regelbok-hjelpere
         cands = generate_candidates_for_lp(self.gl_accounts, a07_raw, self.rulebook,
                                            amounts_override=amounts,
                                            min_name=0.25, min_score=float(self.min_score.get())-0.10,
@@ -784,7 +778,6 @@ class A07App(tk.Tk):
         if not cands:
             messagebox.showwarning("LP", "Fant ingen kandidater. Sjekk regelbok/Min‑score."); return
 
-        # 5) Løs LP
         try:
             assignment = solve_global_assignment_lp(
                 amounts, cands, targets,
@@ -801,7 +794,6 @@ class A07App(tk.Tk):
                 code = max(parts.items(), key=lambda kv: kv[1])[0]
                 self.acc_to_code[accno] = code
         self.refresh_control_tables()
-        self.refresh_board()
         messagebox.showinfo("Optimalisering", "LP‑løsning ferdig. Avstemmingstabellen er oppdatert.")
 
     # ---------- Beregninger/refresh ----------
@@ -811,7 +803,6 @@ class A07App(tk.Tk):
         if mode == "ub": return float(acc.get("ub", 0.0)), "UB"
         if mode == "endring": return float(acc.get("endring", 0.0)), "Endring"
         if mode == "belop": return float(acc.get("belop", 0.0)), "Beløp"
-        # auto
         accno = str(acc.get("konto","")); digits = re.sub(r"\D+","",accno)
         if digits and digits.startswith("29"): return float(acc.get("ub", acc.get("belop",0.0))), "Auto:UB"
         return float(acc.get("endring", acc.get("belop",0.0))), "Auto:Endring"
@@ -823,7 +814,6 @@ class A07App(tk.Tk):
         return float(acc.get("endring", acc.get("belop",0.0)))
 
     def _set_compact_columns(self):
-        # Skjul IB/D/K/UB når kompakt er aktiv
         compact = bool(self.compact_view.get())
         cols_hide = ["ib","debet","kredit","ub"]
         for c in cols_hide:
@@ -852,7 +842,6 @@ class A07App(tk.Tk):
                 self.acc_to_code[self._detail_accno] = code
                 self.use_lp_assignment = False
                 self.refresh_control_tables()
-                self.refresh_board()
         except Exception:
             pass
 
@@ -870,7 +859,6 @@ class A07App(tk.Tk):
         self.det_account.config(text=f"Konto {accno} — {acc.get('navn','')}")
         self.det_amount.config(text=f"{lbl}: {fmt_amount(amt)}")
 
-        # Beste forslag
         sugg = self.auto_suggestions.get(accno, {})
         chosen = self.acc_to_code.get(accno, sugg.get("kode",""))
         best_txt = chosen or "–"
@@ -879,7 +867,6 @@ class A07App(tk.Tk):
             best_txt += f"   ({sc:.3f})" if isinstance(sc,(float,int)) else ""
         self.det_best.config(text=best_txt)
 
-        # Alternativer (topp-5) via kandidatbygger hvis regelbok finnes
         self.det_alt_list.delete(0, tk.END)
         try:
             if self.rulebook and HAVE_LP:
@@ -915,18 +902,10 @@ class A07App(tk.Tk):
                 "endring": acc.get("endring",0.0), "ub": acc.get("ub",0.0), "basis": lbl, "foreslatt": chosen,
                 "score": f"{score:.3f}" if isinstance(score,(int,float)) else "", "begrunnelse": reason, "_tags": tags
             })
-        # filter: bare uten mapping
         if self.only_unmapped.get():
             rowsA = [r for r in rowsA if not r.get("foreslatt")]
-        # sorter på kontonummer (rimeligste standard)
-        def _acc_sort_key(r):
-            d = re.sub(r"\D+","", str(r["konto"]))
-            try: return int(d or "0")
-            except Exception: return 0
-        rowsA.sort(key=_acc_sort_key)
-        self.tbl_gl.insert_rows(rowsA)
+        rowsA.sort(key=lambda r: (r["foreslatt"] or "zzz", -abs(float(r["endring"])))); self.tbl_gl.insert_rows(rowsA)
         self._set_compact_columns()
-        # oppdater detaljpanel for valgt rad
         try:
             sel = self.tbl_gl.focus()
             if sel:
@@ -976,6 +955,20 @@ class A07App(tk.Tk):
         unmapped = [acc for acc in self.gl_accounts if acc["konto"] not in self.acc_to_code]
         self.lab_unmapped.configure(text=f"Uten mapping: {len([a for a in unmapped if not(self.hide_zero.get() and abs(self._gl_amount(a)[0])<1e-9)])}")
         self.lab_code_gap.configure(text=f"Koder uten GL: {len([c for c in a07 if gl_per_code.get(c,0.0)==0.0])}")
+
+        # --- Oppdater DnD‑brettet ---
+        try:
+            if hasattr(self, "board"):
+                self.board.supply_data(
+                    accounts=self.gl_accounts,
+                    acc_to_code=self.acc_to_code,
+                    suggestions=self.auto_suggestions,
+                    a07_sums=a07,
+                    diff_threshold=float(self.diff_threshold.get()),
+                    only_unmapped=bool(self.only_unmapped.get()),
+                )
+        except Exception:
+            pass
 
     def _refresh_overview(self):
         self.ov_file.configure(text=f"Fil: {getattr(self,'_file_name','–')}")
@@ -1128,9 +1121,8 @@ class A07App(tk.Tk):
                 "expected_sign": esv,
                 "special_add": special,
             })
-            # lagre i overstyring (lokale endringer)
             self.rulebook_overrides.setdefault("codes", {})[code] = rb["codes"][code]
-            self._refresh_settings_tables(); self.refresh_control_tables(); self.refresh_board()
+            self._refresh_settings_tables(); self.refresh_control_tables()
             win.destroy()
 
         btns = ttk.Frame(win); btns.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=10)
@@ -1161,33 +1153,10 @@ class A07App(tk.Tk):
                 self.rulebook["codes"][code] = {**(self.rulebook.get("codes", {}).get(code, {})), **rule}
             for can, syns in (overrides.get("aliases") or {}).items():
                 self.rulebook["aliases"][can] = set(syns)
-            self._refresh_settings_tables(); self.refresh_control_tables(); self.refresh_board()
+            self._refresh_settings_tables(); self.refresh_control_tables()
             messagebox.showinfo("Lastet", f"Innlasting OK: {os.path.basename(path)}")
         except Exception as e:
             messagebox.showerror("Feil ved innlasting", str(e))
-
-    # ----- Board (DnD) oppdatering -----
-    def refresh_board(self):
-        if not HAVE_BOARD or not hasattr(self, "board"):  # type: ignore
-            return
-        try:
-            # Fyll boardet med dagens status (enkelt grensesnitt):
-            # - a07_sums: {kode: beløp}
-            # - gl_rows:  [{konto, navn, belop, basis}]
-            # - mapping:  {konto: kode} (eller LP‑andel om du vil utvide)
-            a07_sums = summarize_by_code(self.rows)
-            gl_rows = []
-            for acc in self.gl_accounts:
-                amt, lbl = self._gl_amount(acc)
-                gl_rows.append({"konto": acc["konto"], "navn": acc.get("navn",""), "belop": amt, "basis": lbl})
-            mapping = dict(self.acc_to_code)
-            # Enkel API: board.update(a07_sums, gl_rows, mapping)
-            # Hvis din A07Board har en annen metode, tilpass her.
-            if hasattr(self.board, "update"):         # type: ignore
-                self.board.update(a07_sums, gl_rows, mapping)  # type: ignore
-        except Exception:
-            # Ikke knus GUI om board ikke samsvarer 100% — det er valgfritt.
-            pass
 
 # --------------------------- main ---------------------------
 
