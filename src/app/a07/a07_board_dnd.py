@@ -142,6 +142,19 @@ class A07Board(ttk.Frame):
             child.destroy()
         # Summér GL-pr-kode basert på mapping
         gl_sums = summarize_gl_by_code(self.accounts, self.mapping, basis=self.basis)
+        # Lag en oversikt over hvilke kontoer som er mappet til hver kode, med valgt basis-beløp
+        mapped_accounts: Dict[str, List[tuple[str, float]]] = {}
+        for acc in self.accounts:
+            code = self.mapping.get(acc.konto)
+            if not code:
+                continue
+            if self.basis == "ub":
+                amount = acc.ub
+            elif self.basis == "belop":
+                amount = acc.belop
+            else:
+                amount = acc.endring
+            mapped_accounts.setdefault(code, []).append((acc.konto, float(amount)))
         codes = set(self.a07_sums) | set(gl_sums)
         def sort_key(code: str) -> float:
             a07 = float(self.a07_sums.get(code, 0.0))
@@ -172,9 +185,20 @@ class A07Board(ttk.Frame):
             ttk.Label(totals, text=f"Diff: {diff:,.2f}".replace(",", " ").replace(".", ","), foreground=colour).pack(side=tk.LEFT, padx=(8, 0))
             # Tomt drop-område – farger kan endres ved drag-over
             drop_area = ttk.Frame(card)
-            drop_area.grid(row=2, column=0, sticky="ew", padx=4, pady=(2, 4))
+            drop_area.grid(row=2, column=0, sticky="ew", padx=4, pady=(2, 2))
             drop_area.drop_code = code  # type: ignore[attr-defined]
-            # neste
+            # Liste over tilordnede kontoer til denne koden
+            accounts_for_code = mapped_accounts.get(code, [])
+            if accounts_for_code:
+                list_frame = ttk.Frame(card)
+                list_frame.grid(row=3, column=0, sticky="ew", padx=4, pady=(0, 4))
+                # vis inntil 5 rader i listen
+                height = min(len(accounts_for_code), 5)
+                lstbox = tk.Listbox(list_frame, height=height, activestyle="none")
+                for accno_, amt_ in accounts_for_code:
+                    lstbox.insert(tk.END, f"{accno_}: {amt_:,.2f}".replace(",", " ").replace(".", ","))
+                lstbox.pack(side=tk.TOP, fill=tk.X)
+            # neste kort-posisjon
             if col == 1:
                 col = 0
                 row += 1

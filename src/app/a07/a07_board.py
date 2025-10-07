@@ -63,6 +63,9 @@ class A07Board(ttk.Frame):
         self.a07_sums: Dict[str, float] = {}
         self.mapping: Dict[str, str] = {}
         self.basis: str = "endring"
+        # Drag‑and‑drop state
+        self._drag_acc: Optional[str] = None  # kontonummer som dras
+        self._drag_label: Optional[tk.Label] = None  # flytende label under drag
         # Left pane: account list
         left_frame = ttk.Frame(self)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 4), pady=8)
@@ -86,6 +89,10 @@ class A07Board(ttk.Frame):
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # Bind drag-n-drop events
+        self.tree.bind("<ButtonPress-1>", self._on_tree_press)
+        self.tree.bind("<B1-Motion>", self._on_drag_motion)
+        self.tree.bind("<ButtonRelease-1>", self._on_drag_release)
         # Right pane: code cards
         right_frame = ttk.Frame(self)
         right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 8), pady=8)
@@ -148,6 +155,20 @@ class A07Board(ttk.Frame):
             child.destroy()
         # Compute GL sums per code using the selected basis
         gl_sums = summarize_gl_by_code(self.accounts, self.mapping, basis=self.basis)
+        # Build list of mapped accounts per code for display
+        mapped_accounts: Dict[str, List[tuple[str, float]]] = {}
+        for acc in self.accounts:
+            code = self.mapping.get(acc.konto)
+            if not code:
+                continue
+            # choose amount based on basis
+            if self.basis == "ub":
+                amount = acc.ub
+            elif self.basis == "belop":
+                amount = acc.belop
+            else:
+                amount = acc.endring
+            mapped_accounts.setdefault(code, []).append((acc.konto, float(amount)))
         # Determine which codes to display: union of A07 codes and mapped codes
         codes = set(self.a07_sums) | set(gl_sums)
         # Sort codes by descending absolute difference
@@ -178,9 +199,23 @@ class A07Board(ttk.Frame):
             # Diff label with colour based on whether it's within tolerance
             colour = "#2e7d32" if abs(diff) < 1e-2 else "#c62828"
             ttk.Label(totals, text=f"Diff: {diff:,.2f}".replace(",", " ").replace(".", ","), foreground=colour).pack(side=tk.LEFT, padx=(8, 0))
-            # Map button
+            # Drop‑område for drag‑and‑drop
+            drop_area = ttk.Frame(card)
+            drop_area.grid(row=2, column=0, sticky="ew", padx=4, pady=(2, 2))
+            drop_area.drop_code = code  # type: ignore[attr-defined]
+            # Vis liste over tilordnede kontoer
+            accounts_for_code = mapped_accounts.get(code, [])
+            if accounts_for_code:
+                list_frame = ttk.Frame(card)
+                list_frame.grid(row=3, column=0, sticky="ew", padx=4, pady=(0, 4))
+                height = min(len(accounts_for_code), 5)
+                lstbox = tk.Listbox(list_frame, height=height, activestyle="none")
+                for accno_, amt_ in accounts_for_code:
+                    lstbox.insert(tk.END, f"{accno_}: {amt_:,.2f}".replace(",", " ").replace(".", ","))
+                lstbox.pack(side=tk.TOP, fill=tk.X)
+            # Map button for click-mapping (valgfritt)
             map_btn = ttk.Button(card, text="Tilordne valgt konto", command=lambda c=code: self._map_selected(c))
-            map_btn.grid(row=2, column=0, sticky="ew", padx=4, pady=(2, 4))
+            map_btn.grid(row=4, column=0, sticky="ew", padx=4, pady=(0, 4))
             # Move to next column/row
             if col == 1:
                 col = 0
@@ -198,6 +233,55 @@ class A07Board(ttk.Frame):
         except Exception:
             # Swallow exceptions from the callback to avoid crashing the UI
             pass
+
+    # -----------------------------------------------------------------
+    # Drag‑and‑drop event handlers
+    # -----------------------------------------------------------------
+    def _on_tree_press(self, event):
+        """Start drag: memorize selected account."""
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        vals = self.tree.item(item, "values")
+        if not vals:
+            return
+        self._drag_acc = vals[0]
+        if self._drag_label is None:
+            self._drag_label = tk.Label(self, text=self._drag_acc, bg="#607d8b", fg="white")
+
+    def _on_drag_motion(self, event):
+        """Update drag label position."""
+        if self._drag_label:
+            self._drag_label.place(x=event.x_root - self.winfo_rootx() + 10,
+                                   y=event.y_root - self.winfo_rooty() + 10)
+
+    def _on_drag_release(self, event):
+        """Handle drop: map account if dropped over a card."""
+        if self._drag_label:
+            self._drag_label.destroy()
+            self._drag_label = None
+        accno = self._drag_acc
+        self._drag_acc = None
+        if not accno:
+            return
+        # Determine widget under cursor
+        target = self.winfo_containing(event.x_root, event.y_root)
+        code = None
+        while target is not None and target is not self:
+            if hasattr(target, "drop_code"):
+                code = getattr(target, "drop_code")
+                break
+            target = target.master  # type: ignore[attr-defined]
+        if not code:
+            return
+        # find GLAccount by account number
+        for acc in self.accounts:
+            if acc.konto == accno:
+                try:
+                    self.on_map(acc, code)
+                except Exception:
+                    pass
+                break
 
     def get_selected_account(self) -> Optional[GLAccount]:
         """Return the ``GLAccount`` corresponding to the selected row in the tree."""
