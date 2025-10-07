@@ -20,7 +20,7 @@ from collections import defaultdict, Counter
 from typing import Any, Dict, List, Tuple, Iterable, Optional, Set
 
 # ---------- DnD-brett ----------
-from a07_board import AssignmentBoard  # <-- NY
+from board import AssignmentBoard  # <-- NY
 
 # ---------- Regelbok / fallback / LP ----------
 try:
