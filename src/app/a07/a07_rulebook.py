@@ -90,10 +90,33 @@ def _in_any_interval(accno: str, intervals: List[Tuple[int,int]]) -> bool:
 
 # ------------------------ I/O ------------------------
 
-def _read_csv(path: str) -> List[Dict[str,str]]:
+def _read_csv(path: str) -> List[Dict[str, str]]:
+    """Read a CSV file into a list of dictionaries.
+
+    This helper cleans up keys and values by stripping leading/trailing
+    whitespace and ignores any columns without a header.  It also
+    protects against ``NoneType`` keys or values which could cause
+    attribute errors when calling ``strip()`` on ``None``.
+
+    Each row in the returned list contains only those columns that
+    have a non-empty header.
+    """
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
         rd = csv.DictReader(f)
-        return [{k.strip(): (v or "").strip() for k,v in row.items()} for row in rd]
+        rows: List[Dict[str, str]] = []
+        for row in rd:
+            cleaned: Dict[str, str] = {}
+            for k, v in row.items():
+                # ``csv.DictReader`` returns ``None`` for extra columns if
+                # the row has more fields than headers; skip those.
+                key = (k or "").strip()
+                if not key:
+                    continue
+                cleaned[key] = (v or "").strip()
+            # Skip completely empty rows
+            if any(cleaned.values()):
+                rows.append(cleaned)
+        return rows
 
 def _read_excel(path: str) -> Dict[str, List[Dict[str,str]]]:
     try:
