@@ -1,7 +1,17 @@
 # a07_rulebook.py
 from __future__ import annotations
-import csv, json, os, re
+import csv
+import json
+import os
+import re
 from typing import Any, Dict, List, Tuple, Set, Optional
+
+# Optional: import RuleBook from rule_storage for JSON loading support
+try:
+    from rule_storage import RuleBook  # type: ignore
+    HAVE_RULESTORAGE = True
+except Exception:
+    HAVE_RULESTORAGE = False
 
 # RapidFuzz for bedre tekstmatching (pip install rapidfuzz)
 try:
@@ -170,8 +180,97 @@ def load_rulebook(path_or_dir: Optional[str]=None) -> Dict[str, Any]:
                 syns = [_norm(t) for t in re.split(r"[|,;]\s*", r.get("synonyms","")) if t]
                 if can: rules["aliases"][can] = set(syns)
         return rules
+    # Support loading from JSON rulebook if rule_storage is available and the path ends with .json
+    # The JSON structure is expected to follow the format produced by RuleBook.save_to_json
+    # Support loading from JSON rulebook if the path points to a file.  This
+    # detection runs before the .xlsx case to allow files without the .json
+    # suffix to be loaded as JSON.  It uses the RuleBook dataclass loader
+    # if available.  Any errors during JSON parsing will be silently
+    # ignored and the loader will continue to other formats.
+    if path_or_dir and os.path.isfile(path_or_dir) and HAVE_RULESTORAGE:
+        # Only attempt to treat the file as JSON if it is not an Excel file
+        # (handled below).  If the file contains JSON with the expected
+        # structure, it will be loaded; otherwise, parsing errors will be
+        # ignored and the code will fall through to the next handler.
+        if not path_or_dir.lower().endswith(".xlsx"):
+            try:
+                rb = RuleBook.load_from_json(path_or_dir)  # type: ignore[assignment]
+            except Exception:
+                rb = None
+            if rb:
+                codes_dict: Dict[str, Any] = {}
+                for code, rule in rb.rules.items():
+                    allowed_intervals: List[Tuple[int,int]] = []
+                    for expr in rule.allowed_ranges:
+                        try:
+                            allowed_intervals.extend(_parse_range_expr(expr))
+                        except Exception:
+                            pass
+                    codes_dict[code] = {
+                        "label": rule.label.strip() or "",
+                        "category": rule.category.strip() or "wage",
+                        "basis": rule.basis.strip() or "auto",
+                        "allowed": allowed_intervals,
+                        "keywords": set(rule.keywords or []),
+                        "boost_accounts": set(rule.boost_accounts or []),
+                        "special_add": rule.special_add or [],
+                        "expected_sign": int(rule.expected_sign or 0),
+                    }
+                aliases_dict: Dict[str, Set[str]] = {}
+                for can, syns in rb.aliases.items():
+                    can_norm = _norm(can)
+                    syn_set: Set[str] = set()
+                    for syn in syns:
+                        syn_norm = _norm(syn)
+                        if syn_norm:
+                            syn_set.add(syn_norm)
+                    if can_norm:
+                        aliases_dict[can_norm] = syn_set
+                return {"codes": codes_dict, "aliases": aliases_dict, "source": path_or_dir}
+    # If path endswith .json, attempt JSON loading using RuleBook (for backwards compatibility)
+    if path_or_dir and path_or_dir.lower().endswith(".json") and HAVE_RULESTORAGE:
+        # Attempt to load the JSON rulebook using the RuleBook dataclass
+        try:
+            rb = RuleBook.load_from_json(path_or_dir)  # type: ignore[assignment]
+        except Exception:
+            # If JSON cannot be parsed, fall through to default error
+            rb = None
+        if rb:
+            # Convert RuleBook to the same dict structure as CSV/Excel loader
+            codes_dict: Dict[str, Any] = {}
+            for code, rule in rb.rules.items():
+                # Each allowed range string may itself be a range expr (e.g. "5000-5999" or "2940|5290")
+                # Combine and parse them into numeric intervals
+                allowed_intervals: List[Tuple[int,int]] = []
+                for expr in rule.allowed_ranges:
+                    try:
+                        allowed_intervals.extend(_parse_range_expr(expr))
+                    except Exception:
+                        # If parsing fails, ignore that expression
+                        pass
+                codes_dict[code] = {
+                    "label": rule.label.strip() or "",
+                    "category": rule.category.strip() or "wage",
+                    "basis": rule.basis.strip() or "auto",
+                    "allowed": allowed_intervals,
+                    "keywords": set(rule.keywords or []),
+                    "boost_accounts": set(rule.boost_accounts or []),
+                    "special_add": rule.special_add or [],
+                    "expected_sign": int(rule.expected_sign or 0),
+                }
+            aliases_dict: Dict[str, Set[str]] = {}
+            for can, syns in rb.aliases.items():
+                can_norm = _norm(can)
+                syn_set: Set[str] = set()
+                for syn in syns:
+                    syn_norm = _norm(syn)
+                    if syn_norm:
+                        syn_set.add(syn_norm)
+                if can_norm:
+                    aliases_dict[can_norm] = syn_set
+            return {"codes": codes_dict, "aliases": aliases_dict, "source": path_or_dir}
 
-    if path_or_dir.lower().endswith(".xlsx"):
+    if path_or_dir and path_or_dir.lower().endswith(".xlsx"):
         sheets = _read_excel(path_or_dir)
         _load_codes(sheets.get("a07_codes", []))
         for r in sheets.get("aliases", []):
@@ -180,6 +279,7 @@ def load_rulebook(path_or_dir: Optional[str]=None) -> Dict[str, Any]:
             if can: rules["aliases"][can] = set(syns)
         return rules
 
+    # At this point we did not find a matching loader; throw error
     raise FileNotFoundError(f"Fant ingen regelbok på {path_or_dir}")
 
 # ------------------------ tekstscore v2 ------------------------

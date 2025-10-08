@@ -75,6 +75,7 @@ class AssignmentBoard(A07Board):
         a07_sums: Dict[str, float],
         diff_threshold: float,
         only_unmapped: bool,
+        basis: str = "belop",
     ) -> None:
         """Populate the board with new data.
 
@@ -114,11 +115,10 @@ class AssignmentBoard(A07Board):
         # Optionally filter to only unmapped accounts
         if only_unmapped:
             gl_accounts = [gl for gl in gl_accounts if gl.konto not in acc_to_code]
-        # Update the underlying board.  Use 'belop' as basis since we have
-        # populated all amount fields with the same value.  Any exceptions
+        # Update the underlying board with the selected basis.  Any exceptions
         # from the update are suppressed to avoid crashing the GUI.
         try:
-            self.update(gl_accounts, a07_sums, acc_to_code, basis="belop")
+            self.update(gl_accounts, a07_sums, acc_to_code, basis=basis or "belop")
         except Exception:
             pass
 
@@ -456,6 +456,10 @@ class A07App(tk.Tk):
         except Exception:
             pass
 
+        # Autoload from preferences only; do not attempt to automatically
+        # load a JSON file from a hard-coded directory.  Users should
+        # explicitly load the rulebook via the "Last regelbok (JSON)…" button.
+
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------- UI ----------
@@ -710,12 +714,15 @@ class A07App(tk.Tk):
     # ----- Innstillinger -----
     def _build_settings(self, root: ttk.Frame):
         top = ttk.Frame(root); top.pack(side=tk.TOP, fill=tk.X, pady=(8,4))
-        ttk.Button(top, text="Last regelbok (Excel)…", command=self.on_load_rulebook_excel).pack(side=tk.LEFT)
-        ttk.Button(top, text="Last regelbok (CSV‑mappe)…", command=self.on_load_rulebook_csvdir).pack(side=tk.LEFT, padx=(8,0))
+        # Load a global rulebook from a JSON file
+        ttk.Button(top, text="Last regelbok (JSON)…", command=self.on_load_rulebook_json).pack(side=tk.LEFT)
+        # Apply the current rulebook to suggest mappings
         ttk.Button(top, text="Bruk regelbok → Auto‑forslag", command=self.on_auto_map).pack(side=tk.LEFT, padx=(8,0))
         ttk.Button(top, text="Rediger valgt kode", command=self.on_edit_rule).pack(side=tk.LEFT, padx=(8,0))
-        ttk.Button(top, text="Lagre endringer (JSON)…", command=self.on_save_rulebook_overrides).pack(side=tk.LEFT, padx=(8,0))
-        ttk.Button(top, text="Last endringer (JSON)…", command=self.on_load_rulebook_overrides).pack(side=tk.LEFT, padx=(8,0))
+        # Save the entire rulebook (codes + aliases) as JSON
+        ttk.Button(top, text="Lagre regelbok (JSON)…", command=self.on_save_rulebook_json).pack(side=tk.LEFT, padx=(8,0))
+        # Knapp for å legge til en ny A07-kode
+        ttk.Button(top, text="Legg til A07-kode", command=self.on_add_rule).pack(side=tk.LEFT, padx=(8,0))
         self.rulebook_info = ttk.Label(top, text=self._rulebook_status_text(), anchor="w"); self.rulebook_info.pack(side=tk.RIGHT, fill=tk.X, expand=True)
 
         self.set_nb = ttk.Notebook(root); self.set_nb.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(4,8))
@@ -845,6 +852,14 @@ class A07App(tk.Tk):
             if accno in suggestions: self.acc_to_code[accno] = suggestions[accno]["kode"]
         self.use_lp_assignment = False
         self.refresh_control_tables()
+        # Etter at regelbok/fallback har foreslått koder, kjør LP-optimalisering
+        # for å matche beløp dersom LP-hjelperen er tilgjengelig og splits er tillatt.
+        try:
+            if HAVE_LP and self.allow_splits.get():
+                # Kjør global matching for å fordele beløp og minimere diff
+                self.on_optimize_lp()
+        except Exception:
+            pass
 
     def on_set_code(self):
         sel = self.tbl_gl.selection()
@@ -937,19 +952,83 @@ class A07App(tk.Tk):
     # ---------- Beregninger/refresh ----------
 
     def _gl_amount(self, acc: Dict[str, Any]) -> Tuple[float, str]:
+        """
+        Return the amount and a label for a GL account based on the selected basis.
+
+        The user can choose between UB (utgående saldo), Endring (bevegelse), Beløp
+        (kolonne), or Auto.  In Auto‑modus bruker vi et enkelt heuristikk:
+
+        - For balansekonti (konto < 3000) benyttes Endring (bevegelse), siden
+          disse normalt representerer oppgjørsposter som avstemmes mot A07.
+        - For øvrige konti (5000‑ og 7000‑serien) benyttes UB (utgående saldo),
+          som er mest naturlig for kostnadsførte kontoer.
+
+        Args:
+            acc: Et dict med feltene "konto", "ub", "endring" og "belop".
+
+        Returns:
+            Tuple med (beløp, etikett) der etiketten viser hvilket grunnlag som ble brukt.
+        """
         mode = self.gl_basis.get()
-        if mode == "ub": return float(acc.get("ub", 0.0)), "UB"
-        if mode == "endring": return float(acc.get("endring", 0.0)), "Endring"
-        if mode == "belop": return float(acc.get("belop", 0.0)), "Beløp"
-        accno = str(acc.get("konto","")); digits = re.sub(r"\D+","",accno)
-        if digits and digits.startswith("29"): return float(acc.get("ub", acc.get("belop",0.0))), "Auto:UB"
-        return float(acc.get("endring", acc.get("belop",0.0))), "Auto:Endring"
+        # Eksplisitt valg fra radioknappene
+        if mode == "ub":
+            return float(acc.get("ub", 0.0)), "UB"
+        if mode == "endring":
+            return float(acc.get("endring", 0.0)), "Endring"
+        if mode == "belop":
+            return float(acc.get("belop", 0.0)), "Beløp"
+        # Auto: bestem basis ut fra kontonummer (balanse vs resultat)
+        accno = str(acc.get("konto", ""))
+        digits = re.sub(r"\D+", "", accno)
+        try:
+            num = int(digits) if digits else None
+        except Exception:
+            num = None
+        # Balansekonti (1000-2999) bruker endring; ellers UB
+        if num is not None and num < 3000:
+            return float(acc.get("endring", acc.get("belop", 0.0))), "Auto:Endring"
+        return float(acc.get("ub", acc.get("belop", 0.0))), "Auto:UB"
 
     def _gl_amount_by_basis(self, acc: Dict[str,Any], basis: str) -> float:
         b = (basis or "endring").lower()
         if b == "ub": return float(acc.get("ub",0.0))
         if b == "belop": return float(acc.get("belop",0.0))
         return float(acc.get("endring", acc.get("belop",0.0)))
+
+    # ----- Kandidat-filtrering -----
+    def _get_likely_accounts(self) -> List[Dict[str,Any]]:
+        """
+        Returner en liste over de GL‑kontoene som er mest relevante for matching.
+
+        Hvis en regelbok er lastet og LP‑hjelperne er tilgjengelige, bruker vi
+        ``generate_candidates_for_lp`` til å finne kontoer som har minst én
+        gyldig kandidatkode.  Ellers faller vi tilbake til å bruke de
+        kontoene som har fått et autoutkast fra regelbok/fallback.  Dette
+        forhindrer at irrelevante kontoer vises i DnD‑brettet.
+        """
+        try:
+            # Dersom vi har regelbok og LP-hjelpere, bygg kandidater per konto
+            if self.rulebook and HAVE_LP:
+                from a07_optimize import generate_candidates_for_lp
+                a07_sums = summarize_by_code(self.rows) if self.rows else {}
+                # Bruk valgt basis for beløp
+                amounts = {acc["konto"]: self._gl_amount(acc)[0] for acc in self.gl_accounts}
+                candidates = generate_candidates_for_lp(
+                    self.gl_accounts,
+                    a07_sums,
+                    self.rulebook,
+                    amounts_override=amounts,
+                    min_name=0.25,
+                    min_score=max(0.40, float(self.min_score.get()) - 0.10),
+                    top_k=1
+                )
+                return [acc for acc in self.gl_accounts if str(acc.get("konto")) in candidates and candidates[str(acc.get("konto"))]]
+            else:
+                # Uten regelbok: returner kontoer som har et forslag fra fallback/autosuggestions
+                return [acc for acc in self.gl_accounts if acc.get("konto") in self.auto_suggestions]
+        except Exception:
+            # På feil, returner alle kontoer
+            return list(self.gl_accounts)
 
     def _set_compact_columns(self):
         compact = bool(self.compact_view.get())
@@ -1095,15 +1174,24 @@ class A07App(tk.Tk):
         self.lab_code_gap.configure(text=f"Koder uten GL: {len([c for c in a07 if gl_per_code.get(c,0.0)==0.0])}")
 
         # --- Oppdater DnD‑brettet ---
+        # Filtrer kontolisten til de mest sannsynlige kontoene før vi sender
+        # dem til brettet.  Dette gjør at kun relevante kontoer vises og at
+        # brukerens søk og regelbokfiler ikke drukner i irrelevante konti.
         try:
             if hasattr(self, "board"):
+                # Hent kun kontoer som har en kandidatkode via regelbok
+                accounts_for_board = self._get_likely_accounts()
+                # Pass the currently selected basis (auto, ub, endring, belop) so that
+                # the board can display which basis is being used.
+                current_basis = str(self.gl_basis.get() or "endring").lower()
                 self.board.supply_data(
-                    accounts=self.gl_accounts,
+                    accounts=accounts_for_board,
                     acc_to_code=self.acc_to_code,
                     suggestions=self.auto_suggestions,
                     a07_sums=a07,
                     diff_threshold=float(self.diff_threshold.get()),
                     only_unmapped=bool(self.only_unmapped.get()),
+                    basis=current_basis,
                 )
         except Exception:
             pass
@@ -1176,6 +1264,265 @@ class A07App(tk.Tk):
             messagebox.showinfo("Regelbok", f"Lest CSV-mappe: {d}")
         except Exception as e:
             messagebox.showerror("Feil ved lesing", str(e))
+
+    def on_load_rulebook_json(self):
+        """Open a JSON rulebook file and load it using load_rulebook().
+
+        This handler mirrors the behaviour of ``on_load_rulebook_excel`` and
+        ``on_load_rulebook_csvdir`` but for JSON files.  It allows the user
+        to select a single JSON file containing a global rule set and
+        loads it via the patched ``load_rulebook`` function in ``a07_rulebook``.
+        The loaded rules and aliases are stored in ``self.rulebook`` and
+        the source path is saved in user preferences for auto‑loading on
+        subsequent runs.
+        """
+        if load_rulebook is None:
+            messagebox.showwarning("Regelbok", "a07_rulebook.py mangler – kan ikke laste.");
+            return
+        path = filedialog.askopenfilename(
+            title="Velg regelbok (JSON)",
+            filetypes=[("JSON", "*.json"), ("Alle filer", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            rb = load_rulebook(path)
+        except Exception as e:
+            # Present a friendlier error message if this is a JSON parse error
+            emsg = str(e)
+            if "Expecting value" in emsg or "line" in emsg:
+                messagebox.showerror(
+                    "Feil ved innlasting",
+                    "JSON-filen kunne ikke leses. Sjekk at den er gyldig JSON eller lag en ny regelbok.\n\n" + emsg,
+                )
+            else:
+                messagebox.showerror("Feil ved innlasting", emsg)
+            return
+        # If load succeeded, update state
+        self.rulebook = rb
+        self.rulebook_source = path
+        self._refresh_settings_tables()
+        self._save_prefs(rulebook_path=path)
+        messagebox.showinfo("Regelbok", f"Lest: {os.path.basename(path)}")
+
+    def on_export_rulebook_excel(self):
+        """Export the currently loaded rulebook to an Excel file.
+
+        The exported file will contain two sheets: ``a07_codes`` and ``aliases``.
+        This function reconstructs a ``RuleBook`` instance from the
+        in-memory dictionary representation (``self.rulebook``) and uses
+        the ``export_to_excel`` helper in ``rule_storage.RuleBook`` to
+        write the Excel file.  If no rulebook is loaded, the user is
+        notified.  Requires pandas and a working Excel writer engine.
+        """
+        if not self.rulebook:
+            messagebox.showinfo("Eksporter", "Ingen regelbok lastet.")
+            return
+        # Ask user for target path
+        path = filedialog.asksaveasfilename(
+            title="Eksporter regelbok til Excel",
+            defaultextension=".xlsx",
+            filetypes=[("Excel","*.xlsx"), ("Alle filer","*.*")]
+        )
+        if not path:
+            return
+        try:
+            # Build a RuleBook from the in-memory dict
+            from rule_storage import RuleBook, Rule  # type: ignore
+        except Exception:
+            messagebox.showerror("Eksporter", "Kan ikke importere rule_storage – mangler modul.")
+            return
+        rb = RuleBook()
+        # Populate rules
+        for code, r in self.rulebook.get("codes", {}).items():
+            # Reconstruct allowed_ranges as a list of expression strings
+            intervals = r.get("allowed", [])
+            # Flatten numeric intervals into a single expression string separated by ' | '
+            parts: List[str] = []
+            for lo, hi in intervals:
+                parts.append(str(lo) if lo == hi else f"{lo}-{hi}")
+            allowed_ranges = [" | ".join(parts)] if parts else []
+            rule_obj = Rule(
+                code=code,
+                label=str(r.get("label", "")),
+                category=str(r.get("category", "wage")),
+                basis=str(r.get("basis", "auto")),
+                allowed_ranges=allowed_ranges,
+                keywords=list(r.get("keywords", [])),
+                boost_accounts=list(r.get("boost_accounts", [])),
+                expected_sign=int(r.get("expected_sign", 0) or 0),
+                special_add=list(r.get("special_add", [])),
+            )
+            rb.add_rule(rule_obj)
+        # Populate aliases
+        for can, syns in self.rulebook.get("aliases", {}).items():
+            for syn in syns:
+                try:
+                    rb.add_alias(can, syn)
+                except Exception:
+                    continue
+        try:
+            rb.export_to_excel(path)
+            messagebox.showinfo("Eksporter", f"Regelbok lagret til {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Eksporter", str(e))
+
+    def on_save_rulebook_json(self):
+        """Save the entire rulebook (codes and aliases) to a JSON file.
+
+        This function writes the current in-memory rulebook structure to a
+        single JSON file.  It converts numeric interval tuples back into
+        human-readable range expressions (joined by ``|``) and serialises
+        sets into lists.  The resulting JSON can be used as a global
+        rulebook for other clients.  It does not rely on the overrides
+        mechanism and therefore preserves aliases and all code fields.
+        """
+        if not self.rulebook:
+            messagebox.showinfo("Lagre", "Ingen regelbok lastet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Lagre regelbok (JSON)",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("Alle filer", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            # Build full rulebook dict
+            codes_out: Dict[str, Any] = {}
+            for code, rule in self.rulebook.get("codes", {}).items():
+                # Convert numeric intervals back to range expressions
+                intervals = rule.get("allowed", []) or []
+                parts: List[str] = []
+                for lo, hi in intervals:
+                    parts.append(str(lo) if lo == hi else f"{lo}-{hi}")
+                # Allowed ranges as list; if multiple intervals, join with ' | '
+                allowed_ranges = [" | ".join(parts)] if parts else []
+                codes_out[code] = {
+                    "code": code,
+                    "label": str(rule.get("label", "")),
+                    "category": str(rule.get("category", "wage")),
+                    "basis": str(rule.get("basis", "auto")),
+                    "allowed_ranges": allowed_ranges,
+                    # Convert sets to lists for JSON
+                    "keywords": list(rule.get("keywords", [])),
+                    "boost_accounts": list(rule.get("boost_accounts", [])),
+                    "expected_sign": int(rule.get("expected_sign", 0) or 0),
+                    "special_add": rule.get("special_add", []) or [],
+                }
+            aliases_out: Dict[str, List[str]] = {}
+            for can, syns in self.rulebook.get("aliases", {}).items():
+                aliases_out[can] = list(syns)
+            obj = {"rules": codes_out, "aliases": aliases_out, "source": path}
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2)
+            messagebox.showinfo("Lagre", f"Regelbok lagret som {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Lagre", str(e))
+
+    # ----- Legg til ny A07-kode -----
+    def on_add_rule(self) -> None:
+        """Åpne et vindu hvor brukeren kan opprette en ny A07‑kode.
+
+        Den nye koden legges direkte inn i den aktive regelboken.  Hvis
+        ingen regelbok er lastet, vises en informasjonstekst.  Dialogen
+        samler inn kode, beskrivelse, kategori, basis, kontointervaller,
+        nøkkelord, boost‑konti og forventet fortegn.  Special‑add kan
+        legges inn som JSON i et tekstfelt.  Etter lagring oppdateres
+        tabellen i regelbokfanen.
+        """
+        if not self.rulebook or "codes" not in self.rulebook:
+            messagebox.showinfo("Regelbok mangler", "Last eller opprett en regelbok før du legger til koder.")
+            return
+        win = tk.Toplevel(self)
+        win.title("Legg til A07‑kode")
+        win.geometry("520x360")
+        # Felter for input
+        ttk.Label(win, text="A07‑kode:").grid(row=0, column=0, sticky="w", padx=8, pady=(8,2))
+        code_var = tk.StringVar(); ttk.Entry(win, textvariable=code_var).grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Label(win, text="Beskrivelse:").grid(row=1, column=0, sticky="w", padx=8, pady=(2,2))
+        label_var = tk.StringVar(); ttk.Entry(win, textvariable=label_var).grid(row=1, column=1, sticky="ew", padx=8)
+        ttk.Label(win, text="Kategori:").grid(row=2, column=0, sticky="w", padx=8, pady=(2,2))
+        cat_var = tk.StringVar(value="wage"); ttk.Entry(win, textvariable=cat_var).grid(row=2, column=1, sticky="ew", padx=8)
+        ttk.Label(win, text="Basis (auto|ub|endring|belop):").grid(row=3, column=0, sticky="w", padx=8, pady=(2,2))
+        basis_var = tk.StringVar(value="endring"); ttk.Entry(win, textvariable=basis_var).grid(row=3, column=1, sticky="ew", padx=8)
+        ttk.Label(win, text="Kontointervaller (f.eks. 5000-5399|2940):").grid(row=4, column=0, sticky="w", padx=8, pady=(2,2))
+        allowed_var = tk.StringVar(); ttk.Entry(win, textvariable=allowed_var).grid(row=4, column=1, sticky="ew", padx=8)
+        ttk.Label(win, text="Nøkkelord (komma‑separert):").grid(row=5, column=0, sticky="w", padx=8, pady=(2,2))
+        keywords_var = tk.StringVar(); ttk.Entry(win, textvariable=keywords_var).grid(row=5, column=1, sticky="ew", padx=8)
+        ttk.Label(win, text="Boost‑konti (komma‑separert):").grid(row=6, column=0, sticky="w", padx=8, pady=(2,2))
+        boost_var = tk.StringVar(); ttk.Entry(win, textvariable=boost_var).grid(row=6, column=1, sticky="ew", padx=8)
+        ttk.Label(win, text="Forventet fortegn (+/-/blank):").grid(row=7, column=0, sticky="w", padx=8, pady=(2,2))
+        sign_var = tk.StringVar(value=""); ttk.Entry(win, textvariable=sign_var, width=5).grid(row=7, column=1, sticky="w", padx=8)
+        ttk.Label(win, text="Special‑add (JSON):").grid(row=8, column=0, sticky="nw", padx=8, pady=(2,2))
+        special_text = tk.Text(win, height=3, width=40); special_text.grid(row=8, column=1, sticky="ew", padx=8)
+        win.columnconfigure(1, weight=1)
+
+        def save_new_code():
+            code = code_var.get().strip()
+            if not code:
+                messagebox.showerror("Ugyldig kode", "A07‑kode kan ikke være tom.")
+                return
+            label = label_var.get().strip() or code
+            category = cat_var.get().strip() or "wage"
+            basis = basis_var.get().strip().lower() or "endring"
+            allowed_ranges = []
+            allowed_str = allowed_var.get().strip()
+            if allowed_str:
+                for term in allowed_str.split("|"):
+                    term = term.strip()
+                    if term:
+                        allowed_ranges.append(term)
+            keywords = [k.strip() for k in keywords_var.get().split(",") if k.strip()]
+            boost_accounts = [b.strip() for b in boost_var.get().split(",") if b.strip()]
+            sign_txt = sign_var.get().strip()
+            if sign_txt == "+":
+                expected_sign = 1
+            elif sign_txt == "-":
+                expected_sign = -1
+            else:
+                expected_sign = 0
+            # Parse special_add JSON
+            special_raw = special_text.get("1.0", "end").strip()
+            if special_raw:
+                try:
+                    special_add = json.loads(special_raw)
+                    if not isinstance(special_add, list):
+                        raise ValueError("Special‑add må være en liste av objekter.")
+                except Exception as e:
+                    messagebox.showerror("Ugyldig JSON", f"Klarte ikke å parse Special‑add: {e}")
+                    return
+            else:
+                special_add = []
+            # Legg koden inn i regelboken
+            self.rulebook.setdefault("codes", {})[code] = {
+                "code": code,
+                "label": label,
+                "category": category,
+                "basis": basis,
+                "allowed_ranges": allowed_ranges,
+                "keywords": keywords,
+                "boost_accounts": boost_accounts,
+                "expected_sign": expected_sign,
+                "special_add": special_add,
+            }
+            # Oppdater aliases med koden og nøkkelord som synonymer
+            if keywords:
+                canonical = code
+                syns = list(set(keywords + [code]))
+                self.rulebook.setdefault("aliases", {}).setdefault(canonical, [])
+                for syn in syns:
+                    if syn not in self.rulebook["aliases"][canonical]:
+                        self.rulebook["aliases"][canonical].append(syn)
+            self._refresh_settings_tables()
+            win.destroy()
+
+        # knapper
+        btn_frame = ttk.Frame(win)
+        btn_frame.grid(row=9, column=0, columnspan=2, sticky="e", padx=8, pady=10)
+        ttk.Button(btn_frame, text="Lagre", command=save_new_code).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="Avbryt", command=win.destroy).pack(side=tk.RIGHT, padx=(6,0))
 
     # ----- Regelbok-editor -----
     def on_edit_rule(self):

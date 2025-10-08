@@ -130,7 +130,14 @@ class A07Board(ttk.Frame):
         self.refresh_codes()
 
     def refresh_accounts(self) -> None:
-        """Refresh the account list based on the current search filter."""
+        """
+        Refresh the account list based on the current search filter.
+
+        This method clears the treeview and repopulates it with GLAccount entries
+        that match the current search query.  It chooses the amount to display
+        based on the selected basis (endring, ub, belop).  Called whenever
+        accounts, mapping or basis changes.
+        """
         query = (self._search_var.get() or "").strip().lower()
         # Clear existing rows
         for iid in self.tree.get_children():
@@ -146,7 +153,10 @@ class A07Board(ttk.Frame):
                 amount = acc.belop
             else:
                 amount = acc.endring
-            self.tree.insert("", tk.END, values=(acc.konto, acc.navn, f"{amount:,.2f}".replace(",", " ").replace(".", ",")))
+            self.tree.insert(
+                "", tk.END,
+                values=(acc.konto, acc.navn, f"{amount:,.2f}".replace(",", " ").replace(".", ",")),
+            )
 
     def refresh_codes(self) -> None:
         """Rebuild the A07 code cards based on sums and current mapping."""
@@ -191,11 +201,24 @@ class A07Board(ttk.Frame):
             header = ttk.Frame(card)
             header.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
             ttk.Label(header, text=code, font=("TkDefaultFont", 10, "bold")).pack(side=tk.LEFT, anchor="w")
-            # Totals line
+            # Totals line with basis indicator
             totals = ttk.Frame(card)
             totals.grid(row=1, column=0, sticky="ew", padx=4)
             ttk.Label(totals, text=f"A07: {a07_value:,.2f}".replace(",", " ").replace(".", ","), foreground="#424242").pack(side=tk.LEFT)
             ttk.Label(totals, text=f"GL: {gl_value:,.2f}".replace(",", " ").replace(".", ","), foreground="#424242").pack(side=tk.LEFT, padx=(8, 0))
+            # Display which basis is being used (UB, Endring, Beløp, IB or Auto)
+            basis_label = "Endring"
+            b = str(self.basis or "endring").lower()
+            if b == "ub":
+                basis_label = "UB"
+            elif b == "belop":
+                basis_label = "Beløp"
+            elif b == "ib":
+                basis_label = "IB"
+            elif b == "auto":
+                basis_label = "Auto"
+            # Show basis label next to totals
+            ttk.Label(totals, text=f"Basis: {basis_label}", foreground="#757575").pack(side=tk.LEFT, padx=(8, 0))
             # Diff label with colour based on whether it's within tolerance
             colour = "#2e7d32" if abs(diff) < 1e-2 else "#c62828"
             ttk.Label(totals, text=f"Diff: {diff:,.2f}".replace(",", " ").replace(".", ","), foreground=colour).pack(side=tk.LEFT, padx=(8, 0))

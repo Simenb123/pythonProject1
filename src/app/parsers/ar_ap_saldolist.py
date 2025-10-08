@@ -12,6 +12,99 @@ import pandas as pd
 
 MONEY_COLS = ["IB_CF","IB_Amount","PR_Amount","UB_Amount","DiffCheck"]
 
+# Kontrollkontoer. Disse brukes til å identifisere de overordnede
+# reskontro‐konti for henholdsvis AR (kunder) og AP (leverandører).
+# Hvis arap_control_accounts.csv er tom eller mangler, vil disse settene
+# styre hvilke kontoer som inngår i avstemmingen mot kontoplanen.
+AR_CONTROL_ACCOUNTS: Set[str] = {"1510", "1550"}
+AP_CONTROL_ACCOUNTS: Set[str] = {"2410", "2460"}
+
+def _closing_nets(outdir: Path, ctrl_accounts: Set[str]) -> pd.DataFrame:
+    """Returner closing‐saldo per kontrollkonto.
+
+    Les accounts.csv og summerer ClosingDebit - ClosingCredit for alle
+    oppgitte kontoer. Returnerer et DataFrame med kolonnene
+    AccountID, AccountDescription og ClosingNet.
+    """
+    acc_df = _read_csv_safe(outdir / "accounts.csv", dtype=str)
+    if acc_df is None or acc_df.empty or not ctrl_accounts:
+        return pd.DataFrame(columns=["AccountID", "AccountDescription", "ClosingNet"])
+    # Konverter relevante kolonner til tall
+    acc_df = _to_num(acc_df, ["ClosingDebit", "ClosingCredit"])
+    # Normaliser konto‐ID
+    acc_df["AccountID"] = acc_df["AccountID"].astype(str).map(_norm_acc)
+    mask = acc_df["AccountID"].isin(ctrl_accounts)
+    tmp = acc_df.loc[mask].copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=["AccountID", "AccountDescription", "ClosingNet"])
+    tmp["ClosingNet"] = tmp.get("ClosingDebit", 0.0) - tmp.get("ClosingCredit", 0.0)
+    return tmp[["AccountID", "AccountDescription", "ClosingNet"]].reset_index(drop=True)
+
+def _partyless_per_account(outdir: Path, which: str, dto: pd.Timestamp, ctrl_accounts: Set[str]) -> pd.DataFrame:
+    """Summerer transaksjoner på kontrollkonti uten kunde/leverandør-ID.
+
+    Dette gir en oversikt over beløp som mangler tilknytning til en part
+    ("partyless") per kontrollkonto. Beløpene beregnes som Debit - Credit.
+    """
+    tx = _read_csv_safe(outdir / "transactions.csv", dtype=str)
+    if tx is None or tx.empty or not ctrl_accounts:
+        return pd.DataFrame(columns=["AccountID", "PartylessAmount"])
+    tx = _parse_dates(tx, ["TransactionDate", "PostingDate"])
+    tx["Date"] = tx["PostingDate"].fillna(tx["TransactionDate"])
+    for col in ["AccountID", "CustomerID", "SupplierID"]:
+        if col in tx.columns:
+            tx[col] = tx[col].astype(str)
+    tx["AccountID"] = tx["AccountID"].map(_norm_acc)
+    tx = _to_num(tx, ["Debit", "Credit"])
+    # Avgrens dato
+    tx = tx.loc[~tx["Date"].isna() & (tx["Date"] <= dto)].copy()
+    # Filtrer til kontrollkontoer
+    tx = tx.loc[tx["AccountID"].isin(ctrl_accounts)].copy()
+    # Filtrer til rader uten partyID
+    if which == "AR":
+        mask = ~_has_value(tx.get("CustomerID", ""))
+    else:
+        mask = ~_has_value(tx.get("SupplierID", ""))
+    tx = tx.loc[mask].copy()
+    if tx.empty:
+        return pd.DataFrame(columns=["AccountID", "PartylessAmount"])
+    grp = tx.groupby("AccountID")[["Debit", "Credit"]].sum().reset_index()
+    grp["PartylessAmount"] = grp["Debit"] - grp["Credit"]
+    return grp[["AccountID", "PartylessAmount"]].reset_index(drop=True)
+
+def _reskontro_per_account(outdir: Path, which: str, dto: pd.Timestamp, ctrl_accounts: Set[str]) -> pd.DataFrame:
+    """Summerer reskontro (med kunde/leverandør) per kontrollkonto.
+
+    Dette summerer Debit - Credit for transaksjoner der det finnes
+    CustomerID (for AR) eller SupplierID (for AP) og som tilhører
+    kontrollkontoene. Brukes i avstemmingsrapporten.
+    """
+    tx = _read_csv_safe(outdir / "transactions.csv", dtype=str)
+    if tx is None or tx.empty or not ctrl_accounts:
+        return pd.DataFrame(columns=["AccountID", "ReskontroAmount"])
+    tx = _parse_dates(tx, ["TransactionDate", "PostingDate"])
+    tx["Date"] = tx["PostingDate"].fillna(tx["TransactionDate"])
+    for col in ["AccountID", "CustomerID", "SupplierID"]:
+        if col in tx.columns:
+            tx[col] = tx[col].astype(str)
+    tx["AccountID"] = tx["AccountID"].map(_norm_acc)
+    tx = _to_num(tx, ["Debit", "Credit"])
+    # Avgrens dato
+    tx = tx.loc[~tx["Date"].isna() & (tx["Date"] <= dto)].copy()
+    # Filtrer til kontrollkontoer
+    tx = tx.loc[tx["AccountID"].isin(ctrl_accounts)].copy()
+    # Filtrer til rader med partyID
+    if which == "AR":
+        mask = _has_value(tx.get("CustomerID", ""))
+    else:
+        mask = _has_value(tx.get("SupplierID", ""))
+    tx = tx.loc[mask].copy()
+    if tx.empty:
+        return pd.DataFrame(columns=["AccountID", "ReskontroAmount"])
+    grp = tx.groupby("AccountID")[["Debit", "Credit"]].sum().reset_index()
+    grp["ReskontroAmount"] = grp["Debit"] - grp["Credit"]
+    return grp[["AccountID", "ReskontroAmount"]].reset_index(drop=True)
+
 def _read_csv_safe(path: Path, dtype=None) -> Optional[pd.DataFrame]:
     try:
         return pd.read_csv(path, dtype=dtype, keep_default_na=False)
@@ -112,12 +205,21 @@ def _heuristic_accounts(accounts_df: Optional[pd.DataFrame], tx: pd.DataFrame, w
     return accs
 
 def _pick_control_accounts(outdir: Path, which: str, tx_all: pd.DataFrame) -> Set[str]:
+    """Returner sett med kontrollkontoer for henholdsvis AR og AP.
+
+    Hvis arap_control_accounts.csv spesifiserer kontoer, brukes disse. I
+    motsatt fall benyttes forhåndsdefinerte sett (AR_CONTROL_ACCOUNTS
+    eller AP_CONTROL_ACCOUNTS). Dette overstyrer heuristikken for å
+    sikre at avstemmingen benytter de riktige kontrollkontoene (f.eks.
+    1510/1550 for AR og 2410/2460 for AP).
+    """
     arap_ctrl = _read_csv_safe(outdir / "arap_control_accounts.csv", dtype=str)
-    accounts_df = _read_csv_safe(outdir / "accounts.csv", dtype=str)
+    # Først: bruk eventuelt v1.3-filen dersom den inneholder konti
     from_v13 = _ctrl_accounts_from_v13(arap_ctrl, which)
     if from_v13:
         return from_v13
-    return _heuristic_accounts(accounts_df, tx_all, which)
+    # Hvis ikke: bruk konfigurerte standardkonti
+    return AR_CONTROL_ACCOUNTS if which == "AR" else AP_CONTROL_ACCOUNTS
 
 def _ib_cf_from_ctrl(arap_ctrl: Optional[pd.DataFrame], which: str) -> Optional[pd.DataFrame]:
     if arap_ctrl is None or arap_ctrl.empty: return None
@@ -220,11 +322,13 @@ def make_ar_ap_saldolist(outdir: Path, date_from: Optional[str] = None, date_to:
     with _xlsx_writer(path) as xw:
         ar_out = ar.copy()
         ap_out = ap.copy()
+        # Sorter og skriv ut kundeliste og leverandørliste
         ar_out.sort_values(["CustomerName", "CustomerID"], na_position="last").to_excel(xw, index=False, sheet_name="Customers_UB")
         ap_out.sort_values(["SupplierName", "SupplierID"], na_position="last").to_excel(xw, index=False, sheet_name="Suppliers_UB")
         _apply_formats(xw, "Customers_UB", ar_out)
         _apply_formats(xw, "Suppliers_UB", ap_out)
 
+        # Sammendrag for AR og AP (sum av IB, PR og UB fra reskontro)
         summary = pd.DataFrame([
             {"Type": "AR", "Sum_UB": ar["UB_Amount"].sum(), "Sum_IB": ar["IB_Amount"].sum(), "Sum_PR": ar["PR_Amount"].sum()},
             {"Type": "AP", "Sum_UB": ap["UB_Amount"].sum(), "Sum_IB": ap["IB_Amount"].sum(), "Sum_PR": ap["PR_Amount"].sum()},
@@ -234,6 +338,62 @@ def make_ar_ap_saldolist(outdir: Path, date_from: Optional[str] = None, date_to:
         fmt = xw.book.add_format({"num_format": "#,##0.00"})
         ws.set_column(0, 0, 8)
         ws.set_column(1, 3, 14, fmt)
+
+        # Avstemmingsrapport
+        # Finn datointervall å bruke for kontrollsummer
+        tx_all = _read_csv_safe(outdir / "transactions.csv", dtype=str)
+        # default to None if transactions are missing
+        dfrom, dto = _range_dates(Path(outdir), date_from, date_to, tx_all)
+        # AR
+        ctrl_ar = _pick_control_accounts(outdir, "AR", tx_all if tx_all is not None else pd.DataFrame())
+        closing_ar = _closing_nets(outdir, ctrl_ar)
+        partyless_ar = _partyless_per_account(outdir, "AR", dto, ctrl_ar)
+        reskonto_ar = _reskontro_per_account(outdir, "AR", dto, ctrl_ar)
+        # slå sammen til en rapport
+        rec_ar = closing_ar.copy()
+        rec_ar = rec_ar.merge(reskonto_ar, on="AccountID", how="left")
+        rec_ar = rec_ar.merge(partyless_ar, on="AccountID", how="left")
+        rec_ar[["ReskontroAmount", "PartylessAmount"]] = rec_ar[["ReskontroAmount", "PartylessAmount"]].fillna(0.0)
+        rec_ar["TotalSubledger"] = rec_ar["ReskontroAmount"] + rec_ar["PartylessAmount"]
+        rec_ar["Difference"] = rec_ar["ClosingNet"] - rec_ar["TotalSubledger"]
+        rec_ar.insert(0, "Type", "AR")
+        # AP
+        ctrl_ap = _pick_control_accounts(outdir, "AP", tx_all if tx_all is not None else pd.DataFrame())
+        closing_ap = _closing_nets(outdir, ctrl_ap)
+        partyless_ap = _partyless_per_account(outdir, "AP", dto, ctrl_ap)
+        reskonto_ap = _reskontro_per_account(outdir, "AP", dto, ctrl_ap)
+        rec_ap = closing_ap.copy()
+        rec_ap = rec_ap.merge(reskonto_ap, on="AccountID", how="left")
+        rec_ap = rec_ap.merge(partyless_ap, on="AccountID", how="left")
+        rec_ap[["ReskontroAmount", "PartylessAmount"]] = rec_ap[["ReskontroAmount", "PartylessAmount"]].fillna(0.0)
+        rec_ap["TotalSubledger"] = rec_ap["ReskontroAmount"] + rec_ap["PartylessAmount"]
+        rec_ap["Difference"] = rec_ap["ClosingNet"] - rec_ap["TotalSubledger"]
+        rec_ap.insert(0, "Type", "AP")
+        reconciliation = pd.concat([rec_ar, rec_ap], ignore_index=True)
+        # sort for readability
+        reconciliation = reconciliation[["Type","AccountID","AccountDescription","ClosingNet","ReskontroAmount","PartylessAmount","TotalSubledger","Difference"]]
+        reconciliation.to_excel(xw, index=False, sheet_name="Reconciliation")
+        # formater kolonner
+        rec_ws = xw.sheets["Reconciliation"]
+        rec_ws.set_column(0, 0, 8)  # Type
+        rec_ws.set_column(1, 1, 8)  # AccountID
+        rec_ws.set_column(2, 2, 36) # AccountDescription
+        rec_fmt = xw.book.add_format({"num_format": "#,##0.00"})
+        rec_ws.set_column(3, 7, 16, rec_fmt)
+
+        # Partyless-detaljer: lag et eget ark som viser hvilke kontrollkonti som mangler motpart
+        partyless_df = pd.concat([
+            partyless_ar.assign(Type="AR"),
+            partyless_ap.assign(Type="AP"),
+        ], ignore_index=True)
+        if not partyless_df.empty:
+            # reorganiser kolonner
+            partyless_df = partyless_df[["Type", "AccountID", "PartylessAmount"]]
+            partyless_df.to_excel(xw, index=False, sheet_name="Partyless")
+            pl_ws = xw.sheets["Partyless"]
+            pl_ws.set_column(0, 0, 8)
+            pl_ws.set_column(1, 1, 8)
+            pl_ws.set_column(2, 2, 16, rec_fmt)
 
     if write_csv:
         ar2 = ar.copy(); ar2.insert(0, "Type", "AR")
