@@ -47,7 +47,7 @@ def _sum_tx_by_account(
     """Summerer Debit - Credit per kontrollkonto til og med dto.
 
     Parametre:
-        outdir: mappe med transactions.csv
+        outdir: mappe med SAF‑T‑CSV‑filer
         which: "AR" for kunder eller "AP" for leverandører
         dto: dato for siste transaksjon som skal tas med
         ctrl_accounts: sett med reskontrokonti
@@ -55,10 +55,17 @@ def _sum_tx_by_account(
             å summere kun linjer uten part-ID (partyless)
 
     Returnerer en DataFrame med kolonnene AccountID og Amount.
+
+    Filen transactions.csv lokaliseres via _find_csv_file for å støtte
+    ulike plasseringer av datafilene. Hvis filen ikke finnes eller
+    kontrollkontoene er tomme, returneres en tom DataFrame.
     """
-    tx = _read_csv_safe(outdir / "transactions.csv", dtype=str)
+    # Lokaliser transactions.csv med utvidet søk
+    tx_path = _find_csv_file(outdir, "transactions.csv")
+    tx = _read_csv_safe(tx_path, dtype=str) if tx_path else None
     if tx is None or tx.empty or not ctrl_accounts:
         return pd.DataFrame(columns=["AccountID", "Amount"])
+    # Parse datoer og normaliser konti
     tx = _parse_dates(tx, ["TransactionDate", "PostingDate"])
     tx["Date"] = tx["PostingDate"].fillna(tx["TransactionDate"])
     for col in ["AccountID", "CustomerID", "SupplierID"]:
@@ -190,4 +197,8 @@ if __name__ == "__main__":
         "--date_to", type=str, default=None, help="End date (YYYY-MM-DD)"
     )
     args = parser.parse_args()
-    generate_saldolist(Path(args.outdir), args.date_from, args.date_to)
+    try:
+        path = generate_saldolist(Path(args.outdir), args.date_from, args.date_to)
+        print(f"Ferdig! Saldoliste generert i '{path}'.")
+    except FileNotFoundError as exc:
+        print(f"Feil: {exc}")

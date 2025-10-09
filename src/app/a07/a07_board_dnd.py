@@ -28,7 +28,21 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Dict, List, Optional
 
-from models import GLAccount, summarize_gl_by_code
+# Import GLAccount and helper from our package.  Try relative import first;
+# if that fails (e.g. when running without package context), adjust sys.path
+try:
+    from models import GLAccount, summarize_gl_by_code  # type: ignore
+except Exception:
+    try:
+        from .models import GLAccount, summarize_gl_by_code  # type: ignore
+    except Exception:
+        import os, sys
+        # Add the parent directory (../) to sys.path to locate models.py
+        _cur = os.path.dirname(__file__)
+        _parent = os.path.abspath(os.path.join(_cur, '..'))
+        if _parent not in sys.path:
+            sys.path.insert(0, _parent)
+        from models import GLAccount, summarize_gl_by_code  # type: ignore
 
 # Attempt to import TkinterDnD2 for native drag-and-drop support.
 try:

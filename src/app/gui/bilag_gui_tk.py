@@ -246,16 +246,24 @@ class App(tk.Tk):
         self.prefilter_konto = _digits_only(konto) if konto else None
         self.prefilter_bkey  = _bilag_key(bilagsnr) if bilagsnr else None
 
-        # hent klient-rot fra settings. Hvis global konfigurasjon er satt, overstyr denne verdien
+        # Hent klient‑rot fra innstillinger. Dersom brukeren ennå ikke har
+        # definert en root (via StartPortal), returnerer get_clients_root()
+        # None. I så fall forsøker vi å falle tilbake til GLOBAL_CLIENTS_DIR,
+        # men vi overstyrer ikke en verdi som allerede er satt av brukeren.
         self.root_dir = get_clients_root()
-        try:
-            # Dersom global klient-rot er definert, bruk den fremfor eventuell default fra get_clients_root
-            if GLOBAL_CLIENTS_DIR:
+        if (not self.root_dir or not Path(self.root_dir).exists()) and GLOBAL_CLIENTS_DIR:
+            try:
                 self.root_dir = Path(GLOBAL_CLIENTS_DIR)
-        except Exception:
-            pass
-        if not self.root_dir:
-            messagebox.showerror("Mangler klient‑rot", "Fant ikke klient‑rot i settings.")
+            except Exception:
+                self.root_dir = None
+        if not self.root_dir or not Path(self.root_dir).exists():
+            messagebox.showerror(
+                "Mangler klient‑rot", (
+                    "Fant ikke klient‑rot i innstillinger. Gå tilbake til Start‑portalen "
+                    "og bruk knappen “Bytt rot …” for å velge riktig katalog med klientmapper."
+                ),
+                parent=self,
+            )
             self.destroy()
             return
 

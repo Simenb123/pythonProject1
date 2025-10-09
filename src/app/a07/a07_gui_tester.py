@@ -990,6 +990,7 @@ class A07App(BaseTk):
         unmapped_codes.sort(key=lambda kv: abs(kv[1]))
         for code, target in unmapped_codes:
             # Let etter en umappet konto som matcher beløpet innenfor toleranse
+            matched = False
             for acc in self.gl_accounts:
                 accno = acc["konto"]
                 if accno in self.acc_to_code:
@@ -1002,9 +1003,40 @@ class A07App(BaseTk):
                     if abs(float(amt) - target) <= thr:
                         # Sett mapping og gå videre til neste kode
                         self.acc_to_code[accno] = code
+                        matched = True
                         break
                 except Exception:
                     continue
+            # Hvis ingen enkeltkonto ble matchet, forsøk å kombinere to konti som sammen gir beløpet
+            if not matched:
+                # Samle alle umappede konti med beløp
+                remaining: List[Tuple[str, float]] = []
+                for acc2 in self.gl_accounts:
+                    accno2 = acc2["konto"]
+                    if accno2 in self.acc_to_code:
+                        continue
+                    try:
+                        amt2, _lbl2 = self._gl_amount(acc2)
+                    except Exception:
+                        continue
+                    remaining.append((accno2, float(amt2)))
+                n = len(remaining)
+                # Sjekk parvise kombinasjoner
+                for i in range(n):
+                    for j in range(i+1, n):
+                        acc_i, amt_i = remaining[i]
+                        acc_j, amt_j = remaining[j]
+                        try:
+                            if abs((amt_i + amt_j) - target) <= thr:
+                                # Kartlegg begge kontiene til koden
+                                self.acc_to_code[acc_i] = code
+                                self.acc_to_code[acc_j] = code
+                                matched = True
+                                break
+                        except Exception:
+                            continue
+                    if matched:
+                        break
 
     # ---------- LP ----------
     def on_optimize_lp(self):
