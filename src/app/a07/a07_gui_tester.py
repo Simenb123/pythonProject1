@@ -22,15 +22,36 @@ from typing import Any, Dict, List, Tuple, Iterable, Optional, Set
 # ---------- DnD-brett ----------
 # Prøv relativ import hvis vi kjøres som del av pakke; ellers fall tilbake til absolutt import.
 try:
-    from .a07_board import A07Board  # type: ignore[attr-defined]
+    # Prefer the DnD-enabled board if available.
+    from .a07_board_dnd import A07Board  # type: ignore[attr-defined]
 except Exception:
-    from a07_board import A07Board
+    try:
+        from a07_board_dnd import A07Board  # type: ignore[attr-defined]
+    except Exception:
+        # Fallback to the basic board implementation
+        try:
+            from .a07_board import A07Board  # type: ignore[attr-defined]
+        except Exception:
+            from a07_board import A07Board  # type: ignore[attr-defined]
 
 # Import GLAccount for wrapper board
 try:
     from .models import GLAccount
 except Exception:
     from models import GLAccount
+
+# Attempt to import TkinterDnD2 to enable native drag‑and‑drop at the root level
+try:
+    from tkinterdnd2 import TkinterDnD  # type: ignore
+    HAVE_DND_ROOT = True
+except Exception:
+    HAVE_DND_ROOT = False
+
+# Select the appropriate Tk base class: use TkinterDnD.Tk if available, else tkinter.Tk
+if HAVE_DND_ROOT:
+    BaseTk = TkinterDnD.Tk  # type: ignore
+else:
+    BaseTk = tk.Tk
 
 class AssignmentBoard(A07Board):
     """Compatibility wrapper around A07Board to support legacy interface.
@@ -394,7 +415,7 @@ class Table(ttk.Treeview):
 
 # --------------------------- GUI ---------------------------
 
-class A07App(tk.Tk):
+class A07App(BaseTk):
     # ---------- Preferanser ----------
     def _prefs_file(self) -> str:
         return os.path.join(os.path.expanduser("~"), ".a07_prefs.json")

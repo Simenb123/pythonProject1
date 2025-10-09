@@ -30,6 +30,14 @@ from typing import Callable, Dict, List, Optional
 
 from models import GLAccount, summarize_gl_by_code
 
+# Attempt to import TkinterDnD2 for native drag-and-drop support.
+try:
+    from tkinterdnd2 import DND_TEXT, COPY  # type: ignore
+    HAVE_DND = True
+except Exception:
+    # If TkinterDnD2 is not available, fall back to manual DnD
+    HAVE_DND = False
+
 
 class A07Board(ttk.Frame):
     """Interaktivt DnD-brett for å mappe GL-konti til A07-koder."""
@@ -67,9 +75,24 @@ class A07Board(ttk.Frame):
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         # Bind drag‑events på kontolisten
-        self.tree.bind("<ButtonPress-1>", self._on_tree_press)
-        self.tree.bind("<B1-Motion>", self._on_drag_motion)
-        self.tree.bind("<ButtonRelease-1>", self._on_drag_release)
+        if HAVE_DND:
+            # Register the Treeview as a native drag source.  When the user
+            # drags with mouse button 1, <<DragInitCmd>> will be invoked.
+            try:
+                # The DnD API will add methods to widgets if the root window
+                # derives from TkinterDnD.Tk.  If not, registration is a no-op.
+                self.tree.drag_source_register(1, DND_TEXT)
+                self.tree.dnd_bind("<<DragInitCmd>>", self._on_dnd_start)
+            except Exception:
+                # If registration fails, fall back to manual drag events.
+                self.tree.bind("<ButtonPress-1>", self._on_tree_press)
+                self.tree.bind("<B1-Motion>", self._on_drag_motion)
+                self.tree.bind("<ButtonRelease-1>", self._on_drag_release)
+        else:
+            # Manual drag-and-drop for environments without TkinterDnD2
+            self.tree.bind("<ButtonPress-1>", self._on_tree_press)
+            self.tree.bind("<B1-Motion>", self._on_drag_motion)
+            self.tree.bind("<ButtonRelease-1>", self._on_drag_release)
         # Høyre panel: A07-kodekort
         right_frame = ttk.Frame(self)
         right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 8), pady=8)
@@ -183,6 +206,17 @@ class A07Board(ttk.Frame):
             ttk.Label(totals, text=f"GL: {gl_value:,.2f}".replace(",", " ").replace(".", ","), foreground="#424242").pack(side=tk.LEFT, padx=(8, 0))
             colour = "#2e7d32" if abs(diff) < 1e-2 else "#c62828"
             ttk.Label(totals, text=f"Diff: {diff:,.2f}".replace(",", " ").replace(".", ","), foreground=colour).pack(side=tk.LEFT, padx=(8, 0))
+            # Add a small label showing which basis (UB, Endring, Beløp, Auto) is being used
+            # Convert internal basis code to a user-friendly label
+            basis_map = {
+                "ub": "UB",
+                "endring": "Endring",
+                "belop": "Beløp",
+                "ib": "IB",
+                "auto": "Auto",
+            }
+            display_basis = basis_map.get(self.basis.lower(), self.basis)
+            ttk.Label(totals, text=f"Basis: {display_basis}", foreground="#424242").pack(side=tk.LEFT, padx=(8, 0))
             # Tomt drop-område – farger kan endres ved drag-over
             drop_area = ttk.Frame(card)
             drop_area.grid(row=2, column=0, sticky="ew", padx=4, pady=(2, 2))
@@ -198,6 +232,13 @@ class A07Board(ttk.Frame):
                 for accno_, amt_ in accounts_for_code:
                     lstbox.insert(tk.END, f"{accno_}: {amt_:,.2f}".replace(",", " ").replace(".", ","))
                 lstbox.pack(side=tk.TOP, fill=tk.X)
+            # If TkinterDnD2 is available, register this card as a drop target
+            if HAVE_DND:
+                try:
+                    card.drop_target_register(DND_TEXT)
+                    card.dnd_bind("<<Drop>>", lambda e, c=code: self._on_dnd_drop(e, c))
+                except Exception:
+                    pass
             # neste kort-posisjon
             if col == 1:
                 col = 0
@@ -259,3 +300,56 @@ class A07Board(ttk.Frame):
                 except Exception:
                     pass
                 break
+
+    # --- TkinterDnD2 handler to initiate drag ---
+    def _on_dnd_start(self, event):
+        """Called when a drag is initiated on the treeview.
+
+        Returns a tuple (actions, types, data) describing the drag.  The data
+        is the account number of the row being dragged.  This method is only
+        used when TkinterDnD2 is available.
+        """
+        # Determine which row is being dragged: prefer current selection.
+        item_id = None
+        sel = self.tree.selection()
+        if sel:
+            item_id = sel[0]
+        else:
+            item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return None
+        vals = self.tree.item(item_id, "values")
+        if not vals:
+            return None
+        accno = str(vals[0])
+        # Remember the account number for potential fallback
+        self._drag_acc = accno
+        # Provide copy action, text type, and account number as data
+        try:
+            return (COPY, DND_TEXT, accno)
+        except Exception:
+            return ("copy", "text/plain", accno)
+
+    # --- TkinterDnD2 handler to process drop ---
+    def _on_dnd_drop(self, event, code: str):
+        """Handle a drop on a code card when using TkinterDnD2.
+
+        The event's data contains the account number as a string.  Maps the
+        corresponding GLAccount to the specified A07 code and returns the
+        desired drop action.
+        """
+        try:
+            accno = str(event.data).strip().strip("{}")
+        except Exception:
+            accno = None
+        if not accno:
+            return "refuse_drop"
+        # Find the GLAccount matching this account number
+        for acc in self.accounts:
+            if acc.konto == accno:
+                try:
+                    self.on_map(acc, code)
+                except Exception:
+                    pass
+                break
+        return "copy"
