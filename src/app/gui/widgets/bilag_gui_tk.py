@@ -69,6 +69,48 @@ def _import_all():
  year_paths,
  DataTable) = _import_all()
 
+# -------------------------------------------------------------
+# Global konfigurasjon: kildefiler og klientrot
+# -------------------------------------------------------------
+# Standardstier som brukes dersom de ikke finnes i meta eller defineres i miljø.
+# Disse kan overstyres via miljøvariablene BHL_KILDEFILER_DIR og BHL_CLIENTS_DIR,
+# eller via en global_config.json som ligger i prosjektmappen eller kildefil-mappen.
+GLOBAL_KILDEFILER_DIR: str = os.environ.get("BHL_KILDEFILER_DIR", r"F:\\Dokument\\Kildefiler")
+GLOBAL_CLIENTS_DIR: str = os.environ.get("BHL_CLIENTS_DIR", r"F:\\Dokument\\2\\BHL klienter\\Klienter")
+
+def _load_global_config() -> None:
+    """Oppdater globale stier fra global_config.json dersom den finnes."""
+    global GLOBAL_KILDEFILER_DIR, GLOBAL_CLIENTS_DIR
+    # Søk etter configfil i prosjektroten eller i kildefil-katalogen
+    candidates = []
+    try:
+        base1 = Path(__file__).resolve().parents[3]
+        candidates.append(base1 / "global_config.json")
+    except Exception:
+        pass
+    try:
+        base2 = Path(__file__).resolve().parents[2]
+        candidates.append(base2 / "global_config.json")
+    except Exception:
+        pass
+    try:
+        candidates.append(Path(GLOBAL_KILDEFILER_DIR) / "global_config.json")
+    except Exception:
+        pass
+    for cfg_path in candidates:
+        try:
+            if cfg_path.exists():
+                with cfg_path.open("r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    GLOBAL_KILDEFILER_DIR = cfg.get("kildefiler_dir", GLOBAL_KILDEFILER_DIR)
+                    GLOBAL_CLIENTS_DIR = cfg.get("clients_root", GLOBAL_CLIENTS_DIR)
+                    break
+        except Exception:
+            continue
+
+_load_global_config()
+
 # --- regnskapslinjer (valgbar) ---
 try:
     from app.services.regnskapslinjer import try_map_saldobalanse_to_regnskapslinjer
@@ -169,7 +211,14 @@ class App(tk.Tk):
         self.prefilter_konto = _digits_only(konto) if konto else None
         self.prefilter_bkey  = _bilag_key(bilagsnr) if bilagsnr else None
 
+        # hent klient-rot fra settings. Hvis global konfigurasjon er satt, overstyr denne verdien
         self.root_dir = get_clients_root()
+        try:
+            # Dersom global klient-rot er definert, bruk den fremfor eventuell default fra get_clients_root
+            if GLOBAL_CLIENTS_DIR:
+                self.root_dir = Path(GLOBAL_CLIENTS_DIR)
+        except Exception:
+            pass
         if not self.root_dir:
             messagebox.showerror("Mangler klient‑rot", "Fant ikke klient‑rot i settings.")
             self.destroy()
@@ -177,6 +226,20 @@ class App(tk.Tk):
 
         # meta (for persist av UI‑pref og filbaner)
         self.meta = load_meta(self.root_dir, self.client)
+        # sørg for at global kildefil-rot er lagret i preferanser dersom det ikke finnes
+        try:
+            prefs = self.meta.setdefault("years", {}).setdefault(str(self.year), {}).setdefault("ui_prefs", {})
+            if not prefs.get(_PREF_KILDE_DIR) or not Path(prefs.get(_PREF_KILDE_DIR, "")).exists():
+                prefs[_PREF_KILDE_DIR] = str(GLOBAL_KILDEFILER_DIR)
+                save_meta(self.root_dir, self.client, self.meta)
+        except Exception:
+            pass
+        # sett miljøvariabler som brukes av tjenester til å finne kildefiler og klientkatalog
+        try:
+            os.environ.setdefault("AO7_KILDEFILER_DIR", str(GLOBAL_KILDEFILER_DIR))
+            os.environ.setdefault("AO7_CLIENTS_ROOT", str(GLOBAL_CLIENTS_DIR))
+        except Exception:
+            pass
 
         self.title(f"Bilagsanalyse – {client} ({year}, {source}/{vtype})")
         self.geometry("1220x780")
@@ -715,63 +778,41 @@ class App(tk.Tk):
                 messagebox.showwarning("Ingen mapping", f"Fant ikke kildefiler for regnskapslinjer.\nDetalj: {reason}", parent=self)
                 return
             # rows_df har bare mappede rader; flett inn i originalen for å beholde evt. umappede
-            # Vi bruker kolonnene 'konto', 'regnskapsnr' og 'regnskapsnavn' hvis de finnes.
             lut = rows_df[["konto", "regnskapsnr", "regnskapsnavn"]].dropna(subset=["regnskapsnr"]).copy()
-            # lag et numerisk nøkkelfelt for konto til matching; behold original konto uendret
-            lut["__konto_int__"] = pd.to_numeric(lut["konto"], errors="coerce").astype("Int64")
-            # trekk ut det numeriske regnr som tekst (bevarer eventuelle ledende nuller)
-            lut["__regnr_digits__"] = (
-                lut["regnskapsnr"].astype(str).str.extract(r"(\d+)", expand=False)
-            )
+            # sørg for int konto
+            lut["konto"] = pd.to_numeric(lut["konto"], errors="coerce").astype("Int64")
+            # tolke regnskapsnr: kan være tekst som "510 - Utvikling"
+            lut["regnskapsnr"] = lut["regnskapsnr"].apply(lambda v: _extract_first_int(v))
             base = self.df_full.copy()
-            # base skal beholde original 'konto' som tekst/objekt; vi lager en numerisk nøkkel for matching
-            base["__konto_int__"] = pd.to_numeric(base["konto"], errors="coerce").astype("Int64")
-            # slå sammen base med LUT på det numeriske kontonummeret
-            out = base.merge(lut, how="left", on="__konto_int__", suffixes=("", "_y"))
-            # sett regnr-kolonnen som ren tekst; manglende verdi blir blank
-            out["regnr"] = out["__regnr_digits__"].fillna("").astype(str)
-            # regnskapslinje hentes direkte fra regnskapsnavn (teksten);
-            # fyll først manglende med tom streng før str()-konvertering for å unngå 'nan'
-            out["regnskapslinje"] = out["regnskapsnavn"].fillna("").astype(str)
+            base["konto"] = pd.to_numeric(base["konto"], errors="coerce").astype("Int64")
+            out = base.merge(lut, how="left", on="konto")
+            # vis som tekst uten desimaler i tabellen
+            out["regnr"] = out["regnskapsnr"].astype("Int64").astype("string")
+            out["regnskapslinje"] = out["regnskapsnavn"].astype("string")
             # oppdater interne mappinger og lagre for senere bruk
-            # Bruk __konto_int__ og __regnr_digits__ for regnr-verdier; hopp over rader uten regnr
-            reg_map = lut.dropna(subset=["__konto_int__", "__regnr_digits__"]).copy()
+            reg_map = lut.dropna(subset=["konto", "regnskapsnr"]).copy()
             for _, row in reg_map.iterrows():
-                konto_int = row["__konto_int__"]
-                regnr_str = row["__regnr_digits__"]
-                if pd.isna(konto_int) or not regnr_str:
+                konto_val = row["konto"]
+                regnr_val = row["regnskapsnr"]
+                if pd.isna(konto_val) or pd.isna(regnr_val):
                     continue
-                try:
-                    k_int = int(konto_int)
-                    r_int = int(regnr_str)
-                except Exception:
+                k_int = _extract_first_int(konto_val)
+                r_int = _extract_first_int(regnr_val)
+                if k_int is None or r_int is None:
                     continue
                 self._konto2regnr[str(k_int)] = r_int
-                # lagre navn på regnr hvis vi har det
-                nav = row.get("regnskapsnavn")
-                if nav and not pd.isna(nav):
-                    self._regnr2name[r_int] = str(nav)
+                if not pd.isna(row.get("regnskapsnavn")):
+                    self._regnr2name[r_int] = str(row["regnskapsnavn"])
             self._save_regnr_map()
-            # rydd opp ekstra kolonner fra LUT før vi viser
-            # behold de originale 'konto' og 'kontonavn'-kolonnene fra base
-            drop_cols = [c for c in ("regnskapsnr", "regnskapsnavn", "__regnr_digits__", "__konto_int__", "__konto_int___y") if c in out.columns]
-            # også dropp eventuelle duplikatkolonner med suffiks _y (fra lut)
-            drop_cols += [c for c in out.columns if c.endswith("_y")]
-            self.df_full = out.drop(columns=drop_cols)
-            # bestem rekkefølgen: vis konto, kontonavn, regnr, regnskapslinje først
+            # rydd og vis
+            self.df_full = out.drop(columns=[c for c in ("regnskapsnr", "regnskapsnavn") if c in out.columns])
             cols = [c for c in ("konto", "kontonavn", "regnr", "regnskapslinje") if c in self.df_full.columns]
             cols += [c for c in self.df_full.columns if c not in cols and not str(c).startswith("__")]
-            # oppdater tabellen med nye kolonner
             self.table.set_dataframe(self.df_full[cols], reset=True)
             self.table.refresh()
-            # beregn hvor mange konti som fikk mapping
-            mapped = int(lut["__konto_int__"].nunique())
-            total = int(base["__konto_int__"].dropna().nunique())
-            messagebox.showinfo(
-                "OK",
-                f"Mappet {mapped} av {total} konti (lagret sti til kildefiler i settings).",
-                parent=self,
-            )
+            mapped = int(lut["konto"].nunique())
+            total = int(base["konto"].dropna().nunique())
+            messagebox.showinfo("OK", f"Mappet {mapped} av {total} konti (lagret sti til kildefiler i settings).", parent=self)
         except Exception as exc:
             messagebox.showerror("Mapping feilet", f"{type(exc).__name__}: {exc}", parent=self)
 
