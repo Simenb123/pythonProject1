@@ -28,7 +28,21 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Dict, List, Optional
 
-from models import GLAccount, summarize_gl_by_code
+# Import GLAccount and helper from our package.  Try relative import first;
+# if that fails (e.g. when running without package context), adjust sys.path
+try:
+    from models import GLAccount, summarize_gl_by_code  # type: ignore
+except Exception:
+    try:
+        from .models import GLAccount, summarize_gl_by_code  # type: ignore
+    except Exception:
+        import os, sys
+        # Add the parent directory (../) to sys.path to locate models.py
+        _cur = os.path.dirname(__file__)
+        _parent = os.path.abspath(os.path.join(_cur, '..'))
+        if _parent not in sys.path:
+            sys.path.insert(0, _parent)
+        from models import GLAccount, summarize_gl_by_code  # type: ignore
 
 # Attempt to import TkinterDnD2 for native drag-and-drop support.
 try:
@@ -246,6 +260,26 @@ class A07Board(ttk.Frame):
             else:
                 col = 1
 
+        # Legg til en egen "fjern mapping"-boks som drop-target for unmapping.
+        # Denne boksen lar brukeren dra en konto hit for å fjerne tilordningen.
+        # Den vises som et eget kort nederst på brettet.
+        unmap_card = ttk.Frame(self.cards_container, relief=tk.RIDGE, borderwidth=1)
+        unmap_card.grid(row=row, column=col, padx=6, pady=6, sticky="ew")
+        unmap_card.columnconfigure(0, weight=1)
+        # Lagre en tom drop_code for å indikere unmapping
+        unmap_card.drop_code = ""  # type: ignore[attr-defined]
+        header_un = ttk.Frame(unmap_card)
+        header_un.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+        ttk.Label(header_un, text="Fjern mapping", font=("TkDefaultFont", 10, "bold")).pack(side=tk.LEFT, anchor="w")
+        ttk.Label(unmap_card, text="Slipp konto her for å fjerne mapping", foreground="#555").grid(row=1, column=0, sticky="w", padx=4, pady=(0,4))
+        # Registrer som drop target dersom TkinterDnD2 er tilgjengelig
+        if HAVE_DND:
+            try:
+                unmap_card.drop_target_register(DND_TEXT)
+                unmap_card.dnd_bind("<<Drop>>", lambda e, c="": self._on_dnd_drop(e, c))
+            except Exception:
+                pass
+
     # -----------------------------------------------------------------
     # Drag‑and‑drop håndtering
     # -----------------------------------------------------------------
@@ -290,9 +324,19 @@ class A07Board(ttk.Frame):
                 code = getattr(target, "drop_code")
                 break
             target = target.master  # type: ignore[attr-defined]
-        if not code:
+        if code is None:
             return
-        # Finn GLAccount-objektet med gitt kontonummer
+        # Hvis koden er tom streng (""), fjern mapping for denne kontoen
+        if code == "":
+            for acc in self.accounts:
+                if acc.konto == accno:
+                    try:
+                        self.on_map(acc, "")
+                    except Exception:
+                        pass
+                    break
+            return
+        # Ellers utfør mapping til koden
         for acc in self.accounts:
             if acc.konto == accno:
                 try:

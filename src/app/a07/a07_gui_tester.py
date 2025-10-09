@@ -14,6 +14,26 @@ Bygger videre på eksisterende prosjektstruktur (regelbok/fallback/LP).
 
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# Path setup: dynamically adjust sys.path so that modules like ``models.py``
+# and ``a07_board.py`` can be imported regardless of the working directory.
+# This is necessary when running this script from a different location (e.g.
+# ``src/app/gui/widgets``) where relative imports fail.  We ascend the
+# directory tree until we find ``models.py`` and insert that directory into
+# ``sys.path``.  Once the root is on sys.path, normal absolute imports work.
+import os as _os, sys as _sys
+_this_dir = _os.path.dirname(_os.path.abspath(__file__))
+_potential_root = _this_dir
+for _i in range(6):
+    if _os.path.isfile(_os.path.join(_potential_root, 'models.py')):
+        if _potential_root not in _sys.path:
+            _sys.path.insert(0, _potential_root)
+        break
+    _parent = _os.path.dirname(_potential_root)
+    if _parent == _potential_root:
+        break
+    _potential_root = _parent
+
 import csv, io, json, os, re, tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from collections import defaultdict, Counter
@@ -717,7 +737,14 @@ class A07App(BaseTk):
             return self._gl_amount(acc)[0]
 
         def _on_drop(accno: str, code: str):
-            self.acc_to_code[str(accno)] = str(code)
+            # Hvis koden er tom eller None, fjern mapping for denne kontoen; ellers sett
+            if code:
+                self.acc_to_code[str(accno)] = str(code)
+            else:
+                try:
+                    self.acc_to_code.pop(str(accno), None)
+                except Exception:
+                    pass
             self.use_lp_assignment = False
             self.refresh_control_tables()
 
@@ -872,12 +899,16 @@ class A07App(BaseTk):
             accno = acc["konto"]
             if accno in suggestions: self.acc_to_code[accno] = suggestions[accno]["kode"]
         self.use_lp_assignment = False
+        # Etter at regelbok/fallback har foreslått koder, forsøk enkel beløpsmatch
+        try:
+            self._smart_amount_match(a07_sums)
+        except Exception:
+            pass
+        # Oppdater visningen etter auto‑mapping og beløpsmatch
         self.refresh_control_tables()
-        # Etter at regelbok/fallback har foreslått koder, kjør LP-optimalisering
-        # for å matche beløp dersom LP-hjelperen er tilgjengelig og splits er tillatt.
+        # Kjør LP-optimalisering for å fordele beløp dersom den er tilgjengelig og splits er tillatt
         try:
             if HAVE_LP and self.allow_splits.get():
-                # Kjør global matching for å fordele beløp og minimere diff
                 self.on_optimize_lp()
         except Exception:
             pass
@@ -914,6 +945,49 @@ class A07App(BaseTk):
             self.acc_to_code.clear(); self.auto_suggestions.clear()
             self.use_lp_assignment = False; self.lp_assignment.clear(); self.lp_fixed.clear(); self.lp_amounts.clear()
             self.refresh_control_tables()
+
+    # ----- Beløpsbasert automatching -----
+    def _smart_amount_match(self, a07_sums: Dict[str,float], tolerance: float | None = None) -> None:
+        """
+        Forsøk å matche GL‑konti til A07‑koder basert på likt beløp.
+
+        Denne funksjonen ser på alle koder i ``a07_sums`` som foreløpig ikke har
+        fått noe regnskapsbeløp (dvs. GL (mappet) = 0).  Hvis det finnes en
+        konto som ennå ikke er mappet, og kontobeløpet (i valgt basis) er
+        lik A07‑summen innenfor en toleranse, settes mappingen direkte.
+
+        Args:
+            a07_sums: Summer per A07‑kode fra A07‑rapporten.
+            tolerance: Maksimalt akseptert avvik i NOK mellom A07 og GL.  Hvis
+                ``None`` brukes ``self.diff_threshold.get()`` som terskel.
+        """
+        try:
+            thr = float(tolerance) if tolerance is not None else float(self.diff_threshold.get())
+        except Exception:
+            thr = 0.0
+        # Beregn GL-sum per kode med gjeldende mapping (uten LP)
+        gl_per_code: Dict[str, float] = defaultdict(float)
+        for acc in self.gl_accounts:
+            code = self.acc_to_code.get(acc["konto"])
+            if not code:
+                continue
+            amt, _lbl = self._gl_amount(acc)
+            gl_per_code[code] += float(amt)
+        # Finn koder uten regnskap (GL-sum = 0 eller ikke i dict)
+        for code, a07_sum in a07_sums.items():
+            if gl_per_code.get(code, 0.0) != 0.0:
+                continue  # allerede mappet
+            target = float(a07_sum)
+            # Let etter en umappet konto som matcher beløpet
+            for acc in self.gl_accounts:
+                accno = acc["konto"]
+                if accno in self.acc_to_code:
+                    continue
+                amt, _lbl = self._gl_amount(acc)
+                if abs(float(amt) - target) <= thr:
+                    # Sett mapping og gå videre til neste kode
+                    self.acc_to_code[accno] = code
+                    break
 
     # ---------- LP ----------
     def on_optimize_lp(self):
