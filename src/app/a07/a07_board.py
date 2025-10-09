@@ -112,6 +112,13 @@ class A07Board(ttk.Frame):
         self.tree.column("konto", width=80, anchor=tk.W)
         self.tree.column("navn", width=200, anchor=tk.W)
         self.tree.column("belop", width=100, anchor=tk.E)
+        # Define tags for row highlighting in the account list.  A green
+        # background indicates the account's code has been fully reconciled
+        # (diff near zero), while yellow indicates the account is mapped but
+        # the difference for its code is non-zero.  Unmapped accounts have
+        # no tag and use the default background.
+        self.tree.tag_configure("complete", background="#e8f5e9")
+        self.tree.tag_configure("partial", background="#fff8e1")
         scrollbar = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -169,7 +176,17 @@ class A07Board(ttk.Frame):
         # Clear existing rows
         for iid in self.tree.get_children():
             self.tree.delete(iid)
-        # Populate with filtered accounts
+        # Compute GL sums per code using the selected basis for highlighting
+        try:
+            gl_sums = summarize_gl_by_code(self.accounts, self.mapping, basis=self.basis)
+        except Exception:
+            gl_sums = {}
+        # Build diff map: A07-sum minus GL-sum for each code
+        diff_map: Dict[str, float] = {}
+        for code, a07_val in self.a07_sums.items():
+            gl_val = float(gl_sums.get(code, 0.0))
+            diff_map[code] = float(a07_val) - gl_val
+        # Populate with filtered accounts, assigning tags based on mapping and diff
         for acc in self.accounts:
             if query and (query not in acc.konto.lower() and query not in acc.navn.lower()):
                 continue
@@ -180,9 +197,18 @@ class A07Board(ttk.Frame):
                 amount = acc.belop
             else:
                 amount = acc.endring
+            tag = None
+            code = self.mapping.get(acc.konto)
+            if code:
+                # Consider the difference: if close to zero, mark as complete; else partial
+                if abs(diff_map.get(code, 0.0)) < 1.0:
+                    tag = "complete"
+                else:
+                    tag = "partial"
             self.tree.insert(
                 "", tk.END,
                 values=(acc.konto, acc.navn, f"{amount:,.2f}".replace(",", " ").replace(".", ",")),
+                tags=(tag,) if tag else (),
             )
 
     def refresh_codes(self) -> None:

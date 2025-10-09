@@ -84,6 +84,11 @@ class A07Board(ttk.Frame):
         self.tree.column("konto", width=80, anchor=tk.W)
         self.tree.column("navn", width=200, anchor=tk.W)
         self.tree.column("belop", width=100, anchor=tk.E)
+        # Define tags for row highlighting.  Green indicates that the
+        # mapped code is fully reconciled (diff ~ 0) and yellow indicates
+        # that the account is mapped but the code still has a difference.
+        self.tree.tag_configure("complete", background="#e8f5e9")
+        self.tree.tag_configure("partial", background="#fff8e1")
         scrollbar = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -153,7 +158,19 @@ class A07Board(ttk.Frame):
         # Tøm tidligere rader
         for iid in self.tree.get_children():
             self.tree.delete(iid)
-        # Legg til filtrerte kontoer
+        # Beregn GL-summer per kode og differanse mot A07 for tagging.
+        # Vi bruker summarize_gl_by_code for å beregne GL-summer basert på
+        # gjeldende mapping og valgt basis.
+        try:
+            gl_sums = summarize_gl_by_code(self.accounts, self.mapping, basis=self.basis)
+        except Exception:
+            gl_sums = {}
+        # Lag diff-map for hver kode: A07-sum minus GL-sum
+        diff_map: Dict[str, float] = {}
+        for code, a07_val in self.a07_sums.items():
+            gl_val = float(gl_sums.get(code, 0.0))
+            diff_map[code] = float(a07_val) - gl_val
+        # Legg til filtrerte kontoer med eventuelle highlight-tags
         for acc in self.accounts:
             if query and (query not in acc.konto.lower() and query not in acc.navn.lower()):
                 continue
@@ -164,9 +181,21 @@ class A07Board(ttk.Frame):
                 amount = acc.belop
             else:
                 amount = acc.endring
+            # Bestem tag basert på mapping og diff
+            tag = None
+            code = self.mapping.get(acc.konto)
+            if code:
+                # Et beløp anses som fullstendig avstemt hvis diff for koden er
+                # svært liten (mindre enn 1 kr).  Ellers markeres som delvis.
+                if abs(diff_map.get(code, 0.0)) < 1.0:
+                    tag = "complete"
+                else:
+                    tag = "partial"
             self.tree.insert(
-                "", tk.END,
+                "",
+                tk.END,
                 values=(acc.konto, acc.navn, f"{amount:,.2f}".replace(",", " ").replace(".", ",")),
+                tags=(tag,) if tag else (),
             )
 
     # -----------------------------------------------------------------
