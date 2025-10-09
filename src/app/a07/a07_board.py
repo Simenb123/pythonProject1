@@ -37,34 +37,7 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Dict, List, Optional
 
-# Import GLAccount and helper from our package with graceful fallback.
-# We try absolute import first, then relative import. If both fail, we
-# dynamically add the project root to sys.path so ``models.py`` can be found
-# regardless of the current working directory.  This allows the board to
-# function when executed outside the package context (e.g. from a nested
-# ``gui/widgets`` directory).
-try:
-    from models import GLAccount, summarize_gl_by_code  # type: ignore
-except Exception:
-    try:
-        from .models import GLAccount, summarize_gl_by_code  # type: ignore
-    except Exception:
-        import os, sys
-        # Determine the absolute path of the current file and ascend until
-        # ``models.py`` is found.  Insert that directory into sys.path.
-        _cur_dir = os.path.dirname(os.path.abspath(__file__))
-        _potential = _cur_dir
-        for _i in range(6):
-            if os.path.isfile(os.path.join(_potential, 'models.py')):
-                if _potential not in sys.path:
-                    sys.path.insert(0, _potential)
-                break
-            _parent = os.path.dirname(_potential)
-            if _parent == _potential:
-                break
-            _potential = _parent
-        # Try import again after sys.path modification
-        from models import GLAccount, summarize_gl_by_code  # type: ignore
+from models import GLAccount, summarize_gl_by_code
 
 
 class A07Board(ttk.Frame):

@@ -973,21 +973,38 @@ class A07App(BaseTk):
                 continue
             amt, _lbl = self._gl_amount(acc)
             gl_per_code[code] += float(amt)
-        # Finn koder uten regnskap (GL-sum = 0 eller ikke i dict)
+        # Finn koder uten regnskap (GL-sum = 0 eller ikke i dict).  Sorter kodene
+        # etter absolutt A07-beløp slik at små beløp matches først.  Dette
+        # øker sjansen for nøyaktige beløpsmatcher (f.eks. 60 320) før store
+        # beløp (f.eks. 13 000 000).
+        unmapped_codes: List[Tuple[str, float]] = []
         for code, a07_sum in a07_sums.items():
             if gl_per_code.get(code, 0.0) != 0.0:
-                continue  # allerede mappet
-            target = float(a07_sum)
-            # Let etter en umappet konto som matcher beløpet
+                continue
+            try:
+                target = float(a07_sum)
+            except Exception:
+                continue
+            unmapped_codes.append((code, target))
+        # Sorter på absolutt verdi av A07-sum (minste først)
+        unmapped_codes.sort(key=lambda kv: abs(kv[1]))
+        for code, target in unmapped_codes:
+            # Let etter en umappet konto som matcher beløpet innenfor toleranse
             for acc in self.gl_accounts:
                 accno = acc["konto"]
                 if accno in self.acc_to_code:
                     continue
-                amt, _lbl = self._gl_amount(acc)
-                if abs(float(amt) - target) <= thr:
-                    # Sett mapping og gå videre til neste kode
-                    self.acc_to_code[accno] = code
-                    break
+                try:
+                    amt, _lbl = self._gl_amount(acc)
+                except Exception:
+                    continue
+                try:
+                    if abs(float(amt) - target) <= thr:
+                        # Sett mapping og gå videre til neste kode
+                        self.acc_to_code[accno] = code
+                        break
+                except Exception:
+                    continue
 
     # ---------- LP ----------
     def on_optimize_lp(self):
