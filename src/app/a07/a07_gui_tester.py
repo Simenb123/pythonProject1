@@ -457,7 +457,13 @@ class A07App(BaseTk):
         self.json_root: Dict[str,Any] = {}
         self.rows: List[A07Row] = []; self.errors: List[str] = []
         self.gl_accounts: List[Dict[str,Any]] = []; self.gl_meta: Dict[str,Any] = {}
-        self.acc_to_code: Dict[str,str] = {}; self.auto_suggestions: Dict[str,Dict[str,Any]] = {}
+        # Mapping from GL account numbers to one or more A07 codes.  In
+        # earlier versions this was a ``Dict[str,str]``; it has been
+        # generalised to support multiple codes per account.  Use lists of
+        # strings as values.  When a list contains more than one code, the
+        # account's amount will be split equally among those codes.
+        self.acc_to_codes: Dict[str, List[str]] = {}
+        self.auto_suggestions: Dict[str, Dict[str,Any]] = {}
 
         self.gl_basis = tk.StringVar(value="auto")
         self.diff_threshold = tk.DoubleVar(value=100.0)
@@ -739,10 +745,11 @@ class A07App(BaseTk):
         def _on_drop(accno: str, code: str):
             # Hvis koden er tom eller None, fjern mapping for denne kontoen; ellers sett
             if code:
-                self.acc_to_code[str(accno)] = str(code)
+                # Legg til eller erstatte mapping.  Vi bruker kun én kode per konto for nå
+                self.acc_to_codes[str(accno)] = [str(code)]
             else:
                 try:
-                    self.acc_to_code.pop(str(accno), None)
+                    self.acc_to_codes.pop(str(accno), None)
                 except Exception:
                     pass
             self.use_lp_assignment = False
@@ -881,7 +888,7 @@ class A07App(BaseTk):
         except Exception as e:
             messagebox.showerror("Feil ved lesing", f"Kunne ikke lese CSV: {e}"); return
         self.gl_accounts = rows; self.gl_meta = meta
-        self.acc_to_code.clear(); self.auto_suggestions.clear()
+        self.acc_to_codes.clear(); self.auto_suggestions.clear()
         self.use_lp_assignment = False; self.lp_assignment.clear(); self.lp_fixed.clear(); self.lp_amounts.clear()
         self.ctrl_status.configure(text=f"Saldobalanse: {len(rows)} konti.  Kolonner: IB={'ja' if meta.get('ib') else 'nei'}, D={'ja' if meta.get('debet') else 'nei'}, K={'ja' if meta.get('kredit') else 'nei'}, Endr={'ja' if meta.get('endring') else 'nei'}, UB={'ja' if meta.get('ub') else 'nei'}  • Enc: {meta.get('encoding')} • Sep: '{meta.get('delimiter')}'")
         self.refresh_control_tables()
@@ -897,7 +904,9 @@ class A07App(BaseTk):
         self.auto_suggestions = suggestions
         for acc in self.gl_accounts:
             accno = acc["konto"]
-            if accno in suggestions: self.acc_to_code[accno] = suggestions[accno]["kode"]
+            if accno in suggestions:
+                # Replace any existing mapping with a single‑code list
+                self.acc_to_codes[accno] = [suggestions[accno]["kode"]]
         self.use_lp_assignment = False
         # Etter at regelbok/fallback har foreslått koder, forsøk enkel beløpsmatch
         try:
@@ -925,8 +934,11 @@ class A07App(BaseTk):
             val = var.get().strip()
             for item in sel:
                 accno = self.tbl_gl.item(item, "values")[0]
-                if val: self.acc_to_code[accno] = val
-                else: self.acc_to_code.pop(accno, None)
+                if val:
+                    # Set a single‑code list for this account
+                    self.acc_to_codes[accno] = [val]
+                else:
+                    self.acc_to_codes.pop(accno, None)
             self.use_lp_assignment = False
             win.destroy(); self.refresh_control_tables()
         ttk.Button(box, text="OK", command=ok).pack(side=tk.RIGHT); ttk.Button(box, text="Avbryt", command=win.destroy).pack(side=tk.RIGHT, padx=6)
@@ -936,13 +948,14 @@ class A07App(BaseTk):
         if not sel: messagebox.showinfo("Velg konto", "Marker konti du vil fjerne mapping for."); return
         for item in sel:
             accno = self.tbl_gl.item(item, "values")[0]
-            self.acc_to_code.pop(accno, None)
+            # Fjern mapping for denne kontoen (kan være én eller flere koder)
+            self.acc_to_codes.pop(accno, None)
         self.use_lp_assignment = False
         self.refresh_control_tables()
 
     def on_reset_mapping(self):
         if messagebox.askyesno("Nullstill mapping", "Fjern all mapping (manuell + auto + LP)?"):
-            self.acc_to_code.clear(); self.auto_suggestions.clear()
+            self.acc_to_codes.clear(); self.auto_suggestions.clear()
             self.use_lp_assignment = False; self.lp_assignment.clear(); self.lp_fixed.clear(); self.lp_amounts.clear()
             self.refresh_control_tables()
 
@@ -968,11 +981,17 @@ class A07App(BaseTk):
         # Beregn GL-sum per kode med gjeldende mapping (uten LP)
         gl_per_code: Dict[str, float] = defaultdict(float)
         for acc in self.gl_accounts:
-            code = self.acc_to_code.get(acc["konto"])
-            if not code:
+            codes = self.acc_to_codes.get(acc["konto"])
+            if not codes:
                 continue
             amt, _lbl = self._gl_amount(acc)
-            gl_per_code[code] += float(amt)
+            # Split amount equally among codes
+            try:
+                share = float(amt) / len(codes)
+            except Exception:
+                share = 0.0
+            for code in codes:
+                gl_per_code[code] += share
         # Finn koder uten regnskap (GL-sum = 0 eller ikke i dict).  Sorter kodene
         # etter absolutt A07-beløp slik at små beløp matches først.  Dette
         # øker sjansen for nøyaktige beløpsmatcher (f.eks. 60 320) før store
@@ -991,10 +1010,10 @@ class A07App(BaseTk):
         for code, target in unmapped_codes:
             # Let etter en umappet konto som matcher beløpet innenfor toleranse
             matched = False
-            for acc in self.gl_accounts:
-                accno = acc["konto"]
-                if accno in self.acc_to_code:
-                    continue
+        for acc in self.gl_accounts:
+            accno = acc["konto"]
+            if accno in self.acc_to_codes:
+                continue
                 try:
                     amt, _lbl = self._gl_amount(acc)
                 except Exception:
@@ -1002,7 +1021,7 @@ class A07App(BaseTk):
                 try:
                     if abs(float(amt) - target) <= thr:
                         # Sett mapping og gå videre til neste kode
-                        self.acc_to_code[accno] = code
+                        self.acc_to_codes[accno] = [code]
                         matched = True
                         break
                 except Exception:
@@ -1029,8 +1048,8 @@ class A07App(BaseTk):
                         try:
                             if abs((amt_i + amt_j) - target) <= thr:
                                 # Kartlegg begge kontiene til koden
-                                self.acc_to_code[acc_i] = code
-                                self.acc_to_code[acc_j] = code
+                                self.acc_to_codes[acc_i] = [code]
+                                self.acc_to_codes[acc_j] = [code]
                                 matched = True
                                 break
                         except Exception:
@@ -1085,11 +1104,11 @@ class A07App(BaseTk):
             messagebox.showerror("LP-feil", str(e)); return
 
         self.lp_assignment = assignment; self.use_lp_assignment = True
-        self.acc_to_code.clear()
+        self.acc_to_codes.clear()
         for accno, parts in assignment.items():
             if parts:
                 code = max(parts.items(), key=lambda kv: kv[1])[0]
-                self.acc_to_code[accno] = code
+                self.acc_to_codes[accno] = [code]
         self.refresh_control_tables()
         messagebox.showinfo("Optimalisering", "LP‑løsning ferdig. Avstemmingstabellen er oppdatert.")
 
@@ -1200,7 +1219,10 @@ class A07App(BaseTk):
             line = self.det_alt_list.get(idx[0])
             code = line.split()[0]
             if hasattr(self, "_detail_accno") and self._detail_accno and code:
-                self.acc_to_code[self._detail_accno] = code
+                # When choosing an alternative code, replace any existing
+                # mappings with a single‑code list.  Using a list allows
+                # accounts to be mapped to multiple codes in the future.
+                self.acc_to_codes[self._detail_accno] = [code]
                 self.use_lp_assignment = False
                 self.refresh_control_tables()
         except Exception:
@@ -1221,7 +1243,14 @@ class A07App(BaseTk):
         self.det_amount.config(text=f"{lbl}: {fmt_amount(amt)}")
 
         sugg = self.auto_suggestions.get(accno, {})
-        chosen = self.acc_to_code.get(accno, sugg.get("kode",""))
+        # Retrieve chosen code from our multi-code mapping.  If the account
+        # has been mapped to one or more codes, display the first code
+        # in the list.  Otherwise fall back to the suggestion.
+        codes = self.acc_to_codes.get(accno)
+        if isinstance(codes, (list, tuple)):
+            chosen = codes[0] if codes else ""
+        else:
+            chosen = codes or sugg.get("kode", "")
         best_txt = chosen or "–"
         if sugg and chosen == sugg.get("kode",""):
             sc = sugg.get("score", "")
@@ -1250,7 +1279,11 @@ class A07App(BaseTk):
             if self.hide_zero.get() and abs(s) < 1e-9 and abs(float(acc.get("ub",0.0))) < 1e-9: continue
             if q and (q not in str(acc["konto"]).lower()) and (q not in str(acc.get("navn","")).lower()): continue
             sugg = self.auto_suggestions.get(acc["konto"], {})
-            chosen = self.acc_to_code.get(acc["konto"], sugg.get("kode",""))
+            codes = self.acc_to_codes.get(acc["konto"])
+            if isinstance(codes, (list, tuple)):
+                chosen = codes[0] if codes else ""
+            else:
+                chosen = codes or sugg.get("kode", "")
             score = sugg.get("score","") if chosen == sugg.get("kode","") else ""
             reason = sugg.get("reason","") if chosen == sugg.get("kode","") else ""
             if self.use_lp_assignment and self.lp_assignment.get(acc["konto"]):
@@ -1289,14 +1322,24 @@ class A07App(BaseTk):
                 gl_per_code[code] += float(fx)
         else:
             for acc in self.gl_accounts:
-                code = self.acc_to_code.get(acc["konto"])
-                if not code: continue
-                amt,_ = self._gl_amount(acc); gl_per_code[code] += amt; code_to_accounts[code] += 1
+                codes = self.acc_to_codes.get(acc["konto"])
+                if not codes:
+                    continue
+                amt, _ = self._gl_amount(acc)
+                try:
+                    share = float(amt) / len(codes)
+                except Exception:
+                    share = 0.0
+                for code in codes:
+                    gl_per_code[code] += share
+                    code_to_accounts[code] += 1
             if self.rulebook:
                 for code, rule in self.rulebook.get("codes", {}).items():
                     for spec in rule.get("special_add", []):
                         accno = str(spec.get("account","")); basis = str(spec.get("basis","endring")).lower(); weight = float(spec.get("weight", 1.0))
-                        if accno in self.acc_to_code: continue
+                        # Skip if account is already mapped in our multi-code mapping
+                        if accno in self.acc_to_codes:
+                            continue
                         for acc in self.gl_accounts:
                             if str(acc.get("konto")) == accno:
                                 gl_per_code[code] += weight * self._gl_amount_by_basis(acc, basis)
@@ -1328,9 +1371,18 @@ class A07App(BaseTk):
                 # Pass the currently selected basis (auto, ub, endring, belop) so that
                 # the board can display which basis is being used.
                 current_basis = str(self.gl_basis.get() or "endring").lower()
+                # Convert our mapping (list of codes) to a single‑code mapping for the
+                # DnD board by taking the first code in each list.  This board
+                # implementation currently expects a ``Dict[str,str]``.
+                mapping_for_board: Dict[str,str] = {}
+                for accno, codes in self.acc_to_codes.items():
+                    if isinstance(codes, (list, tuple)) and codes:
+                        mapping_for_board[accno] = codes[0]
+                    elif isinstance(codes, str):
+                        mapping_for_board[accno] = codes
                 self.board.supply_data(
                     accounts=accounts_for_board,
-                    acc_to_code=self.acc_to_code,
+                    acc_to_code=mapping_for_board,
                     suggestions=self.auto_suggestions,
                     a07_sums=a07,
                     diff_threshold=float(self.diff_threshold.get()),

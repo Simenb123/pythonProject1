@@ -237,11 +237,15 @@ def map_saldobalanse_to_regnskapslinjer(
     if "konto" not in needed:
         raise ValueError("SB mangler kolonnen 'konto' etter standardisering.")
     # 1) radnivå: legg på regnskapsnr + navn
+    #   Vi kaller kolonnene `regnr` og `regnskapslinje` i returverdien for å være
+    #   konsekvent med GUI-modulen. De opprinnelige navnene `regnskapsnr` og
+    #   `regnskapsnavn` oversettes derfor før vi returnerer.
     rn = _assign_intervals_vectorized(df_sb["konto"], ranges)
     rows = df_sb.copy()
-    rows["regnskapsnr"] = rn
-    rows = rows.dropna(subset=["regnskapsnr"]).copy()
-    rows = rows.merge(lines, on="regnskapsnr", how="left")
+    rows["regnr"] = rn  # regnskapsnummer (string)
+    rows = rows.dropna(subset=["regnr"]).copy()
+    # slå opp navn basert på regnr; behold navnet i kolonnen `regnskapslinje`
+    rows = rows.merge(lines.rename(columns={"regnskapsnr": "regnr", "regnskapsnavn": "regnskapslinje"}), on="regnr", how="left")
     # 2) aggregat pr regnskapslinje
     agg_cols = [c for c in ("inngående balanse", "utgående balanse", "endring") if c in rows.columns]
     if not agg_cols:
@@ -251,8 +255,8 @@ def map_saldobalanse_to_regnskapslinjer(
             agg_cols = ["endring"]
     if not agg_cols:
         raise ValueError("Fant ingen beløpskolonner i SB (forventet IB/UB/endring).")
-    grp = rows.groupby(["regnskapsnr", "regnskapsnavn"], dropna=False)[agg_cols].sum().reset_index()
-    grp = grp.sort_values("regnskapsnr").reset_index(drop=True)
+    grp = rows.groupby(["regnr", "regnskapslinje"], dropna=False)[agg_cols].sum().reset_index()
+    grp = grp.sort_values("regnr").reset_index(drop=True)
     # 3) metadata til manifest
     src_accounts = int(pd.to_numeric(df_sb["konto"], errors="coerce").dropna().nunique())
     mapped_accounts = int(pd.to_numeric(rows["konto"], errors="coerce").dropna().nunique())

@@ -687,29 +687,92 @@ def make_trial_balance(
     # Andre kolonner vi ikke ønsker å vise (f.eks. rå Debit/Credit fra tidligere merges) holdes utenfor
     out_cols = first_cols + value_cols + optional_cols
     out = tb[out_cols]
+
+    # Juster for mikroskopisk differanse i utgående saldo. Når man bruker
+    # flyttall kan summer av ClosingDebit og ClosingCredit gi en svært liten
+    # differanse (f.eks. noen få øre) selv om hovedboken egentlig balanserer.
+    # Dersom denne differansen er mindre enn 1 cent (0.01), justeres den mot
+    # kontoen med ID "0" (hvis den finnes). Dette sikrer at sum UB blir
+    # nøyaktig null uten å påvirke øvrige konti.
+    try:
+        # Konverter relevante kolonner til numeriske midlertidig for justering
+        tmp = out[["AccountID", "ClosingDebit", "ClosingCredit", "IB_OpenNet"]].copy()
+        tmp["ClosingDebit"] = pd.to_numeric(tmp["ClosingDebit"], errors="coerce").fillna(0.0)
+        tmp["ClosingCredit"] = pd.to_numeric(tmp["ClosingCredit"], errors="coerce").fillna(0.0)
+        # Finn differansen mellom sum debit og kredit
+        delta = (tmp["ClosingDebit"].sum() - tmp["ClosingCredit"].sum())
+        if abs(delta) < 0.01:
+            # Finn indeksen for konto "0" (bruk første rad hvis ikke finnes)
+            mask_zero = tmp["AccountID"].astype(str) == "0"
+            if mask_zero.any():
+                idx = tmp.index[mask_zero][0]
+            else:
+                idx = tmp.index[0]
+            # Juster closing debit/credit på valgt rad
+            if delta > 0:
+                # Sum debit for stor → øk kredit for å balansere
+                out.at[idx, "ClosingCredit"] = float(out.at[idx, "ClosingCredit"]) + delta
+            elif delta < 0:
+                # Sum kredit for stor → øk debet
+                out.at[idx, "ClosingDebit"] = float(out.at[idx, "ClosingDebit"]) + (-delta)
+            # Oppdater UB_CloseNet og PR_Accounts hvis de finnes
+            if "UB_CloseNet" in out.columns:
+                # Reberegn UB_closeNet for rad idx
+                cd = pd.to_numeric(out.at[idx, "ClosingDebit"], errors="coerce")
+                cc = pd.to_numeric(out.at[idx, "ClosingCredit"], errors="coerce")
+                out.at[idx, "UB_CloseNet"] = cd - cc
+            if "IB_OpenNet" in out.columns and "PR_Accounts" in out.columns:
+                ib = pd.to_numeric(out.at[idx, "IB_OpenNet"], errors="coerce")
+                ub = pd.to_numeric(out.at[idx, "UB_CloseNet"], errors="coerce") if "UB_CloseNet" in out.columns else pd.to_numeric(out.at[idx, "GL_UB"], errors="coerce")
+                out.at[idx, "PR_Accounts"] = ub - ib
+            if "GL_UB" in out.columns and "UB_CloseNet" in out.columns and "Diff_UB" in out.columns:
+                gl_ub = pd.to_numeric(out.at[idx, "GL_UB"], errors="coerce")
+                ub_close = pd.to_numeric(out.at[idx, "UB_CloseNet"], errors="coerce")
+                out.at[idx, "Diff_UB"] = gl_ub - ub_close
+    except Exception:
+        # Hvis noe går galt, hopp over justering
+        pass
     path = outdir / "trial_balance.xlsx"
     with pd.ExcelWriter(path, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as writer:
         # Lag full TrialBalance-fane
-        out.sort_values("AccountID").to_excel(writer, index=False, sheet_name="TrialBalance")
-        # Lag en enkel fane med kun konto, navn, IB, bevegelse og UB
-        # Bestem kolonnenavn for IB, bevegelse og UB (fallback til GL når kontoplan mangler)
-        ib_col = "IB_OpenNet" if "IB_OpenNet" in tb.columns else "GL_IB"
-        pr_col = "PR_Accounts" if "PR_Accounts" in tb.columns else "GL_PR"
-        ub_col = "UB_CloseNet" if "UB_CloseNet" in tb.columns else "GL_UB"
-        simple_cols = [c for c in ["AccountID", "AccountDescription"] if c in tb.columns]
-        simple_df = tb[simple_cols].copy() if simple_cols else pd.DataFrame()
-        # Legg til IB, bevegelse og UB-kolonner
-        simple_df["IB"] = tb[ib_col]
-        simple_df["Movement"] = tb[pr_col]
-        simple_df["UB"] = tb[ub_col]
-        # Vi fjerner ikke lenger konto-ID "0" fra den enkle balansen. Selv om konto
-        # "0" typisk representerer en ubestemt eller midlertidig konto, kan den ha
-        # reell saldo som trengs for at summen av IB + bevegelse = UB skal bli null.
-        # Dermed beholdes også kontoen med ID "0" i denne enkle rapporten.
-        # Skriv til en egen fane
-        simple_df.sort_values("AccountID" if "AccountID" in simple_df.columns else None).to_excel(
-            writer, index=False, sheet_name="SimpleTrialBalance"
-        )
+        # Rund av alle numeriske verdier til 2 desimaler for å unngå mikroskopiske differanser
+        out_sorted = out.sort_values("AccountID").copy()
+        for col in out_sorted.select_dtypes(include=["float", "float64"]).columns:
+            out_sorted[col] = out_sorted[col].round(2)
+        out_sorted.to_excel(writer, index=False, sheet_name="TrialBalance")
+        # Lag en enkel fane med kun konto, navn, IB, bevegelse og UB.  Når kontoplanen
+        # (accounts.csv) inneholder OpeningDebit/OpeningCredit og ClosingDebit/ClosingCredit,
+        # benytter vi disse til å beregne IB, Movement og UB slik at saldobalansen stemmer med
+        # kontoplanen. Hvis disse feltene mangler (dvs. kontoplanen var ufullstendig),
+        # faller vi tilbake til de genererte GL-kolonnene.
+        simple_cols = [c for c in ["AccountID", "AccountDescription"] if c in out.columns]
+        simple_df = out[simple_cols].copy() if simple_cols else pd.DataFrame()
+        # Sjekk om vi har opening/closing kolonnene tilgjengelig
+        has_open_close = {"OpeningDebit", "OpeningCredit", "ClosingDebit", "ClosingCredit"}.issubset(out.columns)
+        if has_open_close:
+            # Konverter numeriske kolonner til float og beregn netto
+            odeb = pd.to_numeric(out.get("OpeningDebit", 0), errors="coerce").fillna(0.0)
+            ocred = pd.to_numeric(out.get("OpeningCredit", 0), errors="coerce").fillna(0.0)
+            cdeb = pd.to_numeric(out.get("ClosingDebit", 0), errors="coerce").fillna(0.0)
+            ccred = pd.to_numeric(out.get("ClosingCredit", 0), errors="coerce").fillna(0.0)
+            # IB er nettobeløp av opening (Debit - Credit)
+            simple_df["IB"] = (odeb - ocred).round(2)
+            # UB er nettobeløp av closing (Debit - Credit)
+            simple_df["UB"] = (cdeb - ccred).round(2)
+            # Movement er forskjellen mellom UB og IB
+            simple_df["Movement"] = (simple_df["UB"] - simple_df["IB"]).round(2)
+        else:
+            # Fallback: bruk de kolonnene som finnes i tb (IB_OpenNet/PR_Accounts/UB_CloseNet) eller GL
+            ib_col = "IB_OpenNet" if "IB_OpenNet" in tb.columns else "GL_IB"
+            pr_col = "PR_Accounts" if "PR_Accounts" in tb.columns else "GL_PR"
+            ub_col = "UB_CloseNet" if "UB_CloseNet" in tb.columns else "GL_UB"
+            simple_df["IB"] = pd.to_numeric(tb[ib_col], errors="coerce").round(2)
+            simple_df["Movement"] = pd.to_numeric(tb[pr_col], errors="coerce").round(2)
+            simple_df["UB"] = pd.to_numeric(tb[ub_col], errors="coerce").round(2)
+        # Sorter etter AccountID hvis tilgjengelig og skriv til fane
+        if "AccountID" in simple_df.columns:
+            simple_df = simple_df.sort_values("AccountID")
+        simple_df.to_excel(writer, index=False, sheet_name="SimpleTrialBalance")
     return path
 
 
