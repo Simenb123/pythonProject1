@@ -138,7 +138,7 @@ def _svg_html(labels: Dict[NodeId, str], edges: List[Edge], pos: Dict[NodeId, Tu
         fill = "#e9ecef" if is_company else "#ffffff"
         stroke = "#495057" if is_company else "#6c757d"
         node_svgs.append(
-            f'<g class="node" transform="translate({X-80},{Y-30})">'
+            f'<g class="node" data-id="{nid}" transform="translate({X-80},{Y-30})">'
             f'<rect x="0" y="0" rx="8" ry="8" width="160" height="60" '
             f'style="fill:{fill};stroke:{stroke};stroke-width:1.2"/>'
             f'<text x="80" y="25" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" '
@@ -158,11 +158,85 @@ def _svg_html(labels: Dict[NodeId, str], edges: List[Edge], pos: Dict[NodeId, Tu
         x1a, y1a = X1, Y1 + 30
         x2a, y2a = X2, Y2 - 30
         edge_svgs.append(
-            f'<path d="M{x1a},{y1a} C{x1a},{(y1a+y2a)//2} {x2a},{(y1a+y2a)//2} {x2a},{y2a}" '
+            f'<path data-src="{src}" data-dst="{dst}" '
+            f'd="M{x1a},{y1a} C{x1a},{(y1a+y2a)//2} {x2a},{(y1a+y2a)//2} {x2a},{y2a}" '
             f'style="fill:none;stroke:#6c757d;stroke-width:1.2" marker-end="url(#arrow)"/>'
-            f'<text x="{(x1a+x2a)//2}" y="{(y1a+y2a)//2 - 4}" text-anchor="middle" '
+            f'<text data-src="{src}" data-dst="{dst}" x="{(x1a+x2a)//2}" y="{(y1a+y2a)//2 - 4}" text-anchor="middle" '
             f'font-size="11" font-family="Arial, Helvetica, sans-serif" fill="#495057">{esc(lbl)}</text>'
         )
+
+    # Interaktiv skript for å flytte noder med mus og oppdatere kanter. Dette legges til på slutten av HTMLen.
+    script = """
+<script>
+(function() {
+  const nodeWidth = 160;
+  const nodeHeight = 60;
+  function parseTransform(transform) {
+    const match = /translate\(([-0-9.]+),([-0-9.]+)\)/.exec(transform);
+    return {x: parseFloat(match[1]), y: parseFloat(match[2])};
+  }
+  const nodeElems = {};
+  document.querySelectorAll('g.node').forEach(node => {
+    const id = node.getAttribute('data-id');
+    nodeElems[id] = node;
+  });
+  const edgesList = [];
+  document.querySelectorAll('path[data-src]').forEach(pathElem => {
+    const src = pathElem.getAttribute('data-src');
+    const dst = pathElem.getAttribute('data-dst');
+    const textElem = document.querySelector(`text[data-src="${src}"][data-dst="${dst}"]`);
+    edgesList.push({path: pathElem, text: textElem, src: src, dst: dst});
+  });
+  let draggingNode = null;
+  const dragStart = {x: 0, y: 0};
+  const nodeStart = {x: 0, y: 0};
+  function updateEdges(id) {
+    edgesList.forEach(edge => {
+      if (edge.src === id || edge.dst === id) {
+        const srcNode = nodeElems[edge.src];
+        const dstNode = nodeElems[edge.dst];
+        const tSrc = parseTransform(srcNode.getAttribute('transform'));
+        const tDst = parseTransform(dstNode.getAttribute('transform'));
+        const x1 = tSrc.x + nodeWidth / 2;
+        const y1 = tSrc.y + nodeHeight;
+        const x2 = tDst.x + nodeWidth / 2;
+        const y2 = tDst.y;
+        const midY = (y1 + y2) / 2;
+        edge.path.setAttribute('d', `M${x1},${y1} C${x1},${midY} ${x2},${midY} ${x2},${y2}`);
+        edge.text.setAttribute('x', (x1 + x2) / 2);
+        edge.text.setAttribute('y', midY - 4);
+      }
+    });
+  }
+  document.querySelectorAll('g.node').forEach(node => {
+    node.addEventListener('mousedown', function(evt) {
+      draggingNode = this;
+      const trans = parseTransform(this.getAttribute('transform'));
+      nodeStart.x = trans.x;
+      nodeStart.y = trans.y;
+      dragStart.x = evt.clientX;
+      dragStart.y = evt.clientY;
+      evt.preventDefault();
+    });
+  });
+  document.addEventListener('mousemove', function(evt) {
+    if (!draggingNode) return;
+    const dx = evt.clientX - dragStart.x;
+    const dy = evt.clientY - dragStart.y;
+    const newX = nodeStart.x + dx;
+    const newY = nodeStart.y + dy;
+    draggingNode.setAttribute('transform', `translate(${newX},${newY})`);
+    const id = draggingNode.getAttribute('data-id');
+    updateEdges(id);
+  });
+  document.addEventListener('mouseup', function(evt) {
+    if (draggingNode) {
+      draggingNode = null;
+    }
+  });
+})();
+</script>
+"""
 
     html = f"""<!doctype html>
 <html lang="no">
@@ -185,6 +259,7 @@ body{{margin:0;background:#f8f9fa; overflow:auto}}
 {''.join(edge_svgs)}
 {''.join(node_svgs)}
 </svg>
+{script}
 </html>"""
     return html
 
