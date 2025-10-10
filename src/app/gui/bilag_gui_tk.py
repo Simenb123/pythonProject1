@@ -155,6 +155,14 @@ except Exception:
     except Exception:
         try_map_saldobalanse_to_regnskapslinjer = None  # type: ignore
 
+# Fallback: egen robust mappingfunksjon for saldobalanse
+try:
+    # map_saldobalanse_df returnerer DataFrame med regnr og regnskapslinje, gitt en DF og kildestier
+    from sb_regnskapsmapping import map_saldobalanse_df, MapSources  # type: ignore
+except Exception:
+    map_saldobalanse_df = None  # type: ignore
+    MapSources = None  # type: ignore
+
 # -------------------------------------------------------------
 # Hjelpere
 # -------------------------------------------------------------
@@ -246,24 +254,16 @@ class App(tk.Tk):
         self.prefilter_konto = _digits_only(konto) if konto else None
         self.prefilter_bkey  = _bilag_key(bilagsnr) if bilagsnr else None
 
-        # Hent klient‑rot fra innstillinger. Dersom brukeren ennå ikke har
-        # definert en root (via StartPortal), returnerer get_clients_root()
-        # None. I så fall forsøker vi å falle tilbake til GLOBAL_CLIENTS_DIR,
-        # men vi overstyrer ikke en verdi som allerede er satt av brukeren.
+        # hent klient-rot fra settings. Hvis global konfigurasjon er satt, overstyr denne verdien
         self.root_dir = get_clients_root()
-        if (not self.root_dir or not Path(self.root_dir).exists()) and GLOBAL_CLIENTS_DIR:
-            try:
+        try:
+            # Dersom global klient-rot er definert, bruk den fremfor eventuell default fra get_clients_root
+            if GLOBAL_CLIENTS_DIR:
                 self.root_dir = Path(GLOBAL_CLIENTS_DIR)
-            except Exception:
-                self.root_dir = None
-        if not self.root_dir or not Path(self.root_dir).exists():
-            messagebox.showerror(
-                "Mangler klient‑rot", (
-                    "Fant ikke klient‑rot i innstillinger. Gå tilbake til Start‑portalen "
-                    "og bruk knappen “Bytt rot …” for å velge riktig katalog med klientmapper."
-                ),
-                parent=self,
-            )
+        except Exception:
+            pass
+        if not self.root_dir:
+            messagebox.showerror("Mangler klient‑rot", "Fant ikke klient‑rot i settings.")
             self.destroy()
             return
 
@@ -877,33 +877,80 @@ class App(tk.Tk):
 
     def _map_regn(self):
         """Kjør intervall‑mapping (konto -> regnr/regnskapslinje) og oppdater tabellen."""
-        if try_map_saldobalanse_to_regnskapslinjer is None:
-            messagebox.showwarning("Ikke tilgjengelig", "Modul for regnskapslinje‑mapping mangler.", parent=self)
+        """
+        Prøv å kjøre mapping via den sentrale tjenesten
+        ``try_map_saldobalanse_to_regnskapslinjer`` (fra app/services/regnskapslinjer).
+        Hvis den ikke er tilgjengelig eller returnerer ``None``, bruker vi vår egen
+        fallback-mapping fra ``sb_regnskapsmapping`` som leser Regnskapslinjer.xlsx og
+        Mapping standard kontoplan.xlsx fra brukervalgte filer. Resultatet flettes inn
+        i ``self.df_full`` og kolonnene ``regnr`` og ``regnskapslinje`` vises i tabellen.
+        """
+        # Først: forsøk via modulen (hvis tilgjengelig)
+        rows_df: pd.DataFrame | None = None
+        meta: dict = {}
+        if try_map_saldobalanse_to_regnskapslinjer is not None:
+            try:
+                rows_df, _agg, meta = try_map_saldobalanse_to_regnskapslinjer(self.df_full)
+            except Exception:
+                # Ignorer feil her; vi prøver fallback i neste steg
+                rows_df = None
+        if rows_df is None:
+            # Hvis modul ikke finnes eller returnerer None, prøv fallback med direkte filvalg
+            if map_saldobalanse_df is None or MapSources is None:
+                # Ingen mappingfunksjon tilgjengelig
+                reason = meta.get("reason") if meta else "ukjent"
+                messagebox.showwarning(
+                    "Ingen mapping",
+                    "Fant ikke kildefiler for regnskapslinjer eller mapping-funksjon mangler.\n"
+                    f"Detalj: {reason}",
+                    parent=self,
+                )
+                return
+            # Sørg for at vi vet hvilke filer som skal brukes
+            files = self._ensure_regn_files()
+            if not files:
+                return
+            rl_path, map_path = files
+            try:
+                # Kjør robust mapping: returnerer DataFrame med 'regnr' og 'regnskapslinje'
+                mapped_df, _ = map_saldobalanse_df(self.df_full, MapSources(regnskapslinjer_path=rl_path, intervall_path=map_path))
+                rows_df = mapped_df
+            except Exception as exc:
+                messagebox.showerror(
+                    "Mapping feilet",
+                    f"{type(exc).__name__}: {exc}",
+                    parent=self,
+                )
+                return
+            # Oppdater info-linjen for fallback
+            meta = {"reason": "fallback"}
+        # Hvis vi fortsatt ikke har rader, gi beskjed
+        if rows_df is None:
+            reason = (meta or {}).get("reason", "ukjent")
+            messagebox.showwarning(
+                "Ingen mapping",
+                f"Fant ikke kildefiler for regnskapslinjer.\nDetalj: {reason}",
+                parent=self,
+            )
             return
         try:
-            # kall tjenesten – finner 'F:\\Dokument\\Kildefiler' selv og husker sti i settings
-            rows_df, _, meta = try_map_saldobalanse_to_regnskapslinjer(self.df_full)
-            if rows_df is None:
-                reason = (meta or {}).get("reason", "ukjent")
-                messagebox.showwarning("Ingen mapping", f"Fant ikke kildefiler for regnskapslinjer.\nDetalj: {reason}", parent=self)
-                return
-            # rows_df har bare mappede rader; flett inn i originalen for å beholde evt. umappede
-            lut = rows_df[["konto", "regnskapsnr", "regnskapsnavn"]].dropna(subset=["regnskapsnr"]).copy()
+            # rows_df har bare mappede rader; flett inn i originalen for å beholde umappede
+            lut = rows_df[["konto", "regnr", "regnskapslinje"]].dropna(subset=["regnr"]).copy()
             # sørg for int konto
             lut["konto"] = pd.to_numeric(lut["konto"], errors="coerce").astype("Int64")
-            # tolke regnskapsnr: kan være tekst som "510 - Utvikling"
-            lut["regnskapsnr"] = lut["regnskapsnr"].apply(lambda v: _extract_first_int(v))
+            # tolke regnr: kan være tekst som "510 - Utvikling" eller string med sifre
+            lut["regnr_int"] = lut["regnr"].apply(_extract_first_int)
             base = self.df_full.copy()
             base["konto"] = pd.to_numeric(base["konto"], errors="coerce").astype("Int64")
             out = base.merge(lut, how="left", on="konto")
             # vis som tekst uten desimaler i tabellen
-            out["regnr"] = out["regnskapsnr"].astype("Int64").astype("string")
-            out["regnskapslinje"] = out["regnskapsnavn"].astype("string")
+            out["regnr"] = out["regnr_int"].astype("Int64").astype("string")
+            out["regnskapslinje"] = out["regnskapslinje"].astype("string")
             # oppdater interne mappinger og lagre for senere bruk
-            reg_map = lut.dropna(subset=["konto", "regnskapsnr"]).copy()
+            reg_map = lut.dropna(subset=["konto", "regnr_int"]).copy()
             for _, row in reg_map.iterrows():
                 konto_val = row["konto"]
-                regnr_val = row["regnskapsnr"]
+                regnr_val = row["regnr_int"]
                 if pd.isna(konto_val) or pd.isna(regnr_val):
                     continue
                 k_int = _extract_first_int(konto_val)
@@ -911,20 +958,30 @@ class App(tk.Tk):
                 if k_int is None or r_int is None:
                     continue
                 self._konto2regnr[str(k_int)] = r_int
-                if not pd.isna(row.get("regnskapsnavn")):
-                    self._regnr2name[r_int] = str(row["regnskapsnavn"])
+                # bruk navnekolonnen hvis tilgjengelig
+                nm = row.get("regnskapslinje")
+                if isinstance(nm, str) and nm:
+                    self._regnr2name[r_int] = nm
             self._save_regnr_map()
             # rydd og vis
-            self.df_full = out.drop(columns=[c for c in ("regnskapsnr", "regnskapsnavn") if c in out.columns])
+            self.df_full = out.drop(columns=[c for c in ("regnr_int",) if c in out.columns])
             cols = [c for c in ("konto", "kontonavn", "regnr", "regnskapslinje") if c in self.df_full.columns]
             cols += [c for c in self.df_full.columns if c not in cols and not str(c).startswith("__")]
             self.table.set_dataframe(self.df_full[cols], reset=True)
             self.table.refresh()
             mapped = int(lut["konto"].nunique())
             total = int(base["konto"].dropna().nunique())
-            messagebox.showinfo("OK", f"Mappet {mapped} av {total} konti (lagret sti til kildefiler i settings).", parent=self)
+            messagebox.showinfo(
+                "OK",
+                f"Mappet {mapped} av {total} konti (lagret sti til kildefiler i settings).",
+                parent=self,
+            )
         except Exception as exc:
-            messagebox.showerror("Mapping feilet", f"{type(exc).__name__}: {exc}", parent=self)
+            messagebox.showerror(
+                "Mapping feilet",
+                f"{type(exc).__name__}: {exc}",
+                parent=self,
+            )
 
     def _map_to_regnskapslinjer(self):
         """
