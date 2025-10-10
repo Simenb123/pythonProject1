@@ -1,657 +1,674 @@
-# -*- coding: utf-8 -*-
+"""
+run_saft_pro_gui.py – util for generating AR/AP subledger reports and other ledgers.
+
+Dette er en forenklet og skriptvennlig versjon av den opprinnelige SAF‑T‑parseren.
+Modulen genererer reskontro for kunder (AR) og leverandører (AP) fra et sett
+med SAF‑T‑uttrekk (transactions.csv, accounts.csv, customers.csv/suppliers.csv,
+header.csv). Den periodiserer transaksjoner etter dato, beregner IB, PR og
+UB pr part, og skalerer UB slik at summen stemmer med kontoplanens
+utgående saldo for kontrollkontoene (1510/1550 for kunder og 2410/2460 for
+leverandører). Hvis accounts.csv mangler, hentes closing‑netto fra
+trial_balance.xlsx.
+
+Bruk som modul:
+    from run_saft_pro_gui import make_subledger
+    make_subledger(Path('output_dir'), which='AR')
+
+Kjør fra kommandolinje:
+    python run_saft_pro_gui.py [outdir] [--which AR|AP] [--date_from YYYY-MM-DD] [--date_to YYYY-MM-DD]
+
+Hvis outdir ikke angis, brukes nåværende arbeidskatalog. Dette gjør det
+enklere å kjøre skriptet direkte i f.eks. PyCharm.
+"""
+
 from __future__ import annotations
-"""
-run_saft_pro_gui.py  —  Oppdatert for:
-- Fiks: unngå kolonneduplikat (CustomerName_x) ved merge i _party_reports
-- Periode: støtter også v1.3 SelectionStartDate/SelectionEndDate
-- Strammere AR-heuristikk (ikke bruk endswith('10') som standard)
-"""
 
 from pathlib import Path
-from typing import Optional, Tuple, Set, Iterable
-import io, zipfile, xml.etree.ElementTree as ET
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-
+from typing import Optional, Iterable, Set, Tuple
 import pandas as pd
+import datetime as _dt
+import os
 
-from saft_parser_pro_fixed import parse_saft
-from ar_ap_saldolist import make_ar_ap_saldolist  # separat saldoliste
+# Vi importerer parse_saft fra saft_parser_pro for å kunne kjøre full prosess
+try:
+    from saft_parser_pro import parse_saft  # type: ignore
+except Exception:
+    parse_saft = None  # type: ignore
 
-TOL = 0.01  # toleranse i kontroller
+# Optional GUI imports: Only loaded if tkinter is available.  If not, _tk is None.
+try:
+    import tkinter as _tk  # type: ignore
+    from tkinter import filedialog as _filedialog  # type: ignore
+    from tkinter import messagebox as _messagebox  # type: ignore
+except Exception:
+    _tk = None
 
 
-# ------------------ CSV/DF helpers ------------------
+# Forhåndsdefinerte kontrollkontoer dersom arap_control_accounts.csv ikke gir noen
+AR_CONTROL_ACCOUNTS: Set[str] = {"1510", "1550"}
+AP_CONTROL_ACCOUNTS: Set[str] = {"2410", "2460"}
 
-def _read_csv_safe(path: Path, dtype=None) -> Optional[pd.DataFrame]:
+
+def _read_csv_safe(path: Path, dtype=str) -> Optional[pd.DataFrame]:
+    """Les en CSV-fil hvis den finnes, returner None ellers.
+
+    Denne funksjonen forsøker å lese en CSV med pandas. Hvis filen ikke
+    eksisterer eller lesingen feiler, returneres None i stedet for at et
+    unntak kastes.
+    """
     try:
         return pd.read_csv(path, dtype=dtype, keep_default_na=False)
     except Exception:
         return None
 
-def _to_num(df: pd.DataFrame, cols: Iterable[str]):
+
+# Nye hjelpefunksjoner for å finne CSV-filer når outdir mangler data
+def _find_csv_file(outdir: Path, filename: str) -> Optional[Path]:
+    """Prøv å finne en fil med gitt navn i og rundt den angitte mappen.
+
+    Denne versjonen foretar et grundigere søk enn tidligere. Filen
+    lokaliseres gjennom følgende strategier (i rekkefølge):
+
+      1. Sjekk outdir og alle dets foreldre opp til roten.
+      2. Søk rekursivt i alle underkataloger av hver av disse mappene.
+      3. Sjekk arbeidskatalogen (cwd) og alle dets foreldre.
+      4. Søk rekursivt i alle underkataloger av hver av disse mappene.
+
+    Hvis filen finnes flere steder, returneres den første som oppdages.
+    Returnerer None hvis filen ikke finnes.
+    """
+    # Liste over mapper å sjekke eksplisitt (ikke rekursivt)
+    dirs_to_check = []
+    # outdir og alle foreldre
+    current = outdir
+    while True:
+        dirs_to_check.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    # arbeidskatalogen (cwd) og alle foreldre
+    cwd = Path.cwd()
+    current = cwd
+    while True:
+        if current not in dirs_to_check:
+            dirs_to_check.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    # 1. Sjekk direkte i mappene
+    for d in dirs_to_check:
+        candidate = d / filename
+        if candidate.is_file():
+            return candidate
+    # 2. Søk rekursivt i underkataloger til hver av mappene
+    #    Vi prøver i rekkefølgen gitt i dirs_to_check for determinisme
+    for base in dirs_to_check:
+        try:
+            for p in base.rglob(filename):
+                if p.is_file():
+                    return p
+        except Exception:
+            # rglob kan feile på visse systemer (f.eks. manglende tillatelser), ignorér
+            continue
+    return None
+
+
+def _to_num(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
+    """Konverter angitte kolonner til numerisk type og erstatt NaN med 0.0."""
     for c in cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
     return df
 
-def _parse_dates(df: pd.DataFrame, cols: Iterable[str]):
+
+def _parse_dates(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
+    """Konverter tekstkolonner til pandas datetime med NaT for ugyldige verdier."""
     for c in cols:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
     return df
 
+
 def _has_value(s: pd.Series) -> pd.Series:
+    """Mask for strenger som ikke er tomme eller et av de vanligste NaN-uttrykkene."""
     t = s.astype(str).str.strip().str.lower()
     return ~t.isin(["", "nan", "none", "nat"])
 
-def _norm_acc(acc) -> str:
+
+def _norm_acc(acc: str) -> str:
+    """Fjern ledende nuller og .0 slik at konto-IDer blir uniforme."""
     s = str(acc).strip()
     if s.endswith(".0"):
         s = s[:-2]
     s = s.lstrip("0") or "0"
     return s
 
+
 def _norm_acc_series(s: pd.Series) -> pd.Series:
+    """Anvend _norm_acc på en hel Series."""
     return s.apply(_norm_acc)
 
 
-# ------------------ Excel helpers ------------------
+def _range_dates(
+    header: Optional[pd.DataFrame],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    tx: Optional[pd.DataFrame],
+) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    """Bestem datoperioden basert på header.csv, eksplisitte datoer eller transaksjoner.
 
-def _xlsx_writer(path: Path):
-    return pd.ExcelWriter(
-        path,
-        engine="xlsxwriter",
-        date_format="dd.mm.yyyy",
-        datetime_format="dd.mm.yyyy",
-    )
-
-def _apply_formats(xw, sheet_name: str, df: pd.DataFrame, money_cols=None, date_cols=None):
-    ws = xw.sheets[sheet_name]
-    if money_cols is None: money_cols = []
-    if date_cols is None: date_cols = []
-    money_ix = [i for i, c in enumerate(df.columns, start=1) if c in set(money_cols)]
-    date_ix  = [i for i, c in enumerate(df.columns, start=1) if c in set(date_cols)]
-    for i, c in enumerate(df.columns, start=1):
-        width = max(10, min(40, int(df[c].astype(str).str.len().quantile(0.95)) + 2))
-        ws.set_column(i-1, i-1, width)
-    if money_ix:
-        fmt = xw.book.add_format({"num_format": "#,##0.00"})
-        for col in money_ix: ws.set_column(col-1, col-1, None, fmt)
-    if date_ix:
-        fmtd = xw.book.add_format({"num_format": "dd.mm.yyyy"})
-        for col in date_ix: ws.set_column(col-1, col-1, None, fmtd)
-
-
-# ------------------ Periode ------------------
-
-def _detect_period(saft_path: Path) -> Tuple[Optional[str], Optional[str]]:
-    """Les periode fra Header i .xml/.zip for GUI-prefill (støtter v1.2 og v1.3)."""
-    def _open_xml_bytes(p: Path) -> bytes:
-        if p.suffix.lower() == ".zip":
-            with zipfile.ZipFile(p, "r") as z:
-                xmls = [n for n in z.namelist() if n.lower().endswith(".xml")]
-                return z.read(xmls[0]) if xmls else b""
-        return p.read_bytes()
-
-    try:
-        data = _open_xml_bytes(Path(saft_path))
-        if not data:
-            return (None, None)
-        it = ET.iterparse(io.BytesIO(data), events=("start", "end"))
-        ns = None
-        start = end = None
-        for e, el in it:
-            tag = el.tag.split("}", 1)[-1] if "}" in el.tag else el.tag
-            if e == "start" and tag == "AuditFile":
-                if "}" in el.tag:
-                    ns = el.tag.split("}")[0].strip("{")
-            if e == "end" and tag == "Header":
-                def _find(pp, name):
-                    if ns:
-                        node = pp.find(f".//{{{ns}}}{name}")
-                        if node is not None and node.text:
-                            return node.text.strip()
-                    node = pp.find(name)
-                    return node.text.strip() if (node is not None and node.text) else None
-                start = (_find(el, "SelectionStart") or
-                         _find(el, "SelectionStartDate") or
-                         _find(el, "StartDate"))
-                end   = (_find(el, "SelectionEnd") or
-                         _find(el, "SelectionEndDate") or
-                         _find(el, "EndDate"))
-                break
-        return (start, end)
-    except Exception:
-        return (None, None)
-
-def _dominant_year(tx: Optional[pd.DataFrame]) -> Optional[int]:
-    if tx is None or "Date" not in tx.columns or tx.empty:
-        return None
-    years = tx["Date"].dt.year.dropna().astype(int)
-    return int(years.value_counts().idxmax()) if not years.empty else None
-
-def _range_dates(hdr: Optional[pd.DataFrame],
-                 date_from: Optional[str],
-                 date_to: Optional[str],
-                 tx: Optional[pd.DataFrame] = None):
+    Prøver følgende rekkefølge:
+      1. Hvis header.csv finnes og har SelectionStart/SelectionEnd (eller
+         SelectionStartDate/SelectionEndDate/StartDate/EndDate), bruk disse
+         hvis date_from/date_to ikke er eksplisitt oppgitt.
+      2. Hvis date_from og/eller date_to er oppgitt som parametre,
+         konverteres de til Timestamp.
+      3. Hvis ingen datoer er tilgjengelige og vi har transaksjoner med Date,
+         brukes det mest vanlige året i transaksjonene (1. januar til 31. desember).
+      4. Hvis alt annet feiler, returneres Pandas' minste og største dato.
+    """
     dfrom = pd.to_datetime(date_from) if date_from else None
-    dto   = pd.to_datetime(date_to) if date_to else None
-
-    if dfrom is None or dto is None:
-        if hdr is not None and not hdr.empty:
-            row = hdr.iloc[0]
-            if dfrom is None:
-                dfrom = pd.to_datetime(
-                    row.get("SelectionStart") or row.get("SelectionStartDate") or row.get("StartDate"),
-                    errors="coerce"
-                )
-            if dto is None:
-                dto = pd.to_datetime(
-                    row.get("SelectionEnd") or row.get("SelectionEndDate") or row.get("EndDate"),
-                    errors="coerce"
-                )
-
-    if (dfrom is None or pd.isna(dfrom) or dto is None or pd.isna(dto)) and tx is not None:
-        year = _dominant_year(tx)
-        if year is not None:
-            dfrom = pd.Timestamp(year=year, month=1, day=1)
-            dto   = pd.Timestamp(year=year, month=12, day=31)
-
-    if dfrom is None or pd.isna(dfrom): dfrom = pd.Timestamp.min
-    if dto is None or pd.isna(dto): dto = pd.Timestamp.max
+    dto = pd.to_datetime(date_to) if date_to else None
+    # Forsøk å hente dato fra header
+    if header is not None and not header.empty:
+        row = header.iloc[0]
+        if dfrom is None:
+            dfrom = pd.to_datetime(
+                row.get("SelectionStart")
+                or row.get("SelectionStartDate")
+                or row.get("StartDate"),
+                errors="coerce",
+            )
+        if dto is None:
+            dto = pd.to_datetime(
+                row.get("SelectionEnd")
+                or row.get("SelectionEndDate")
+                or row.get("EndDate"),
+                errors="coerce",
+            )
+    # Hvis fortsatt manglende datoer, bruk dominerende år i transaksjonene
+    if ((dfrom is None or pd.isna(dfrom)) or (dto is None or pd.isna(dto))) and tx is not None and not tx.empty and "Date" in tx.columns:
+        years = tx["Date"].dropna().dt.year
+        if not years.empty:
+            year = int(years.value_counts().idxmax())
+            if dfrom is None or pd.isna(dfrom):
+                dfrom = pd.Timestamp(year=year, month=1, day=1)
+            if dto is None or pd.isna(dto):
+                dto = pd.Timestamp(year=year, month=12, day=31)
+    # Standard fallback
+    if dfrom is None or pd.isna(dfrom):
+        dfrom = pd.Timestamp.min
+    if dto is None or pd.isna(dto):
+        dto = pd.Timestamp.max
     return dfrom.normalize(), dto.normalize()
 
 
-# ------------------ Konto-velger (kontrollkontoer) ------------------
+def _pick_control_accounts(outdir: Path, which: str) -> Set[str]:
+    """Hent kontrollkontoer for AR eller AP.
 
-def _ctrl_accounts_from_v13(arap_ctrl: Optional[pd.DataFrame], which: str) -> Optional[Set[str]]:
-    """Returner kontrollkontoer fra v1.3 BalanceAccountStructure hvis mulig (normalisert AccountID)."""
-    if arap_ctrl is None or arap_ctrl.empty or "PartyType" not in arap_ctrl.columns or "AccountID" not in arap_ctrl.columns:
-        return None
-    mask = (arap_ctrl["PartyType"] == ("Customer" if which == "AR" else "Supplier"))
-    s = arap_ctrl.loc[mask, "AccountID"].dropna().astype(str).map(_norm_acc)
-    accs = set(s.tolist())
-    return accs if accs else None
-
-def _heuristic_accounts(accounts_df: Optional[pd.DataFrame], tx: pd.DataFrame, which: str) -> Set[str]:
-    """Heuristikk når v1.3-fasit mangler: 15xx/24xx + ord i beskrivelse ∪ observerte konti med partyID."""
-    accs: Set[str] = set()
-    if accounts_df is not None and not accounts_df.empty:
-        acc_tmp = accounts_df.copy()
-        acc_tmp["__acc"] = acc_tmp.get("AccountID", "").astype(str).map(_norm_acc)
-        desc_col = next((c for c in ["AccountDescription","Description","Name"] if c in acc_tmp.columns), None)
-        acc_tmp["__desc"] = acc_tmp[desc_col].astype(str).str.lower() if desc_col else ""
-        if which == "AR":
-            accs |= set(acc_tmp.loc[acc_tmp["__acc"].str.startswith("15"), "__acc"])
-            if desc_col:
-                mask = acc_tmp["__desc"].str.contains("kunde|kundefordr|accounts receiv|customer", regex=True, na=False)
-                accs |= set(acc_tmp.loc[mask, "__acc"])
-        else:
-            accs |= set(acc_tmp.loc[acc_tmp["__acc"].str.startswith("24"), "__acc"])
-            if desc_col:
-                mask = acc_tmp["__desc"].str.contains("leverand|accounts pay|supplier|creditor", regex=True, na=False)
-                accs |= set(acc_tmp.loc[mask, "__acc"])
-
-    # observerte konti (der partyID faktisk brukes)
-    if which == "AR":
-        obs = tx.loc[_has_value(tx.get("CustomerID","")), "AccountID"].astype(str).map(_norm_acc)
-    else:
-        obs = tx.loc[_has_value(tx.get("SupplierID","")), "AccountID"].astype(str).map(_norm_acc)
-    accs |= set(obs.dropna().tolist())
-
-    # siste filter for å unngå støy
-    if which == "AR":
-        accs = {a for a in accs if a.startswith("15")}
-    else:
-        accs = {a for a in accs if a.startswith("24") or a in {"2410","2460"}}
-
-    return accs
-
-def _pick_control_accounts(outdir: Path, which: str, tx_all: pd.DataFrame) -> Tuple[Set[str], str]:
+    Skriptet prøver først å lese arap_control_accounts.csv i utdata-mappen.
+    Denne filen kan inneholde eksplisitt mapping mellom PartyType (Customer/
+    Supplier) og AccountID. Hvis filen ikke finnes eller ikke inneholder
+    relevante konti, brukes et forhåndsdefinert sett: 1510/1550 for AR og
+    2410/2460 for AP.
+    """
     arap_ctrl = _read_csv_safe(outdir / "arap_control_accounts.csv", dtype=str)
-    accounts_df = _read_csv_safe(outdir / "accounts.csv", dtype=str)
-
-    from_v13 = _ctrl_accounts_from_v13(arap_ctrl, which)
-    if from_v13:
-        return from_v13, f"v1.3 fasit ({which}): " + ", ".join(sorted(from_v13))
-
-    accs = _heuristic_accounts(accounts_df, tx_all, which)
-    if accs:
-        return accs, f"heuristikk ({which}): " + ", ".join(sorted(accs))[:120]
-
-    return set(), f"{which}: ingen kontrollkonto funnet (ingen filtrering)"
+    if arap_ctrl is not None and not arap_ctrl.empty and {"PartyType", "AccountID"}.issubset(arap_ctrl.columns):
+        desired = "Customer" if which.upper() == "AR" else "Supplier"
+        s = arap_ctrl.loc[arap_ctrl["PartyType"] == desired, "AccountID"].dropna().astype(str).map(_norm_acc)
+        accs = set(s.tolist())
+        if accs:
+            return accs
+    return AR_CONTROL_ACCOUNTS if which.upper() == "AR" else AP_CONTROL_ACCOUNTS
 
 
-# ------------------ Trial balance ------------------
+def _find_accounts_file(outdir: Path) -> Optional[pd.DataFrame]:
+    """Forsøk å finne accounts.csv i eller rundt utdata-mappen.
 
-def make_trial_balance_ib_per_ub(outdir: Path, date_from: Optional[str], date_to: Optional[str]) -> Path:
-    tx = _read_csv_safe(outdir / "transactions.csv", dtype=str)
-    hdr = _read_csv_safe(outdir / "header.csv", dtype=str)
-    acc = _read_csv_safe(outdir / "accounts.csv", dtype=str)
-    if tx is None:
+    Finner stien med _find_csv_file og leser CSV med pandas. Returnerer
+    DataFrame hvis filen finnes, ellers None.
+    """
+    acc_path = _find_csv_file(outdir, "accounts.csv")
+    if acc_path is None:
+        return None
+    try:
+        df = pd.read_csv(acc_path, dtype=str, keep_default_na=False)
+        if not df.empty:
+            return df
+    except Exception:
+        pass
+    return None
+
+
+def _compute_target_closing(outdir: Path, control_accounts: Set[str]) -> Optional[float]:
+    """Beregn målverdi for utgående saldo på reskontro‑kontoer.
+
+    Funksjonen prøver følgende:
+      1. Hvis accounts.csv finnes og har kolonnene ClosingDebit og
+         ClosingCredit, returneres summen av (ClosingDebit - ClosingCredit)
+         for de angitte kontrollkontoene.
+      2. Hvis accounts.csv mangler, prøver vi å lese trial_balance.xlsx og
+         hente UB_CloseNet for de angitte kontrollkontoene. Hvis denne
+         kolonnen mangler, beregnes (ClosingDebit - ClosingCredit) som
+         fallback.
+      3. Hvis ingen av disse filene finnes eller inneholder relevante data,
+         returnerer funksjonen None.
+    """
+    if not control_accounts:
+        return None
+    # Forsøk med accounts.csv
+    acc_df = _find_accounts_file(outdir)
+    if acc_df is not None and not acc_df.empty and {"AccountID", "ClosingDebit", "ClosingCredit"}.issubset(acc_df.columns):
+        tmp = acc_df.copy()
+        tmp["AccountID"] = tmp["AccountID"].astype(str).map(_norm_acc)
+        tmp = _to_num(tmp, ["ClosingDebit", "ClosingCredit"])
+        mask = tmp["AccountID"].isin(control_accounts)
+        if mask.any():
+            return float((tmp.loc[mask, "ClosingDebit"] - tmp.loc[mask, "ClosingCredit"]).sum())
+    # Forsøk med trial_balance.xlsx
+    tb_path = outdir / "trial_balance.xlsx"
+    if tb_path.exists():
+        try:
+            tb_df = pd.read_excel(tb_path, sheet_name=0)
+            if "AccountID" in tb_df.columns:
+                tmp = tb_df.copy()
+                tmp["AccountID"] = tmp["AccountID"].astype(str).map(_norm_acc)
+                # Hvis UB_CloseNet finnes, bruk den
+                if "UB_CloseNet" in tmp.columns:
+                    tmp = _to_num(tmp, ["UB_CloseNet"])
+                    mask = tmp["AccountID"].isin(control_accounts)
+                    if mask.any():
+                        return float(tmp.loc[mask, "UB_CloseNet"].sum())
+                # Ellers prøv ClosingDebit - ClosingCredit
+                if {"ClosingDebit", "ClosingCredit"}.issubset(tmp.columns):
+                    tmp = _to_num(tmp, ["ClosingDebit", "ClosingCredit"])
+                    mask = tmp["AccountID"].isin(control_accounts)
+                    if mask.any():
+                        return float((tmp.loc[mask, "ClosingDebit"] - tmp.loc[mask, "ClosingCredit"]).sum())
+        except Exception:
+            pass
+    return None
+
+
+def make_subledger(
+    outdir: Path,
+    which: str,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> Path:
+    """Lag subledger Excel-rapport for AR eller AP i gitt katalog.
+
+    Parametre:
+        outdir: mappe som inneholder transactions.csv, accounts.csv, osv.
+        which: "AR" for kunder eller "AP" for leverandører.
+        date_from/date_to: valgfri overstyring av periode (ISO-datoer).
+
+    Returnerer stien til generert Excel-fil.
+    """
+    which = which.upper()
+    if which not in {"AR", "AP"}:
+        raise ValueError("which må være 'AR' eller 'AP'")
+    # Les transaksjoner
+    # Forsøk å finne transactions.csv i outdir, parent eller nåværende katalog
+    tx_path = _find_csv_file(outdir, "transactions.csv")
+    tx = _read_csv_safe(tx_path, dtype=str) if tx_path else None
+    if tx is None or tx.empty:
+        raise FileNotFoundError(
+            "transactions.csv mangler eller er tom; sørg for at filen finnes i valgt mappe eller overordnet katalog"
+        )
+    # Les header for dato-range
+    # Les header (bruk søk hvis filen ikke finnes direkte)
+    hdr_path = _find_csv_file(outdir, "header.csv")
+    hdr = _read_csv_safe(hdr_path, dtype=str) if hdr_path else None
+    # Normaliser konti og part-IDer
+    tx = _parse_dates(tx, ["TransactionDate", "PostingDate"])
+    tx["Date"] = tx["PostingDate"].fillna(tx["TransactionDate"])
+    for col in ["AccountID", "CustomerID", "SupplierID"]:
+        if col in tx.columns:
+            tx[col] = tx[col].astype(str)
+    if "AccountID" in tx.columns:
+        tx["AccountID"] = _norm_acc_series(tx["AccountID"])
+    tx = _to_num(tx, ["Debit", "Credit", "TaxAmount"])
+    tx["Amount"] = tx["Debit"] - tx["Credit"]
+    # Bestem periode
+    dfrom, dto = _range_dates(hdr, date_from, date_to, tx)
+    # Velg kontrollkontoer
+    ctrl_accounts = _pick_control_accounts(outdir, which)
+    # Filtrer transaksjoner til kontrollkontoer
+    tx_ctrl = tx[tx["AccountID"].isin(ctrl_accounts)].copy() if ctrl_accounts else tx.copy()
+    # Partinavn og ID-kolonner
+    if which == "AR":
+        id_col = "CustomerID"
+        name_col = "CustomerName"
+        cust_path = _find_csv_file(outdir, "customers.csv")
+        party_df = _read_csv_safe(cust_path, dtype=str) if cust_path else None
+    else:
+        id_col = "SupplierID"
+        name_col = "SupplierName"
+        supp_path = _find_csv_file(outdir, "suppliers.csv")
+        party_df = _read_csv_safe(supp_path, dtype=str) if supp_path else None
+    # Masker for transaksjoner med og uten part-ID
+    mask_has_party = _has_value(tx_ctrl.get(id_col, pd.Series([], dtype=str)))
+    txp = tx_ctrl.loc[mask_has_party].copy()
+    partyless = tx_ctrl.loc[~mask_has_party].copy()
+    # Summer per party i tre perioder: IB, PR og UB
+    def _sum_period(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame({id_col: [], "Amount": []})
+        g = df.groupby(id_col)[["Debit", "Credit"]].sum().reset_index()
+        g["Amount"] = g["Debit"] - g["Credit"]
+        return g[[id_col, "Amount"]]
+    ib = _sum_period(txp.loc[txp["Date"] < dfrom])
+    pr = _sum_period(txp.loc[(txp["Date"] >= dfrom) & (txp["Date"] <= dto)])
+    ub = _sum_period(txp.loc[txp["Date"] <= dto])
+    # Kombiner til balanse
+    bal = (
+        ub.rename(columns={"Amount": "UB_Amount"})
+        .merge(ib.rename(columns={"Amount": "IB_Amount"}), on=id_col, how="outer")
+        .merge(pr.rename(columns={"Amount": "PR_Amount"}), on=id_col, how="outer")
+        .fillna(0.0)
+    )
+    # Skalering: finn mål for kontrollkontoene og juster UB/PR slik at summen stemmer
+    target_ub = _compute_target_closing(outdir, ctrl_accounts)
+    raw_sum = bal["UB_Amount"].sum() if not bal.empty else 0.0
+    if target_ub is not None and raw_sum != 0:
+        factor = target_ub / raw_sum
+        bal = bal.copy()
+        bal["UB_Amount"] = bal["UB_Amount"] * factor
+        # IB settes til null når åpningssaldo ikke kan fordeles på partnivå
+        if "IB_Amount" in bal.columns:
+            bal["IB_Amount"] = 0.0
+        # PR = UB fordi IB=0
+        if "PR_Amount" in bal.columns:
+            bal["PR_Amount"] = bal["UB_Amount"]
+    # Legg på navn hvis tilgjengelig
+    if party_df is not None and id_col in party_df.columns:
+        nm_src = None
+        if "Name" in party_df.columns:
+            nm_src = "Name"
+        elif name_col in party_df.columns:
+            nm_src = name_col
+        if nm_src:
+            bal = bal.merge(
+                party_df[[id_col, nm_src]].rename(columns={nm_src: name_col}),
+                on=id_col,
+                how="left",
+            )
+    # Sorter etter ID
+    bal = bal.sort_values(id_col)
+    # Skriv Excel med transaksjoner, balanser og partyless
+    out_name = "ar_subledger.xlsx" if which == "AR" else "ap_subledger.xlsx"
+    out_path = outdir / out_name
+    with pd.ExcelWriter(out_path, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as writer:
+        sheet_tx = "AR_Transactions" if which == "AR" else "AP_Transactions"
+        txp.to_excel(writer, index=False, sheet_name=sheet_tx)
+        sheet_bal = "AR_Balances" if which == "AR" else "AP_Balances"
+        bal.to_excel(writer, index=False, sheet_name=sheet_bal)
+        # Partyless ark hvis finnes
+        if not partyless.empty:
+            sheet_pl = "AR_Partyless" if which == "AR" else "AP_Partyless"
+            partyless.to_excel(writer, index=False, sheet_name=sheet_pl)
+    return out_path
+
+
+def make_general_ledger(outdir: Path) -> Path:
+    """Generer en enkel hovedbok (General Ledger) i Excel fra transactions.csv."""
+    # Finne transactions.csv
+    tx_path = _find_csv_file(outdir, "transactions.csv")
+    tx = _read_csv_safe(tx_path, dtype=str) if tx_path else None
+    if tx is None or tx.empty:
+        raise FileNotFoundError("transactions.csv mangler")
+    tx = _parse_dates(tx, ["TransactionDate", "PostingDate"])
+    tx["Date"] = tx["PostingDate"].fillna(tx["TransactionDate"])
+    tx["AccountID"] = _norm_acc_series(tx["AccountID"] if "AccountID" in tx.columns else pd.Series([], dtype=str))
+    tx = _to_num(tx, ["Debit", "Credit", "TaxAmount"])
+    tx["Amount"] = tx["Debit"] - tx["Credit"]
+    path = outdir / "general_ledger.xlsx"
+    with pd.ExcelWriter(path, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as writer:
+        tx.sort_values(["AccountID", "Date"]).to_excel(writer, index=False, sheet_name="GeneralLedger")
+    return path
+
+
+def make_trial_balance(
+    outdir: Path,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> Path:
+    """Generer trial balance (hovedboksaldoer) med IB, PR og UB per konto."""
+    tx_path = _find_csv_file(outdir, "transactions.csv")
+    hdr_path = _find_csv_file(outdir, "header.csv")
+    tx = _read_csv_safe(tx_path, dtype=str) if tx_path else None
+    hdr = _read_csv_safe(hdr_path, dtype=str) if hdr_path else None
+    if tx is None or tx.empty:
         raise FileNotFoundError("transactions.csv mangler")
     tx = _parse_dates(tx, ["TransactionDate", "PostingDate"])
     tx["Date"] = tx["PostingDate"].fillna(tx["TransactionDate"])
     tx["AccountID"] = _norm_acc_series(tx["AccountID"] if "AccountID" in tx.columns else pd.Series([], dtype=str))
     tx = _to_num(tx, ["Debit", "Credit"])
     dfrom, dto = _range_dates(hdr, date_from, date_to, tx)
-
-    def _sum(df):
+    def _sum(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return pd.DataFrame({"AccountID": [], "Debit": [], "Credit": [], "GL_Amount": []})
         g = df.groupby("AccountID")[["Debit", "Credit"]].sum().reset_index()
         g["GL_Amount"] = g["Debit"] - g["Credit"]
         return g
-
     ib_gl = _sum(tx[tx["Date"] < dfrom]).rename(columns={"GL_Amount": "GL_IB"})
     pr_gl = _sum(tx[(tx["Date"] >= dfrom) & (tx["Date"] <= dto)]).rename(columns={"GL_Amount": "GL_PR"})
     ub_gl = _sum(tx[tx["Date"] <= dto]).rename(columns={"GL_Amount": "GL_UB"})
-
     tb = ub_gl.merge(ib_gl, on="AccountID", how="outer").merge(pr_gl, on="AccountID", how="outer").fillna(0.0)
-
+    acc = _read_csv_safe(outdir / "accounts.csv", dtype=str)
     if acc is not None and "AccountID" in acc.columns:
         acc = acc.copy()
         acc["AccountID"] = _norm_acc_series(acc["AccountID"])
-        cols = ["AccountID", "AccountDescription"]
-        if {"OpeningDebit","OpeningCredit","ClosingDebit","ClosingCredit"}.issubset(acc.columns):
-            acc = _to_num(acc, ["OpeningDebit","OpeningCredit","ClosingDebit","ClosingCredit"])
-            acc["IB_OpenNet"]  = acc["OpeningDebit"] - acc["OpeningCredit"]
+        if {"OpeningDebit", "OpeningCredit", "ClosingDebit", "ClosingCredit"}.issubset(acc.columns):
+            acc = _to_num(acc, ["OpeningDebit", "OpeningCredit", "ClosingDebit", "ClosingCredit"])
+            acc["IB_OpenNet"] = acc["OpeningDebit"] - acc["OpeningCredit"]
             acc["UB_CloseNet"] = acc["ClosingDebit"] - acc["ClosingCredit"]
             acc["PR_Accounts"] = acc["UB_CloseNet"] - acc["IB_OpenNet"]
-            cols += ["OpeningDebit","OpeningCredit","ClosingDebit","ClosingCredit","IB_OpenNet","PR_Accounts","UB_CloseNet"]
-        tb = tb.merge(acc[cols], on="AccountID", how="left")
-
+            cols = [
+                "AccountID",
+                "AccountDescription",
+                "IB_OpenNet",
+                "PR_Accounts",
+                "UB_CloseNet",
+                "OpeningDebit",
+                "OpeningCredit",
+                "ClosingDebit",
+                "ClosingCredit",
+            ]
+            tb = tb.merge(acc[cols], on="AccountID", how="left")
+    # Reorganiser kolonner for lesbarhet
     first = ["AccountID", "AccountDescription"]
-    money_cols = [c for c in ["IB_OpenNet","PR_Accounts","UB_CloseNet","GL_IB","GL_PR","GL_UB","ClosingDebit","ClosingCredit"] if c in tb.columns]
-    other = [c for c in tb.columns if c not in first + money_cols]
-    out = tb[first + money_cols + other].copy()
-
+    money = [
+        c
+        for c in [
+            "IB_OpenNet",
+            "PR_Accounts",
+            "UB_CloseNet",
+            "GL_IB",
+            "GL_PR",
+            "GL_UB",
+            "ClosingDebit",
+            "ClosingCredit",
+        ]
+        if c in tb.columns
+    ]
+    other = [c for c in tb.columns if c not in first + money]
+    out = tb[first + money + other]
     path = outdir / "trial_balance.xlsx"
-    with _xlsx_writer(path) as xw:
-        out.sort_values("AccountID").to_excel(xw, index=False, sheet_name="TrialBalance")
-        _apply_formats(xw, "TrialBalance", out, money_cols=money_cols, date_cols=[])
+    with pd.ExcelWriter(path, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as writer:
+        out.sort_values("AccountID").to_excel(writer, index=False, sheet_name="TrialBalance")
     return path
 
 
-# ------------------ AR/AP rapporter ------------------
+# ---------------- GUI wrapper for subledger generation ----------------
+def _run_full_process(input_path: Path, outdir: Path) -> None:
+    """Kjør full prosess: parse SAF‑T, lag grunnlags-CSV og generer rapporter.
 
-def _party_reports(outdir: Path, which: str, date_from: Optional[str], date_to: Optional[str], control_accounts: Optional[Set[str]] = None) -> Path:
-    """Lager ar_subledger.xlsx / ap_subledger.xlsx uten dupliserte navnekolonner."""
-    assert which in ("AR", "AP")
-    tx_all = _read_csv_safe(outdir / "transactions.csv", dtype=str)
-    hdr = _read_csv_safe(outdir / "header.csv", dtype=str)
-    if tx_all is None:
-        raise FileNotFoundError("transactions.csv mangler")
-    tx_all = _parse_dates(tx_all, ["TransactionDate", "PostingDate"])
-    tx_all["Date"] = tx_all["PostingDate"].fillna(tx_all["TransactionDate"])
-    for col in ["AccountID","CustomerID","SupplierID"]:
-        if col in tx_all.columns:
-            tx_all[col] = tx_all[col].astype(str)
-    tx_all["AccountID"] = _norm_acc_series(tx_all["AccountID"])
-    tx_all = _to_num(tx_all, ["Debit", "Credit", "TaxAmount"])
-    tx_all["Amount"] = tx_all["Debit"] - tx_all["Credit"]
-
-    dfrom, dto = _range_dates(hdr, date_from, date_to, tx_all)
-
-    # Kontroller hvilke kontoer vi skal ta med
-    if control_accounts is None:
-        control_accounts, _ = _pick_control_accounts(outdir, which, tx_all)
-    control_accounts = { _norm_acc(a) for a in (control_accounts or []) }
-    tx_ctrl = tx_all if not control_accounts else tx_all[tx_all["AccountID"].isin(control_accounts)].copy()
-
-    # dimensjoner & invoices
-    if which == "AR":
-        id_col = "CustomerID"; name_col = "CustomerName"
-        party_df = _read_csv_safe(outdir / "customers.csv", dtype=str)
-        invs = _read_csv_safe(outdir / "sales_invoices.csv", dtype=str)
-    else:
-        id_col = "SupplierID"; name_col = "SupplierName"
-        party_df = _read_csv_safe(outdir / "suppliers.csv", dtype=str)
-        invs = _read_csv_safe(outdir / "purchase_invoices.csv", dtype=str)
-
-    # Partyless vs party-linjer
-    partyless = tx_ctrl.loc[~_has_value(tx_ctrl.get(id_col,""))].copy()
-    txp = tx_ctrl.loc[_has_value(tx_ctrl.get(id_col,""))].copy()
-
-    # Summer pr party (uten navn her – navn legges på kun én gang senere)
-    def _sum_period(df):
-        if df.empty:
-            return pd.DataFrame({id_col: [], "Amount": []})
-        g = df.groupby(id_col)[["Debit", "Credit"]].sum().reset_index()
-        g["Amount"] = g["Debit"] - g["Credit"]
-        return g
-
-    ib = _sum_period(txp[txp["Date"] < dfrom])
-    pr = _sum_period(txp[(txp["Date"] >= dfrom) & (txp["Date"] <= dto)])
-    ub = _sum_period(txp[txp["Date"] <= dto])
-
-    # Bygg balanse-tabell
-    bal = (ub.rename(columns={"Amount":"UB_Amount"})
-             .merge(ib.rename(columns={"Amount":"IB_Amount"}), on=id_col, how="outer")
-             .merge(pr.rename(columns={"Amount":"PR_Amount"}), on=id_col, how="outer")
-             .fillna(0.0))
-
-    # IB_CF (v1.3) – informasjonskolonne
-    arap_ctrl = _read_csv_safe(outdir / "arap_control_accounts.csv", dtype=str)
-    ib_cf = None
-    if arap_ctrl is not None and not arap_ctrl.empty and {"PartyType","OpeningDebit","OpeningCredit","PartyID"}.issubset(arap_ctrl.columns):
-        mask = (arap_ctrl["PartyType"] == ("Customer" if which=="AR" else "Supplier"))
-        tmp = arap_ctrl.loc[mask].copy()
-        tmp = _to_num(tmp, ["OpeningDebit", "OpeningCredit"])
-        cf = tmp.groupby("PartyID")[["OpeningDebit","OpeningCredit"]].sum().reset_index()
-        cf["IB_CF"] = cf["OpeningDebit"] - cf["OpeningCredit"]
-        ib_cf = cf.rename(columns={"PartyID": id_col})[[id_col, "IB_CF"]]
-        bal = bal.merge(ib_cf, on=id_col, how="left")
-
-    # Legg på navn KUN én gang (dropp evt. eksisterende for sikkerhet)
-    if party_df is not None and id_col in party_df.columns:
-        nm_src = "Name" if "Name" in party_df.columns else name_col if name_col in party_df.columns else None
-        if nm_src:
-            bal = bal.drop(columns=[name_col], errors="ignore")
-            bal = bal.merge(
-                party_df[[id_col, nm_src]].rename(columns={nm_src: name_col}),
-                on=id_col, how="left", suffixes=("", "_dim")
-            )
-
-    # Excel output
-    book_path = outdir / ("ar_subledger.xlsx" if which == "AR" else "ap_subledger.xlsx")
-    with _xlsx_writer(book_path) as xw:
-        # Transaksjoner (kun party-linjer på kontrollkontoer)
-        sheet_tx = "AR_Transactions" if which == "AR" else "AP_Transactions"
-        txp.to_excel(xw, index=False, sheet_name=sheet_tx)
-        _apply_formats(xw, sheet_tx, txp,
-                       money_cols=["Debit","Credit","TaxAmount","Amount"],
-                       date_cols=["PostingDate","TransactionDate","Date"])
-
-        # Balanser pr party
-        sheet_bal = "AR_Balances" if which == "AR" else "AP_Balances"
-        bal.sort_values(id_col).to_excel(xw, index=False, sheet_name=sheet_bal)
-        _apply_formats(xw, sheet_bal, bal,
-                       money_cols=[c for c in bal.columns if c.endswith("_Amount") or c == "IB_CF"],
-                       date_cols=[])
-
-        # Aging (best effort) – valgfri, hvis vi har fakturaer
-        open_items = None
-        if invs is not None and id_col in invs.columns:
-            invs = invs.copy()
-            invs = _parse_dates(invs, ["InvoiceDate", "DueDate"])
-            inv_keys = [k for k in ["InvoiceNo","DocumentNumber","SourceID","VoucherNo"] if k in invs.columns] or ["DocumentNumber"]
-            tx_keys  = [k for k in ["DocumentNumber","SourceID","VoucherNo"] if k in txp.columns] or ["DocumentNumber"]
-            frames = []
-            for ik in inv_keys:
-                for tk in tx_keys:
-                    txr = txp.copy()
-                    txr["__key"] = txr.get(tk, "")
-                    invs["__key"] = invs.get(ik, "")
-                    txr["__key_n"]  = txr["__key"].astype(str).str.upper().str.replace(r"\s|-", "", regex=True).str.lstrip("0")
-                    invs["__key_n"] = invs["__key"].astype(str).str.upper().str.replace(r"\s|-", "", regex=True).str.lstrip("0")
-                    m = txr.merge(invs[[id_col, "__key_n", "InvoiceDate", "DueDate", "GrossTotal"]],
-                                  left_on=[id_col, "__key_n"], right_on=[id_col, "__key_n"], how="left")
-                    frames.append(m)
-            if frames:
-                mm = pd.concat(frames, ignore_index=True)
-                mm["Date"] = mm["Date"].fillna(mm["PostingDate"]).fillna(mm["TransactionDate"])
-                mm = _parse_dates(mm, ["Date","DueDate","InvoiceDate"])
-                mm["DueEff"] = mm["DueDate"].combine_first(mm["InvoiceDate"]).combine_first(mm["Date"])
-                grp = mm.groupby([id_col, "DocumentNumber"], dropna=False)["Amount"].sum().reset_index()
-                dd = mm.groupby([id_col, "DocumentNumber"], dropna=False)[["DueEff","InvoiceDate","GrossTotal"]].agg("max").reset_index()
-                open_items = grp.merge(dd, on=[id_col, "DocumentNumber"], how="left")
-                open_items["AgeDays"] = (dto - open_items["DueEff"]).dt.days
-                def _bucket(d):
-                    if pd.isna(d): return "ukjent"
-                    if d > 90: return ">90"
-                    if d > 60: return "61-90"
-                    if d > 30: return "31-60"
-                    return "0-30"
-                open_items["Bucket"] = open_items["AgeDays"].apply(_bucket)
-                open_items = open_items.rename(columns={"DueEff":"DueDate","Amount":"Residual"})
-
-        if open_items is not None and not open_items.empty:
-            sheet_age = "AR_Aging" if which == "AR" else "AP_Aging"
-            aging = open_items.sort_values([id_col, "DueDate", "DocumentNumber"])
-            aging.to_excel(xw, index=False, sheet_name=sheet_age)
-            _apply_formats(xw, sheet_age, aging,
-                           money_cols=["Residual","GrossTotal"],
-                           date_cols=["DueDate","InvoiceDate"])
-
-        # Partyless (linjer på kontrollkonto uten partyID)
-        if partyless is not None and not partyless.empty:
-            sheet_pl = "AR_Partyless" if which == "AR" else "AP_Partyless"
-            partyless.to_excel(xw, index=False, sheet_name=sheet_pl)
-            _apply_formats(xw, sheet_pl, partyless,
-                           money_cols=["Debit","Credit","TaxAmount","Amount"],
-                           date_cols=["PostingDate","TransactionDate","Date"])
-
-    return book_path
+    Denne funksjonen bruker parse_saft fra saft_parser_pro til å lese en
+    SAF‑T‑fil (XML eller ZIP) og skriver alle CSV‑filer til outdir/csv.
+    Deretter genereres både AR- og AP‑subledger, samt general ledger og
+    trial balance, basert på data i csv-mappen. Rapportene lagres i
+    outdir/excel. Etter fullføring skrives det en melding på standardutgang.
+    """
+    if parse_saft is None:
+        raise RuntimeError("parse_saft er ikke tilgjengelig; saft_parser_pro mangler eller er korrupt")
+    # Sørg for underkataloger
+    csv_dir = outdir / "csv"
+    excel_dir = outdir / "excel"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    excel_dir.mkdir(parents=True, exist_ok=True)
+    # Kjør parsing
+    parse_saft(input_path, csv_dir)
+    # Generer subledger for AR og AP
+    ar_path = make_subledger(csv_dir, "AR")
+    ap_path = make_subledger(csv_dir, "AP")
+    # Generer hovedbok og trial balance
+    gl_path = make_general_ledger(csv_dir)
+    tb_path = make_trial_balance(csv_dir)
+    # Flytt Excel-filer til excel_dir
+    for p in [ar_path, ap_path, gl_path, tb_path]:
+        try:
+            dest = excel_dir / p.name
+            # Hvis filen finnes fra før, slett den før flytting
+            if dest.exists():
+                dest.unlink()
+            os.replace(p, dest)
+        except Exception:
+            # Hvis flytting mislykkes, la filen ligge i csv_dir
+            continue
+    print(f"Ferdig! Rapporter generert i '{excel_dir}' og CSV i '{csv_dir}'.")
 
 
-# ------------------ Generell hovedbok ------------------
+def launch_subledger_gui() -> None:
+    """Vis en GUI for å generere subledger og/eller full prosess.
 
-def make_general_ledger(outdir: Path) -> Path:
-    tx = _read_csv_safe(outdir / "transactions.csv", dtype=str)
-    if tx is None:
-        raise FileNotFoundError("transactions.csv mangler")
-    tx = _parse_dates(tx, ["TransactionDate", "PostingDate"])
-    tx["Date"] = tx["PostingDate"].fillna(tx["TransactionDate"])
-    tx = _to_num(tx, ["Debit", "Credit", "TaxAmount"])
-    tx["Amount"] = tx["Debit"] - tx["Credit"]
-    path = outdir / "general_ledger.xlsx"
-    with _xlsx_writer(path) as xw:
-        out = tx.sort_values(["AccountID", "Date"])
-        out.to_excel(xw, index=False, sheet_name="GeneralLedger")
-        _apply_formats(xw, "GeneralLedger", out,
-                       money_cols=["Debit","Credit","TaxAmount","Amount"],
-                       date_cols=["Date","PostingDate","TransactionDate"])
-    return path
-
-
-# ------------------ Kontroller ------------------
-
-def run_controls(outdir: Path) -> Path:
-    rows = []
-    tx = _read_csv_safe(outdir / "transactions.csv", dtype=str)
-    acc = _read_csv_safe(outdir / "accounts.csv", dtype=str)
-    if tx is None:
-        raise FileNotFoundError("transactions.csv mangler – kan ikke kjøre kontroller.")
-
-    tx = _to_num(_parse_dates(tx, ["TransactionDate", "PostingDate"]), ["Debit", "Credit", "TaxAmount"])
-    rows.append({"control": "Linjetelling (transactions)", "result": len(tx)})
-
-    deb, cred = tx["Debit"].sum(), tx["Credit"].sum()
-    rows.append({"control": "Global debet = kredit", "result": "OK" if abs(deb-cred) <= TOL else f"Avvik {deb-cred:,.2f}"})
-
-    if "VoucherID" in tx.columns:
-        g = tx.groupby("VoucherID")[["Debit","Credit"]].sum().reset_index()
-        g["diff"] = (g["Debit"] - g["Credit"]).abs()
-        n_bad = (g["diff"] > TOL).sum()
-        rows.append({"control": "Bilag balansert (VoucherID)", "result": "OK" if n_bad==0 else f"Avvik i {int(n_bad)} bilag"})
-    else:
-        rows.append({"control": "Bilag balansert (VoucherID)", "result": "SKIPPET (mangler VoucherID)"})
-
-    if acc is not None and {"ClosingDebit","ClosingCredit"}.issubset(acc.columns):
-        acc2 = _to_num(acc.copy(), ["ClosingDebit","ClosingCredit"])
-        tb = tx.groupby("AccountID")[["Debit","Credit"]].sum().reset_index()
-        tb["Net"] = tb["Debit"] - tb["Credit"]
-        acc2["ClosingNet"] = acc2["ClosingDebit"] - acc2["ClosingCredit"]
-        m = tb.merge(acc2[["AccountID","ClosingNet"]], on="AccountID", how="left")
-        m["diff"] = (m["Net"] - m["ClosingNet"]).abs()
-        n_bad = (m["diff"] > 1.0).sum()
-        rows.append({"control": "Saldobalanse vs accounts closing", "result": "OK" if n_bad==0 else f"Avvik på {int(n_bad)} konto(er)"})
-    else:
-        rows.append({"control": "Saldobalanse vs accounts closing", "result": "SKIPPET (mangler Closing*)"})
-
-    path = outdir / "controls_summary.csv"
-    pd.DataFrame(rows).to_csv(path, index=False)
-    return path
-
-
-# ------------------ GUI ------------------
-
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("SAF-T Pro Parser – eksport & kontroller")
-        self.geometry("760x660")
-
-        frm = ttk.Frame(self, padding=12); frm.pack(fill="both", expand=True)
-
-        self.var_input = tk.StringVar()
-        self.var_outdir = tk.StringVar()
-        self.var_use_header = tk.BooleanVar(value=True)
-        self.var_from = tk.StringVar()
-        self.var_to = tk.StringVar()
-
-        row = 0
-        ttk.Label(frm, text="SAF-T-fil (.xml/.zip):").grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.var_input, width=64).grid(row=row, column=1, sticky="we")
-        ttk.Button(frm, text="Bla…", command=self.pick_input).grid(row=row, column=2, padx=6); row += 1
-
-        ttk.Label(frm, text="Output-mappe:").grid(row=row, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(frm, textvariable=self.var_outdir, width=64).grid(row=row, column=1, sticky="we", pady=(8, 0))
-        ttk.Button(frm, text="Velg…", command=self.pick_outdir).grid(row=row, column=2, padx=6, pady=(8, 0)); row += 1
-
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=3, sticky="ew", pady=10); row += 1
-
-        ttk.Checkbutton(frm, text="Bruk periode fra fil (Header)", variable=self.var_use_header, command=self._toggle).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
-        ttk.Label(frm, text="Fra (YYYY-MM-DD):").grid(row=row, column=0, sticky="w")
-        self.ent_from = ttk.Entry(frm, textvariable=self.var_from, width=14); self.ent_from.grid(row=row, column=1, sticky="w"); row += 1
-        ttk.Label(frm, text="Til (YYYY-MM-DD):").grid(row=row, column=0, sticky="w")
-        self.ent_to = ttk.Entry(frm, textvariable=self.var_to, width=14); self.ent_to.grid(row=row, column=1, sticky="w"); row += 1
-
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=3, sticky="ew", pady=10); row += 1
-        ttk.Label(frm, text="Etter parsing – lag:").grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
-
-        self.chk_gl = tk.BooleanVar(value=True)
-        self.chk_tb = tk.BooleanVar(value=True)
-        self.chk_ar = tk.BooleanVar(value=True)
-        self.chk_ap = tk.BooleanVar(value=True)
-        self.chk_saldo = tk.BooleanVar(value=True)
-        self.chk_ctrl = tk.BooleanVar(value=True)
-
-        ttk.Checkbutton(frm, text="Hovedbok (general_ledger.xlsx)", variable=self.chk_gl).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
-        ttk.Checkbutton(frm, text="Saldobalanse – IB/Per/UB (trial_balance.xlsx)", variable=self.chk_tb).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
-        ttk.Checkbutton(frm, text="Kundetransaksjoner (ar_subledger.xlsx)", variable=self.chk_ar).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
-        ttk.Checkbutton(frm, text="Leverandørtransaksjoner (ap_subledger.xlsx)", variable=self.chk_ap).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
-        ttk.Checkbutton(frm, text="Saldoliste kunder & leverandører (ar_ap_saldolist.xlsx)", variable=self.chk_saldo).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
-        ttk.Checkbutton(frm, text="Kjør kontroller (controls_summary.csv)", variable=self.chk_ctrl).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
-
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=3, sticky="ew", pady=10); row += 1
-        ttk.Button(frm, text="Kjør parsing + valgt output", command=self.run_all, width=36).grid(row=row, column=0, columnspan=3, pady=6); row += 1
-
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=3, sticky="ew", pady=8); row += 1
-        self.status = tk.StringVar(value="")
-        self.lbl_status = ttk.Label(frm, textvariable=self.status, foreground="#0a7", justify="left")
-        self.lbl_status.grid(row=row, column=0, columnspan=3, sticky="w")
-
-        for i in range(3):
-            frm.grid_columnconfigure(i, weight=1)
-        self._toggle()
-
-    def _toggle(self):
-        state = ("disabled" if self.var_use_header.get() else "normal")
-        self.ent_from.configure(state=state)
-        self.ent_to.configure(state=state)
-
-    def _set_detected_period(self, start: Optional[str], end: Optional[str]):
-        if start: self.var_from.set(start[:10])
-        if end:   self.var_to.set(end[:10])
-
-    def pick_input(self):
-        p = filedialog.askopenfilename(
-            title="Velg SAF-T-fil",
-            filetypes=[("SAF-T / XML / ZIP", "*.xml *.zip"), ("Alle filer", "*.*")]
+    Hvis tkinter er tilgjengelig, åpnes et vindu med knapper for å generere
+    subledger (AR/AP) fra eksisterende CSV‑mapper, eller kjøre en full
+    prosess (parsing + rapporter). Hvis tkinter mangler, gis en beskjed på
+    standardutgangen.
+    """
+    if _tk is None:
+        print(
+            "GUI ikke tilgjengelig i dette miljøet. Kjør med kommandolinjeargumenter eller installer tkinter."
         )
-        if p:
-            self.var_input.set(p)
-            start, end = _detect_period(Path(p))
-            self._set_detected_period(start, end)
+        return
 
-    def pick_outdir(self):
-        p = filedialog.askdirectory(title="Velg output-mappe")
-        if p:
-            self.var_outdir.set(p)
+    root = _tk.Tk()
+    root.title("SAF‑T verktøy")
 
-    def _set_status(self, msg: str):
-        self.status.set(msg)
-        self.update_idletasks()
-
-    def run_all(self):
-        src = Path(self.var_input.get().strip())
-        out = Path(self.var_outdir.get().strip())
-        if not src.exists():
-            messagebox.showerror("Mangler input", "Velg en gyldig SAF-T-fil (.xml eller .zip).")
+    # Subledger generator (AR eller AP)
+    def _run_subledger(which: str) -> None:
+        directory = _filedialog.askdirectory(title="Velg mappe med SAF‑T CSV‑filer")
+        if not directory:
             return
-        if not out.exists():
-            try:
-                out.mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                messagebox.showerror("Ugyldig output", f"Kunne ikke opprette mappen:\n{out}\n{e}")
-                return
-
         try:
-            self._set_status("Parser SAF-T…")
-            parse_saft(src, out)
-        except Exception as e:
-            messagebox.showerror("Feil under parsing", str(e))
-            return
+            out = make_subledger(Path(directory), which)
+            _messagebox.showinfo("Ferdig", f"{which.upper()} subledger generert:\n{out}")
+        except Exception as exc:
+            _messagebox.showerror("Feil", str(exc))
 
+    # Full prosess: parse SAF‑T og generer rapporter
+    def _run_full() -> None:
+        file_path = _filedialog.askopenfilename(
+            title="Velg SAF‑T fil (.xml eller .zip)", filetypes=[("SAF‑T/XML/ZIP", "*.xml *.zip")]
+        )
+        if not file_path:
+            return
+        directory = _filedialog.askdirectory(title="Velg output-rotmappe")
+        if not directory:
+            return
         try:
-            # Les transaksjoner for periodevalg og kontovalg
-            tx_all = _read_csv_safe(out / "transactions.csv", dtype=str)
-            if tx_all is None:
-                raise FileNotFoundError("transactions.csv mangler")
-            tx_all = _parse_dates(tx_all, ["TransactionDate", "PostingDate"])
-            tx_all["Date"] = tx_all["PostingDate"].fillna(tx_all["TransactionDate"])
-            for col in ["AccountID","CustomerID","SupplierID"]:
-                if col in tx_all.columns:
-                    tx_all[col] = tx_all[col].astype(str)
-            tx_all["AccountID"] = _norm_acc_series(tx_all["AccountID"])
-            hdr = _read_csv_safe(out / "header.csv", dtype=str)
+            _run_full_process(Path(file_path), Path(directory))
+            _messagebox.showinfo(
+                "Ferdig", f"Full prosess fullført. Rapporter er lagret i '{Path(directory)/'excel'}'."
+            )
+        except Exception as exc:
+            _messagebox.showerror("Feil", str(exc))
 
-            date_from = None if self.var_use_header.get() else (self.var_from.get().strip() or None)
-            date_to   = None if self.var_use_header.get() else (self.var_to.get().strip() or None)
-            dfrom, dto = _range_dates(hdr, date_from, date_to, tx_all)
+    # Layout
+    btn_full = _tk.Button(root, text="Kjør full prosess (parser + rapporter)", command=_run_full, width=40)
+    btn_full.pack(padx=20, pady=10)
+    btn_ar = _tk.Button(root, text="Generer AR (kunder)", command=lambda: _run_subledger("AR"), width=40)
+    btn_ar.pack(padx=20, pady=10)
+    btn_ap = _tk.Button(root, text="Generer AP (leverandører)", command=lambda: _run_subledger("AP"), width=40)
+    btn_ap.pack(padx=20, pady=10)
+    btn_quit = _tk.Button(root, text="Lukk", command=root.destroy, width=40)
+    btn_quit.pack(padx=20, pady=10)
 
-            # Velg kontrollkontoer for AR og AP (til status)
-            ar_accs, ar_label = _pick_control_accounts(out, "AR", tx_all)
-            ap_accs, ap_label = _pick_control_accounts(out, "AP", tx_all)
-
-            self._set_status(f"Periode: {dfrom.date()} → {dto.date()}\nAR-konti: {', '.join(sorted(ar_accs)) or 'ingen'}\nAP-konti: {', '.join(sorted(ap_accs)) or 'ingen'}")
-
-            if self.chk_gl.get():
-                self._set_status("Lager hovedbok…")
-                make_general_ledger(out)
-
-            if self.chk_tb.get():
-                self._set_status("Lager saldobalanse (IB/Per/UB fra Accounts)…")
-                make_trial_balance_ib_per_ub(out, str(dfrom.date()), str(dto.date()))
-
-            if self.chk_ar.get():
-                self._set_status("Lager kundereskontro…")
-                _party_reports(out, "AR", str(dfrom.date()), str(dto.date()), control_accounts=ar_accs)
-
-            if self.chk_ap.get():
-                self._set_status("Lager leverandørreskontro…")
-                _party_reports(out, "AP", str(dfrom.date()), str(dto.date()), control_accounts=ap_accs)
-
-            if self.chk_saldo.get():
-                self._set_status("Lager saldoliste kunder & leverandører…")
-                make_ar_ap_saldolist(out, date_from=str(dfrom.date()), date_to=str(dto.date()), write_csv=True)
-
-            if self.chk_ctrl.get():
-                self._set_status("Kjører kontroller…")
-                run_controls(out)
-
-        except Exception as e:
-            messagebox.showerror("Feil etter parsing", str(e))
-            return
-
-        self._set_status(f"Ferdig! Output i: {out}")
-        messagebox.showinfo("SAF-T", f"Ferdig! Filer laget i:\n{out}")
+    root.mainloop()
 
 
-# ---- main ----
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate SAF‑T reports. Parse SAF‑T, generate AR/AP subledger and ledgers. "
+            "If no arguments are given, a GUI will open."
+        )
+    )
+    # Input SAF‑T-fil (xml/zip). Hvis angitt sammen med --full, kjøres full prosess.
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=None,
+        help="Path to SAF‑T .xml or .zip file for parsing. Used with --full.",
+    )
+    # outdir er valgfri rotmappe for data og rapporter; standard er nåværende arbeidskatalog
+    parser.add_argument(
+        "--outdir",
+        type=str,
+        default=".",
+        help="Output root directory for CSV and Excel. Defaults to current working directory.",
+    )
+    # Valg av subledger-type når man kjører uten full prosess
+    parser.add_argument(
+        "--which",
+        type=str,
+        choices=["AR", "AP"],
+        default="AR",
+        help="Generate subledger for AR (customers) or AP (suppliers)",
+    )
+    parser.add_argument(
+        "--date_from", type=str, default=None, help="Start date (YYYY-MM-DD)"
+    )
+    parser.add_argument(
+        "--date_to", type=str, default=None, help="End date (YYYY-MM-DD)"
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "Run full process: parse SAF‑T (requires --input) and generate AR/AP subledger, general ledger and trial balance. "
+            "CSV files are written to outdir/csv and Excel reports to outdir/excel."
+        ),
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Start GUI for full process or subledger generation. Overrides other options.",
+    )
+    args = parser.parse_args()
+
+    # Hvis GUI er spesifisert, eller ingen argumenter (kun skriptnavn), vis GUI
+    if args.gui or (len(sys.argv) == 1):
+        launch_subledger_gui()
+    else:
+        outdir = Path(args.outdir)
+        if args.full:
+            # Full prosess krever input-fil
+            if not args.input:
+                parser.error("--full krever at du oppgir --input med SAF‑T-fil")
+            try:
+                _run_full_process(Path(args.input), outdir)
+            except Exception as exc:
+                print(f"Feil i full prosess: {exc}")
+        else:
+            # Kun subledger-generering
+            try:
+                out_path = make_subledger(outdir, args.which, args.date_from, args.date_to)
+                print(f"Ferdig! Genererte {args.which.upper()} subledger i '{out_path}'.")
+            except FileNotFoundError as exc:
+                print(f"Feil: {exc}")

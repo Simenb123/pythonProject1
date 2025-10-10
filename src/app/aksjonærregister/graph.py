@@ -164,10 +164,11 @@ def _svg_html(labels: Dict[NodeId, str], edges: List[Edge], pos: Dict[NodeId, Tu
 <meta charset="utf-8"/>
 <title>{esc(title)}</title>
 <style>
-body{{margin:0;background:#f8f9fa}}
-svg{{width:100vw;height:100vh;display:block}}
+/* La siden kunne scrolles dersom SVG er større enn viewport */
+body{{margin:0;background:#f8f9fa; overflow:auto}}
 </style>
-<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">
+<!-- Sett eksplisitt bredde/høyde på SVG slik at hele grafen kan rulles -->
+<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">
 <defs>
   <marker id="arrow" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
     <polygon points="0 0, 10 3.5, 0 7" style="fill:#6c757d;"/>

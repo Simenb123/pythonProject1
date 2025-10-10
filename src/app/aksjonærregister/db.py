@@ -141,10 +141,16 @@ def ensure_db(csv_path: str,
             # Tekstkolonner
             txt_parts: List[str] = []
             for out_name, csv_header in EXTRA_TEXT_COLUMNS.items():
+                # Hvis den aktuelle tekstkolonnen finnes i CSV, normaliserer vi verdien: fjerner innledende/sluttende anførselstegn
+                # og trim whitespace, deretter bruker NULLIF for å konvertere tom streng til NULL. Merk: paranteser må balanseres.
                 if _norm_header(csv_header) in {_norm_header(h) for h in headers}:
                     src = duck_quote(_resolve_headers(headers, {out_name: csv_header})[out_name])
-                    txt_parts.append(f" NULLIF(TRIM(BOTH '\"' FROM TRIM(CAST({src} AS VARCHAR)))), '') AS {out_name},")
+                    # Korrekt uttrykk: NULLIF(TRIM(BOTH '"' FROM TRIM(CAST(src AS VARCHAR))), '')
+                    txt_parts.append(
+                        f" NULLIF(TRIM(BOTH '\"' FROM TRIM(CAST({src} AS VARCHAR))), '') AS {out_name},"
+                    )
                 else:
+                    # Hvis kolonnen ikke finnes, fyller vi med NULL
                     txt_parts.append(f" CAST(NULL AS VARCHAR) AS {out_name},")
 
             # Tallfelter + backfill totalsum per selskap
@@ -210,14 +216,33 @@ def list_columns(conn: duckdb.DuckDBPyConnection) -> List[str]:
     return [r[0] for r in rows]
 
 def search_companies(conn: duckdb.DuckDBPyConnection, term: str, by: str, limit: int = 200):
+    """
+    Returnerer en liste over selskaper som matcher søket.
+
+    - Ved søk etter organisasjonsnummer matcher både selskapets orgnr og eierens orgnr (personnummer).
+    - Ved søk etter navn matcher både selskapsnavn og eiernavn. Case-insensitive ved navnesøk.
+    - Bruker SELECT DISTINCT for å sikre unike selskaper i resultatlisten.
+    """
+    # Wildcards for LIKE/ILIKE
+    like_term = f"%{term}%"
     if by == "orgnr":
-        sql = ("SELECT DISTINCT company_orgnr, company_name "
-               "FROM shareholders WHERE company_orgnr LIKE ? ORDER BY company_orgnr LIMIT ?")
-        params = [f"%{term}%", limit]
+        # Match på både company_orgnr og owner_orgnr. Fjerner NULL-rader i owner_orgnr med COALESCE.
+        sql = (
+            "SELECT DISTINCT company_orgnr, company_name "
+            "FROM shareholders "
+            "WHERE company_orgnr LIKE ? OR owner_orgnr LIKE ? "
+            "ORDER BY company_orgnr LIMIT ?"
+        )
+        params = [like_term, like_term, limit]
     else:
-        sql = ("SELECT DISTINCT company_orgnr, company_name "
-               "FROM shareholders WHERE company_name ILIKE ? ORDER BY company_name LIMIT ?")
-        params = [f"%{term}%", limit]
+        # Navnesøk: case-insensitive. Søker i både selskapets navn og eiernavn.
+        sql = (
+            "SELECT DISTINCT company_orgnr, company_name "
+            "FROM shareholders "
+            "WHERE company_name ILIKE ? OR owner_name ILIKE ? "
+            "ORDER BY company_name LIMIT ?"
+        )
+        params = [like_term, like_term, limit]
     return conn.execute(sql, params).fetchall()
 
 def get_owners_full(conn: duckdb.DuckDBPyConnection, company_orgnr: str):
@@ -239,11 +264,19 @@ def get_owners_full(conn: duckdb.DuckDBPyConnection, company_orgnr: str):
     return conn.execute(sql, [company_orgnr]).fetchall()
 
 def get_owners_agg_owner(conn: duckdb.DuckDBPyConnection, company_orgnr: str):
-    """SUM per eier (uavhengig av aksjeklasse) – for graf oppstrøms."""
+    """
+    Oppsummerer eierskap per eier (uavhengig av aksjeklasse) for graf oppstrøms.
+
+    I DuckDB kan man ikke referere til en aggregert alias direkte i ORDER BY når man også
+    grupperer på andre kolonner. For å unngå "Binder Error" der kolonnen må inngå i GROUP BY
+    eller være del av en aggregering, beregner vi resultatet i en underselect og sorterer i
+    ytterste spørring. Dette gjør at aliasen ``ownership_pct`` kan brukes fritt i ORDER BY.
+    """
     have = _existing_columns(conn)
     own = _expr_or_null(have, "shares_owner_num", "DOUBLE")
     tot = _expr_or_null(have, "shares_company_num", "DOUBLE")
-    sql = (
+    # Vi bygger en subquery som gjør gruppering og beregning av andel for hver eier
+    inner_select = (
         "SELECT owner_orgnr, owner_name, "
         "       CAST(NULL AS VARCHAR) AS share_class, "
         "       CAST(NULL AS VARCHAR) AS owner_country, "
@@ -253,7 +286,12 @@ def get_owners_agg_owner(conn: duckdb.DuckDBPyConnection, company_orgnr: str):
         f"       CASE WHEN MAX({tot}) IS NULL OR MAX({tot})=0 THEN NULL "
         f"            ELSE SUM({own})/MAX({tot})*100 END AS ownership_pct "
         "FROM shareholders WHERE company_orgnr=? "
-        "GROUP BY owner_orgnr, owner_name "
+        "GROUP BY owner_orgnr, owner_name"
+    )
+    sql = (
+        "SELECT owner_orgnr, owner_name, share_class, owner_country, owner_zip_place, "
+        "       shares_owner_num, shares_company_num, ownership_pct "
+        "FROM (" + inner_select + ") t "
         "ORDER BY (ownership_pct IS NULL), ownership_pct DESC, owner_name"
     )
     return conn.execute(sql, [company_orgnr]).fetchall()

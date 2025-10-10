@@ -1,5 +1,17 @@
 # -*- coding: utf-8 -*-
-# src/app/services/regnskapslinjer.py
+# src/app/services/regnskapslinjer.py (fixed version)
+"""
+Denne filen er en tilpasset versjon av det originale
+``src/app/services/regnskapslinjer.py`` fra pythonProject1. Den implementerer
+mer robust kolonnenavn-normalisering for saldobalansefiler før mappingen til
+regnskapslinjer. Synonymer for "inngående balanse", "utgående balanse" og
+"endring" oversettes automatisk, slik at norske feltnavn som "Inngående saldo"
+og "Utgående saldo" aksepteres. Den øvrige funksjonaliteten er uendret.
+
+For å ta denne i bruk erstatter du den eksisterende ``regnskapslinjer.py`` med
+dette innholdet i mappen ``src/app/services``.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,17 +23,15 @@ import re
 import numpy as np
 import pandas as pd
 
-# Vi bruker same settings-mekanisme som ellers i appen
 try:
     from app.services.clients import load_settings  # type: ignore
 except Exception:  # pragma: no cover
     from services.clients import load_settings  # type: ignore
 
-
 # -------------------------- Lokasjon av kildefiler --------------------------
 
 _DEFAULT_DIRS = [
-    Path(r"F:\Dokument\Kildefiler"),
+    Path(r"F:\\Dokument\\Kildefiler"),
 ]
 
 _ENV_KEYS = ("KILDEFILER_DIR", "REGNSKAPSLINJER_DIR", "KILDEFILES_DIR")
@@ -48,28 +58,23 @@ def find_kildefiler_dir() -> Optional[Path]:
             return found
     except Exception:
         pass
-
     # miljøvariabler
     for k in _ENV_KEYS:
         v = os.getenv(k)
         if v and Path(v).exists():
             return Path(v)
-
     # default
     return _first_existing(_DEFAULT_DIRS)
 
 
 def _find_file_case_insensitive(base: Path, wanted: str) -> Optional[Path]:
     wanted_low = wanted.lower()
-    # eksakt navn først
     p = base / wanted
     if p.exists():
         return p
-    # ellers: søk case-insensitivt
     for f in base.iterdir():
         if f.is_file() and f.name.lower() == wanted_low:
             return f
-    # fallback: "inneholder"
     for f in base.iterdir():
         if f.is_file() and wanted_low in f.name.lower():
             return f
@@ -92,7 +97,6 @@ def _pick_col(df: pd.DataFrame, *choices: str) -> Optional[str]:
     for ch in choices:
         if ch in low:
             return low[ch]
-    # substring match (robust mot «regnskapslinje nr» vs «regnskapsnr»)
     for ch in choices:
         for k, v in low.items():
             if ch in k:
@@ -107,7 +111,6 @@ def load_regnskapslinjer(path: Path) -> pd.DataFrame:
       - 'regnskapsnavn' (string)
     """
     df = pd.read_excel(path, engine="openpyxl")
-    # finn kolonner robust
     c_nr = (
         _pick_col(df, "regnskapsnr", "regnskapslinjenr", "linjenr", "nr", "regnskapslinje nr")
         or df.columns[0]
@@ -131,17 +134,13 @@ def load_konto_intervaller(path: Path) -> pd.DataFrame:
       - 'regnskapsnr' (string)  | linjenummer
     """
     df = pd.read_excel(path, engine="openpyxl")
-    # plukk kolonner robust
     c_lo = _pick_col(df, "fra", "fom", "start", "fra konto", "kontofra", "lo", "from", "konto fra")
     c_hi = _pick_col(df, "til", "tom", "slutt", "til konto", "kontotil", "hi", "to", "konto til")
     c_ln = _pick_col(df, "regnskapsnr", "linjenr", "regnskapslinjenr", "linje", "nr")
-
     if not c_lo or not c_hi or not c_ln:
         raise ValueError(
-            "Fant ikke nødvendige kolonner i mapping-filen. "
-            "Forventet noe ala 'fra/til' og 'regnskapsnr'."
+            "Fant ikke nødvendige kolonner i mapping-filen. Forventet noe ala 'fra/til' og 'regnskapsnr'."
         )
-
     out = pd.DataFrame()
     out["lo"] = pd.to_numeric(df[c_lo], errors="coerce").fillna(0).astype(int)
     out["hi"] = pd.to_numeric(df[c_hi], errors="coerce").fillna(0).astype(int)
@@ -167,13 +166,10 @@ def _assign_intervals_vectorized(konto: pd.Series, ranges: pd.DataFrame) -> pd.S
     """
     if konto.empty:
         return pd.Series([], dtype="string")
-
     k = pd.to_numeric(konto, errors="coerce").fillna(-10**9).astype(int).to_numpy()
     lo = ranges["lo"].to_numpy()
     hi = ranges["hi"].to_numpy()
     rn = ranges["regnskapsnr"].to_numpy(dtype=object)
-
-    # Finn siste 'lo' <= k (searchsorted), og verifiser k <= hi[idx]
     idx = np.searchsorted(lo, k, side="right") - 1
     ok = (idx >= 0) & (k <= hi[np.clip(idx, 0, len(hi) - 1)])
     out = np.empty_like(k, dtype=object)
@@ -190,48 +186,73 @@ def map_saldobalanse_to_regnskapslinjer(
 ) -> Optional[MappingResult]:
     """
     Legger til regnskapslinje på radnivå + aggregerer SB pr linje.
-    Returnerer None hvis vi ikke finner kildefilene.
+    Returnerer None hvis vi ikke finner kildefilene. Denne versjonen
+    normaliserer også kolonnenavn i df_sb ved å mappe vanlige norske
+    synonymer til standardnavnene 'inngående balanse', 'utgående balanse'
+    og 'endring'.
     """
     base = base_dir or find_kildefiler_dir()
     if not base:
         return None
-
     f_lines = _find_file_case_insensitive(base, REGNSKAPSLINJER_NAME)
     f_map = _find_file_case_insensitive(base, MAPPING_NAME)
     if not f_lines or not f_map:
         return None
-
     lines = load_regnskapslinjer(f_lines)
     ranges = load_konto_intervaller(f_map)
-
-    # Normaliser kolonnenavn vi trenger i SB
+    # Synonymer for å oversette til standardbeløpskolonner
+    synonyms: Dict[str, str] = {
+        # Inngående balanse (IB)
+        "inngående saldo": "inngående balanse",
+        "inngående balanse": "inngående balanse",
+        "ingående saldo": "inngående balanse",
+        "ingående balanse": "inngående balanse",
+        "inngaende saldo": "inngående balanse",
+        "inngaende balanse": "inngående balanse",
+        "ib": "inngående balanse",
+        # Utgående balanse (UB)
+        "utgående saldo": "utgående balanse",
+        "utgående balanse": "utgående balanse",
+        "utgaende saldo": "utgående balanse",
+        "utgaende balanse": "utgående balanse",
+        "ub": "utgående balanse",
+        # Endring
+        "endring saldo": "endring",
+        "endring beløp": "endring",
+        "endringer": "endring",
+        "bevegelse": "endring",
+        "diff": "endring",
+        "endring": "endring",
+    }
+    # oversett synonymer: finn eksisterende kolonner med matchende navn
+    cols_lower = {c.lower().strip(): c for c in df_sb.columns}
+    for syn, target in synonyms.items():
+        syn_l = syn.lower().strip()
+        if syn_l in cols_lower:
+            orig_col = cols_lower[syn_l]
+            # gi synonymer standardnavn hvis ikke allerede tilstede
+            if target not in df_sb.columns:
+                df_sb = df_sb.rename(columns={orig_col: target})
     needed = [c for c in ("konto", "inngående balanse", "utgående balanse", "endring") if c in df_sb.columns]
     if "konto" not in needed:
         raise ValueError("SB mangler kolonnen 'konto' etter standardisering.")
-
     # 1) radnivå: legg på regnskapsnr + navn
     rn = _assign_intervals_vectorized(df_sb["konto"], ranges)
     rows = df_sb.copy()
     rows["regnskapsnr"] = rn
     rows = rows.dropna(subset=["regnskapsnr"]).copy()
-
     rows = rows.merge(lines, on="regnskapsnr", how="left")
-
     # 2) aggregat pr regnskapslinje
     agg_cols = [c for c in ("inngående balanse", "utgående balanse", "endring") if c in rows.columns]
     if not agg_cols:
-        # fallback: hvis bare én saldo-kolonne finnes, aggreger den
         if "utgående balanse" in df_sb.columns:
             agg_cols = ["utgående balanse"]
         elif "endring" in df_sb.columns:
             agg_cols = ["endring"]
-
     if not agg_cols:
         raise ValueError("Fant ingen beløpskolonner i SB (forventet IB/UB/endring).")
-
     grp = rows.groupby(["regnskapsnr", "regnskapsnavn"], dropna=False)[agg_cols].sum().reset_index()
     grp = grp.sort_values("regnskapsnr").reset_index(drop=True)
-
     # 3) metadata til manifest
     src_accounts = int(pd.to_numeric(df_sb["konto"], errors="coerce").dropna().nunique())
     mapped_accounts = int(pd.to_numeric(rows["konto"], errors="coerce").dropna().nunique())
@@ -244,11 +265,10 @@ def map_saldobalanse_to_regnskapslinjer(
         "source_files": [str(f_lines), str(f_map)],
         "source_accounts": src_accounts,
         "mapped_accounts": mapped_accounts,
-        "unmapped_accounts": unmapped[:200],  # begrens for manifest-størrelse
+        "unmapped_accounts": unmapped[:200],
         "unmapped_count": len(unmapped),
         "columns_aggregated": agg_cols,
     }
-
     return MappingResult(rows=rows, agg=grp, meta=meta)
 
 

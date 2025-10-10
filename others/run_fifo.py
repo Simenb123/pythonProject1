@@ -9,7 +9,7 @@ Skal ligge i samme mappe som fifo_fifo_function.py
 
 from pathlib import Path
 import pandas as pd
-from fifo_fifo_function import fifo      # funksjonen du testet tidligere
+from others.fifo_fifo_function import fifo      # funksjonen du testet tidligere
 
 # --------------------------------------------------------------------------
 # 1)  ANGI FULL FILSTI TIL ARBEIDSBOKEN HER!

@@ -78,11 +78,17 @@ class StartPortal(tk.Tk):
         wrap.rowconfigure(1, weight=1)
 
         # actions
-        btns = ttk.Frame(self); btns.pack(fill="x", padx=8, pady=(0, 8))
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=8, pady=(0, 8))
+        # Knappene nederst i vinduet gir tilgang til ulike funksjoner.
         ttk.Button(btns, text="Åpne hub", command=self._open_hub).pack(side="left")
         ttk.Button(btns, text="Klientinfo…", command=self._open_info).pack(side="left", padx=(6, 0))
         ttk.Button(btns, text="Team…", command=self._open_team).pack(side="left", padx=(6, 0))
         ttk.Button(btns, text="AR‑import…", command=self._open_ar_import).pack(side="left", padx=(6, 0))
+        # Legg til en egen knapp for å velge/endre klient‑rot. Dette gjør det mulig
+        # for ikke‑tekniske brukere å peke applikasjonen til riktig katalog med
+        # klientmapper (for eksempel «F:\\Dokument\\2\\BHL klienter\\Klienter»).
+        ttk.Button(btns, text="Bytt rot …", command=self._choose_root).pack(side="right", padx=(6, 0))
         ttk.Button(btns, text="Oppdater", command=self._refresh_list).pack(side="right")
 
         # init liste
