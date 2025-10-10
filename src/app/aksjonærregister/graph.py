@@ -42,71 +42,152 @@ def _gather_graph(conn, root_orgnr: str, root_name: str, mode: str, max_up: int,
     if mode in ("both","down"): down(root_orgnr, 1)
     return labels, edges
 
-# ---- Enkel layouter (lagvis i Y, jevn fordeling i X) ----
+# ---- Hierarkisk layouter med rekursiv plassering av foreldre og barn ----
 def _layout(labels: Dict[NodeId, str], edges: List[Edge], root: NodeId,
-            max_up: int, max_down: int) -> Dict[NodeId, Tuple[int,int]]:
-    # Lagdybder: negative = oppstrøms, 0 = root, positive = nedstrøms
+            max_up: int, max_down: int) -> Dict[NodeId, Tuple[int, int]]:
+    """
+    Beregn posisjoner for noder i et todimensjonalt orgkart. Vi bruker en
+    lagvis tilnærming: nodene grupperes etter avstand (lag) fra rotnoden,
+    og innen hvert lag sorteres de ved hjelp av barysenterheuristikk for å
+    redusere kryssende kanter. Deretter plasseres de jevnt langs x-aksen.
+
+    Roten ligger på (0,0). Lag > 0 er nedstrøms (barn), lag < 0 er oppstrøms
+    (foreldre). Y-koordinaten er proporsjonal med laget. X-koordinaten settes
+    slik at laget sentreres rundt rotaksen og grupper med samme foreldre
+    havner nær hverandre.
+    """
+    # Beregn lag for hver node: negativ for oppstrøms, 0 for root, positiv for nedstrøms
     layer: Dict[NodeId, int] = {root: 0}
-    # opp
+    # Utvid oppover
     frontier = [root]
-    for d in range(1, max_up+1):
-        nxt = set()
-        for _, dst, _ in edges:
-            if dst in frontier:
-                # finn kilder (eier -> dst)
-                for src, dst2, _ in edges:
-                    if dst2 == dst:
-                        if src not in layer:
-                            layer[src] = -d
-                            nxt.add(src)
+    for d in range(1, max_up + 1):
+        nxt: Set[NodeId] = set()
+        for src, dst, _ in edges:
+            if dst in frontier and src not in layer:
+                layer[src] = -d
+                nxt.add(src)
         frontier = list(nxt)
-    # ned
+    # Utvid nedover
     frontier = [root]
-    for d in range(1, max_down+1):
-        nxt = set()
-        for src, _, _ in edges:
-            if src in frontier:
-                for src2, dst, _ in edges:
-                    if src2 == src:
-                        if dst not in layer:
-                            layer[dst] = d
-                            nxt.add(dst)
+    for d in range(1, max_down + 1):
+        nxt: Set[NodeId] = set()
+        for src, dst, _ in edges:
+            if src in frontier and dst not in layer:
+                layer[dst] = d
+                nxt.add(dst)
         frontier = list(nxt)
 
-    # grupper per lag
-    per_layer: Dict[int, List[NodeId]] = {}
-    for nid, d in layer.items():
-        per_layer.setdefault(d, []).append(nid)
-    for d in per_layer:
-        per_layer[d].sort(key=lambda n: labels[n])
+    # Bygg per-lag-lister og initialiser sortering alfabetisk
+    layers: Dict[int, List[NodeId]] = {}
+    for nid, depth in layer.items():
+        layers.setdefault(depth, []).append(nid)
+    for depth in layers:
+        layers[depth].sort(key=lambda n: labels.get(n, ""))
 
-    # posisjoner
-    pos: Dict[NodeId, Tuple[int,int]] = {}
-    W  = 180  # nodebredde (estimat)
-    H  = 60   # nodehøyde
-    XS = 220  # X-spacing
-    YS = 120  # Y-spacing
+    # Bygg adjacens-lister for nedstrøms pass: foreldre til barn (lag >=0)
+    parents_down: Dict[NodeId, List[NodeId]] = {}
+    for src, dst, _ in edges:
+        ds = layer.get(src, 0)
+        dd = layer.get(dst, 0)
+        # Nedstrøms kant
+        if ds >= 0 and dd > ds:
+            parents_down.setdefault(dst, []).append(src)
+    # Sorter foreldre alfabetisk for konsistens
+    for node, par in parents_down.items():
+        par.sort(key=lambda n: labels.get(n, ""))
 
-    # root midt
-    pos[root] = (0, 0)
+    # Barycenter-sortering for nedstrøms nivåer
+    for k in range(1, max_down + 1):
+        nodes = layers.get(k, [])
+        if not nodes:
+            continue
+        prev_layer_nodes = layers.get(k - 1, [root])
+        # Lag en index-oppslag for foreldre i forrige lag
+        index_prev: Dict[NodeId, int] = {nid: i for i, nid in enumerate(prev_layer_nodes)}
+        # Beregn barysenter for hvert node basert på foreldre
+        bary: Dict[NodeId, float] = {}
+        for node in nodes:
+            par = parents_down.get(node, [])
+            # Dersom flere foreldre, ta gjennomsnitt av indeksene; ellers bruk egen indeks
+            if par:
+                positions = [index_prev[p] for p in par if p in index_prev]
+                if positions:
+                    bary[node] = sum(positions) / len(positions)
+                else:
+                    bary[node] = nodes.index(node)
+            else:
+                bary[node] = nodes.index(node)
+        # Sorter nodene etter barysenter (stiger)
+        nodes.sort(key=lambda n: bary[n])
+        layers[k] = nodes
 
-    # opp (negative lag)
-    for depth in sorted([d for d in per_layer if d < 0]):
-        nodes = per_layer[depth]
+    # Bygg adjacens-lister for oppstrøms pass: foreldre->barn i oppstrømsdelen
+    children_up: Dict[NodeId, List[NodeId]] = {}
+    for src, dst, _ in edges:
+        ds = layer.get(src, 0)
+        dd = layer.get(dst, 0)
+        # Oppstrøms kant: kilde ligger høyere (lavere layer-verdi) enn dest
+        if ds < 0 and dd <= 0:
+            children_up.setdefault(src, []).append(dst)
+    # Sorter barna alfabetisk for konsistens
+    for node, kids in children_up.items():
+        kids.sort(key=lambda n: labels.get(n, ""))
+
+    # Bygg lag for oppstrøms (positiv indeks for enkelhet)
+    layers_up: Dict[int, List[NodeId]] = {0: [root]}
+    for nid, depth in layer.items():
+        if depth < 0:
+            layers_up.setdefault(-depth, []).append(nid)
+    for depth in layers_up:
+        layers_up[depth].sort(key=lambda n: labels.get(n, ""))
+
+    # Barycenter-sortering for oppstrøms lag
+    for k in range(1, max_up + 1):
+        nodes = layers_up.get(k, [])
+        if not nodes:
+            continue
+        prev_layer_nodes = layers_up.get(k - 1, [root])
+        index_prev: Dict[NodeId, int] = {nid: i for i, nid in enumerate(prev_layer_nodes)}
+        bary: Dict[NodeId, float] = {}
+        for node in nodes:
+            kids = children_up.get(node, [])
+            if kids:
+                positions = [index_prev[c] for c in kids if c in index_prev]
+                if positions:
+                    bary[node] = sum(positions) / len(positions)
+                else:
+                    bary[node] = nodes.index(node)
+            else:
+                bary[node] = nodes.index(node)
+        nodes.sort(key=lambda n: bary[n])
+        layers_up[k] = nodes
+
+    # Tildel koordinater: x-koordinater er evenly spaced per lag
+    pos: Dict[NodeId, Tuple[int, int]] = {root: (0, 0)}
+    XS = 220
+    YS = 120
+    # Nedstrøms lag (positive)
+    for depth in range(1, max_down + 1):
+        nodes = layers.get(depth, [])
         n = len(nodes)
+        if n == 0:
+            continue
+        x_start = -((n - 1) / 2.0) * XS
         for i, nid in enumerate(nodes):
-            x = (i - (n-1)/2) * XS
+            x = x_start + i * XS
             y = depth * YS
-            pos[nid] = (int(x), int(y))
-
-    # ned (positive lag)
-    for depth in sorted([d for d in per_layer if d > 0]):
-        nodes = per_layer[depth]
+            pos[nid] = (int(round(x)), int(round(y)))
+    # Oppstrøms lag (negative)
+    for k in range(1, max_up + 1):
+        nodes = layers_up.get(k, [])
         n = len(nodes)
+        if n == 0:
+            continue
+        x_start = -((n - 1) / 2.0) * XS
         for i, nid in enumerate(nodes):
-            x = (i - (n-1)/2) * XS
-            y = depth * YS
-            pos[nid] = (int(x), int(y))
+            x = x_start + i * XS
+            y = -k * YS
+            pos[nid] = (int(round(x)), int(round(y)))
 
     return pos
 
@@ -137,14 +218,19 @@ def _svg_html(labels: Dict[NodeId, str], edges: List[Edge], pos: Dict[NodeId, Tu
         is_company = (nid == root) or nid.isdigit()
         fill = "#e9ecef" if is_company else "#ffffff"
         stroke = "#495057" if is_company else "#6c757d"
+        # Split label into up to two lines to avoid backslash inside f-string expression.
+        _escaped_label = esc(label)
+        _label_lines = _escaped_label.splitlines()
+        if len(_label_lines) < 2:
+            _label_lines.append("")
         node_svgs.append(
             f'<g class="node" data-id="{nid}" transform="translate({X-80},{Y-30})">'
             f'<rect x="0" y="0" rx="8" ry="8" width="160" height="60" '
             f'style="fill:{fill};stroke:{stroke};stroke-width:1.2"/>'
             f'<text x="80" y="25" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" '
-            f'font-size="12" fill="#212529">{esc(label).splitlines()[0]}</text>'
+            f'font-size="12" fill="#212529">{_label_lines[0]}</text>'
             f'<text x="80" y="43" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" '
-            f'font-size="11" fill="#6c757d">{esc(label).splitlines()[1] if "\\n" in label else ""}</text>'
+            f'font-size="11" fill="#6c757d">{_label_lines[1]}</text>'
             f"</g>"
         )
 

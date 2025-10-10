@@ -519,7 +519,26 @@ def make_trial_balance(
     out = tb[out_cols]
     path = outdir / "trial_balance.xlsx"
     with pd.ExcelWriter(path, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as writer:
+        # Lag full TrialBalance-fane
         out.sort_values("AccountID").to_excel(writer, index=False, sheet_name="TrialBalance")
+        # Lag en enkel fane med kun konto, navn, IB, bevegelse og UB
+        # Bestem kolonnenavn for IB, bevegelse og UB (fallback til GL når kontoplan mangler)
+        ib_col = "IB_OpenNet" if "IB_OpenNet" in tb.columns else "GL_IB"
+        pr_col = "PR_Accounts" if "PR_Accounts" in tb.columns else "GL_PR"
+        ub_col = "UB_CloseNet" if "UB_CloseNet" in tb.columns else "GL_UB"
+        simple_cols = [c for c in ["AccountID", "AccountDescription"] if c in tb.columns]
+        simple_df = tb[simple_cols].copy() if simple_cols else pd.DataFrame()
+        # Legg til IB, bevegelse og UB-kolonner
+        simple_df["IB"] = tb[ib_col]
+        simple_df["Movement"] = tb[pr_col]
+        simple_df["UB"] = tb[ub_col]
+        # Fjern eventuelle konto-IDer som er 0 (og tilhørende manglende navn)
+        if "AccountID" in simple_df.columns:
+            simple_df = simple_df[simple_df["AccountID"].astype(str) != "0"]
+        # Skriv til en egen fane
+        simple_df.sort_values("AccountID" if "AccountID" in simple_df.columns else None).to_excel(
+            writer, index=False, sheet_name="SimpleTrialBalance"
+        )
     return path
 
 
