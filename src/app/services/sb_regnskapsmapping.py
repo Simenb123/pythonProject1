@@ -15,6 +15,13 @@ import re
 import pandas as pd
 
 try:
+    # helper for renaming balance columns
+    from regnskap_utils import rename_balance_columns
+except Exception:
+    # fallback if module not available
+    rename_balance_columns = None  # type: ignore
+
+try:
     # for stier og årsmappestruktur
     from app.services.clients import year_paths
 except Exception:
@@ -171,6 +178,12 @@ def map_saldobalanse_df(df_sb: pd.DataFrame,
     intervals = read_konto_intervaller(sources.intervall_path)
 
     mapper = _build_mapper(intervals)
+    # Renamer balansekolonner til standardnavn (IB, UB, Endring) hvis mulig
+    if rename_balance_columns is not None:
+        try:
+            df_sb = rename_balance_columns(df_sb)
+        except Exception:
+            pass
     df = df_sb.copy()
     # sikre konto som int
     if "konto" not in df.columns:

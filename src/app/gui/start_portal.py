@@ -20,6 +20,9 @@ from app.services.registry import (                          # E-post-ID, ansatt
     team_has_user
 )
 
+import pandas as pd
+from pathlib import Path
+
 # (valgfrie) undermoduler – lastes «late» i knapper
 #  - app.gui.client_info_gui: ClientInfoWindow
 #  - app.gui.team_editor_gui: TeamEditor
@@ -78,21 +81,22 @@ class StartPortal(tk.Tk):
         wrap.rowconfigure(1, weight=1)
 
         # actions
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=8, pady=(0, 8))
-        # Knappene nederst i vinduet gir tilgang til ulike funksjoner.
+        btns = ttk.Frame(self); btns.pack(fill="x", padx=8, pady=(0, 8))
         ttk.Button(btns, text="Åpne hub", command=self._open_hub).pack(side="left")
         ttk.Button(btns, text="Klientinfo…", command=self._open_info).pack(side="left", padx=(6, 0))
         ttk.Button(btns, text="Team…", command=self._open_team).pack(side="left", padx=(6, 0))
         ttk.Button(btns, text="AR‑import…", command=self._open_ar_import).pack(side="left", padx=(6, 0))
-        # Legg til en egen knapp for å velge/endre klient‑rot. Dette gjør det mulig
-        # for ikke‑tekniske brukere å peke applikasjonen til riktig katalog med
-        # klientmapper (for eksempel «F:\\Dokument\\2\\BHL klienter\\Klienter»).
-        ttk.Button(btns, text="Bytt rot …", command=self._choose_root).pack(side="right", padx=(6, 0))
         ttk.Button(btns, text="Oppdater", command=self._refresh_list).pack(side="right")
 
         # init liste
         self._all_clients: list[str] = list_clients(self.clients_root)
+        # -- load team and employee data for "Mine klienter" filtering --
+        # helper structures are initialised in _load_team_data()
+        self.team_df: pd.DataFrame
+        self.emp_df: pd.DataFrame
+        self.client_to_initials: dict[int, set[str]]
+        self.email_to_initial: dict[str, str]
+        self._load_team_data()
         self._refresh_list()
 
     # ---------------- UI helpers ----------------
@@ -172,13 +176,134 @@ class StartPortal(tk.Tk):
         if self.only_mine.get():
             email = self._email_var.get().strip().lower()
             if not email:
-                messagebox.showinfo("Velg e‑post", "Sett e‑post først for å bruke «Mine klienter».", parent=self)
+                messagebox.showinfo(
+                    "Velg e‑post",
+                    "Sett e‑post først for å bruke «Mine klienter».",
+                    parent=self,
+                )
                 self.only_mine.set(False)
             else:
-                base = [n for n in base if team_has_user(self.clients_root, n, email)]
+                # Determine the set of initials associated with the logged-in user.
+                initials_to_check: set[str] = set()
+                # Try to look up initials via email
+                ini = self.email_to_initial.get(email)
+                if ini:
+                    initials_to_check.add(ini)
+                else:
+                    # Fallback: use alias (prefix before '@') as initial guess
+                    alias = email.split("@")[0]
+                    alias_upper = alias.replace(".", "").replace("_", "").upper()
+                    if alias_upper:
+                        initials_to_check.add(alias_upper)
+                filtered_base: list[str] = []
+                for n in base:
+                    # Parse the client number from the beginning of the string
+                    cid = None
+                    try:
+                        first = n.strip().split()[0]
+                        # Extract leading digits from the first token (handles 0000_name or 0000-name)
+                        digits = ""
+                        for ch in first:
+                            if ch.isdigit():
+                                digits += ch
+                            else:
+                                break
+                        if digits:
+                            cid = int(digits)
+                        else:
+                            cid = int(first)
+                    except Exception:
+                        cid = None
+                    if cid is None:
+                        continue
+                    member_inis = self.client_to_initials.get(cid)
+                    if not member_inis:
+                        continue
+                    # Check if any of the user's initials match this client
+                    match = False
+                    for user_ini in initials_to_check:
+                        if user_ini.upper() in member_inis:
+                            match = True
+                            break
+                    if match:
+                        filtered_base.append(n)
+                base = filtered_base
         self.lb.delete(0, tk.END)
         for n in base: self.lb.insert(tk.END, n)
         self.count_lbl.config(text=f"{len(base)} av {len(self._all_clients)}")
+
+    def _load_team_data(self) -> None:
+        """Load team and employee information from central files.
+
+        This helper populates self.team_df, self.emp_df, self.client_to_initials,
+        and self.email_to_initial for use in filtering "Mine klienter".  It
+        attempts to locate the files in the kildefiler directory or a local
+        fallback directory.  Missing files are tolerated; in that case no
+        filtering by team will occur.
+        """
+        self.team_df = pd.DataFrame()
+        self.emp_df = pd.DataFrame()
+        self.client_to_initials = {}
+        self.email_to_initial = {}
+        # Attempt to locate files using find_kildefiler_dir
+        base_dir = None
+        try:
+            from app.services.regnskapslinjer import find_kildefiler_dir  # type: ignore
+            bd = find_kildefiler_dir()
+            if bd:
+                base_dir = Path(bd)
+        except Exception:
+            pass
+        if base_dir is None:
+            # fallback: Kildefiler directory relative to src root
+            possible_dir = Path(__file__).resolve().parents[2] / "Kildefiler"
+            if possible_dir.exists():
+                base_dir = possible_dir
+        # read files if found
+        if base_dir:
+            tfile = base_dir / "BHL AS Team.xlsx"
+            if tfile.exists():
+                try:
+                    self.team_df = pd.read_excel(tfile)
+                except Exception:
+                    pass
+            efile = base_dir / "Ansatte BHL.xlsx"
+            if efile.exists():
+                try:
+                    self.emp_df = pd.read_excel(efile)
+                except Exception:
+                    pass
+        # Build helper maps
+        if not self.emp_df.empty:
+            # Normaliser e‑postkolonner til små bokstaver hvis de finnes. Vi gjør dette før mapping.
+            if "epost" in self.emp_df.columns:
+                self.emp_df["epost"] = self.emp_df["epost"].astype(str).str.lower().str.strip()
+            if "email" in self.emp_df.columns:
+                self.emp_df["email"] = self.emp_df["email"].astype(str).str.lower().str.strip()
+            if "Email" in self.emp_df.columns:
+                self.emp_df["Email"] = self.emp_df["Email"].astype(str).str.lower().str.strip()
+            # Bygg mapping fra e‑postadresse til initialer dersom begge kolonner finnes.
+            if "IN" in self.emp_df.columns:
+                initials_series = self.emp_df["IN"].astype(str).str.strip().str.upper()
+                # Finn første tilgjengelige e‑postkolonne
+                emails = None
+                for col in ("epost", "email", "Email"):
+                    if col in self.emp_df.columns:
+                        emails = self.emp_df[col].astype(str).str.lower().str.strip()
+                        break
+                if emails is not None:
+                    self.email_to_initial = dict(zip(emails, initials_series))
+        if not self.team_df.empty:
+            for _, r in self.team_df.iterrows():
+                try:
+                    cid = int(r.get("KLIENT_NR"))
+                except Exception:
+                    continue
+                ini = str(r.get("INITIAL", "")).strip().upper()
+                if cid not in self.client_to_initials:
+                    self.client_to_initials[cid] = set()
+                if ini:
+                    self.client_to_initials[cid].add(ini)
 
     def _selected_client(self) -> str | None:
         sel = self.lb.curselection()
@@ -208,7 +333,12 @@ class StartPortal(tk.Tk):
             messagebox.showwarning("Velg klient", "Velg en klient i listen.", parent=self); return
         try:
             from app.gui.team_editor_gui import TeamEditor
-            TeamEditor(self, self.clients_root, name)
+            win = TeamEditor(self, self.clients_root, name)
+            # wait for editor to close before refreshing team data
+            self.wait_window(win)
+            # reload team data and refresh list (in case of changes)
+            self._load_team_data()
+            self._refresh_list()
         except Exception as exc:
             messagebox.showerror("Mangler modul",
                                  f"Kunne ikke laste Team‑GUI.\n{type(exc).__name__}: {exc}", parent=self)
