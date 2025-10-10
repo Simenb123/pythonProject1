@@ -48,6 +48,162 @@ except Exception:
 AR_CONTROL_ACCOUNTS: Set[str] = {"1510", "1550"}
 AP_CONTROL_ACCOUNTS: Set[str] = {"2410", "2460"}
 
+# === Konto-utvidelse og balansereparasjon ===
+# SAF‑T‑filer fra enkelte systemer inneholder en accounts.csv som mangler
+# reskontro‑konti (f.eks. 1510, 1550, 2410, 2460) eller andre balansekonti
+# som likevel forekommer i transactions.csv. Dette gjør at summen av
+# ClosingDebit minus ClosingCredit i kontoplanen ikke går i null, selv om
+# hovedboken balanserer. For å generere en korrekt trial balance må alle
+# kontoene i transaksjonene også finnes i accounts.csv med korrekte
+# åpning‑ og sluttsaldoer.
+#
+# Funktionen `_complete_accounts_file` leser transactions.csv og header.csv
+# for å beregne OpeningDebit, OpeningCredit, ClosingDebit og ClosingCredit
+# for kontoer som forekommer i transaksjonene, men ikke i accounts.csv.
+# Disse nye kontoene legges til accounts.csv (eller opprettes hvis den
+# mangler), slik at trial balance kan beregnes riktig og sum UB_CloseNet
+# blir null. Hvis accounts.csv ikke finnes, opprettes en ny fil i outdir.
+
+def _complete_accounts_file(outdir: Path) -> None:
+    """Sørg for at accounts.csv inneholder alle kontoer fra transaksjonene.
+
+    Leser transactions.csv og header.csv i utdata-mappen for å finne alle
+    unike kontoer (AccountID) brukt i transaksjonene. For kontoer som ikke
+    finnes i accounts.csv, beregnes OpeningDebit, OpeningCredit,
+    ClosingDebit og ClosingCredit basert på transaksjonene og perioden
+    definert av header.csv (SelectionStart/End). De nye kontoene legges
+    til accounts.csv på disk. Hvis accounts.csv mangler, opprettes den.
+    """
+    # Finn transaksjoner og header
+    tx_path = _find_csv_file(outdir, "transactions.csv")
+    if tx_path is None:
+        return
+    tx = _read_csv_safe(tx_path, dtype=str)
+    if tx is None or tx.empty or "AccountID" not in tx.columns:
+        return
+    # Les header for datoperiode
+    hdr_path = _find_csv_file(outdir, "header.csv")
+    hdr = _read_csv_safe(hdr_path, dtype=str) if hdr_path else None
+    # Parse datoer og normaliser kontoer
+    tx = _parse_dates(tx, ["TransactionDate", "PostingDate"])
+    tx["Date"] = tx["PostingDate"].fillna(tx["TransactionDate"])
+    tx["AccountID"] = _norm_acc_series(tx["AccountID"].astype(str))
+    tx = _to_num(tx, ["Debit", "Credit"])
+    # Bestem periode (bruk hele året dersom header mangler)
+    dfrom, dto = _range_dates(hdr, None, None, tx)
+    # Hent eksisterende accounts.csv (kan være None)
+    acc_path = _find_csv_file(outdir, "accounts.csv")
+    acc_df: Optional[pd.DataFrame] = None
+    if acc_path is not None and acc_path.is_file():
+        try:
+            acc_df = pd.read_csv(acc_path, dtype=str, keep_default_na=False)
+            # Fjern eventuelle duplikate AccountDescription-kolonner som kan ha oppstått ved tidligere flettinger
+            if acc_df is not None:
+                # Samle alle kolonnenavn som starter med AccountDescription (case-insensitivt)
+                desc_cols = [c for c in acc_df.columns if c.lower().startswith("accountdescription")]
+                if desc_cols:
+                    # Hold på den første forekomsten (den antas å være den mest korrekte)
+                    main_desc = desc_cols[0]
+                    # Gi den en ren standardisert navn hvis den ikke allerede heter akkurat 'AccountDescription'
+                    if main_desc != "AccountDescription":
+                        acc_df.rename(columns={main_desc: "AccountDescription"}, inplace=True)
+                    # Dropp alle andre AccountDescription* kolonner
+                    for dc in desc_cols:
+                        if dc != main_desc and dc in acc_df.columns:
+                            acc_df.drop(columns=[dc], inplace=True)
+        except Exception:
+            acc_df = None
+    # Normaliser eksisterende konti og hent beskrivelser
+    desc_df: Optional[pd.DataFrame] = None
+    if acc_df is not None and not acc_df.empty and "AccountID" in acc_df.columns:
+        acc_df["AccountID"] = _norm_acc_series(acc_df["AccountID"])
+        # Hold bare kontobeskrivelsen hvis tilgjengelig
+        if "AccountDescription" in acc_df.columns:
+            desc_df = acc_df[["AccountID", "AccountDescription"]].copy()
+    # Finn alle kontoer i transaksjonene.
+    # Vi filtrerer ikke lenger bort konto-id "0". Erfaring viser at enkelte SAF‑T‑systemer
+    # bokfører balanserende differanser på konto "0". Hvis vi ekskluderer denne, vil
+    # summen av ClosingDebit minus ClosingCredit ikke gå i null, slik at trial balance
+    # rapporten ikke balanserer. Inkluder derfor alle kontoer som faktisk forekommer.
+    all_tx_accounts = sorted(set(tx["AccountID"].dropna().astype(str).tolist()))
+    # Beregn opening (før dfrom) og closing (<= dto) totals for alle kontoer
+    tx_open = tx[tx["Date"] < dfrom]
+    tx_close = tx[tx["Date"] <= dto]
+    open_sum = tx_open.groupby("AccountID")[["Debit", "Credit"]].sum()
+    close_sum = tx_close.groupby("AccountID")[["Debit", "Credit"]].sum()
+    rows = []
+    for acc_id in all_tx_accounts:
+        od = float(open_sum.loc[acc_id, "Debit"]) if acc_id in open_sum.index else 0.0
+        oc = float(open_sum.loc[acc_id, "Credit"]) if acc_id in open_sum.index else 0.0
+        cd = float(close_sum.loc[acc_id, "Debit"]) if acc_id in close_sum.index else 0.0
+        cc = float(close_sum.loc[acc_id, "Credit"]) if acc_id in close_sum.index else 0.0
+        rows.append(
+            {
+                "AccountID": acc_id,
+                "OpeningDebit": od,
+                "OpeningCredit": oc,
+                "ClosingDebit": cd,
+                "ClosingCredit": cc,
+            }
+        )
+    computed_df = pd.DataFrame(rows)
+    # Kontroller konto-IDer: dersom AccountID har verdi "nan" (som kan oppstå når feltet er tomt eller 'nan'),
+    # erstatt den med et eksplisitt navn slik at den ikke forsvinner når filen lagres/leses. Vi velger
+    # "UNDEFINED" som ID for slike kontoer. Dette gjør at saldobalansen balanserer fordi denne
+    # "ubestemte" kontoen får sin egen linje.
+    if not computed_df.empty and "AccountID" in computed_df.columns:
+        computed_df["AccountID"] = computed_df["AccountID"].fillna("").astype(str)
+        computed_df.loc[computed_df["AccountID"].str.lower() == "nan", "AccountID"] = "UNDEFINED"
+    # Slå på kontobeskrivelse hvis den finnes i eksisterende accounts.csv
+    if desc_df is not None:
+        computed_df = computed_df.merge(desc_df, on="AccountID", how="left")
+    # Hvis accounts.csv mangler helt, skriv computed_df som ny fil
+    if acc_df is None or acc_df.empty:
+        cols = [
+            "AccountID",
+            "AccountDescription",
+            "OpeningDebit",
+            "OpeningCredit",
+            "ClosingDebit",
+            "ClosingCredit",
+        ]
+        # Sørg for at AccountDescription finnes selv om den ikke var tilgjengelig
+        if "AccountDescription" not in computed_df.columns:
+            computed_df["AccountDescription"] = ""
+        computed_df[cols].to_csv(outdir / "accounts.csv", index=False)
+        return
+    # Ellers: legg til nye kontoer fra computed_df for konti som ikke finnes i acc_df.
+    # Bevar eksisterende åpning/closing-saldoer i acc_df og tilføye bare de manglende.
+    acc_df = acc_df.copy()
+    # Sørg for numeriske kolonner eksisterer og er tall
+    num_cols = ["OpeningDebit", "OpeningCredit", "ClosingDebit", "ClosingCredit"]
+    for col in num_cols:
+        if col in acc_df.columns:
+            acc_df[col] = pd.to_numeric(acc_df[col], errors="coerce").fillna(0.0)
+        else:
+            acc_df[col] = 0.0
+    # AccountDescription må eksistere for enkel merging
+    if "AccountDescription" not in acc_df.columns:
+        acc_df["AccountDescription"] = ""
+    # Finn kontoer som ikke er i eksisterende accounts
+    existing_ids = set(acc_df["AccountID"].astype(str))
+    missing_df = computed_df[~computed_df["AccountID"].astype(str).isin(existing_ids)].copy()
+    # Sørg for at manglende konti har AccountDescription (tom streng hvis NaN)
+    if "AccountDescription" not in missing_df.columns:
+        missing_df["AccountDescription"] = ""
+    else:
+        missing_df["AccountDescription"] = missing_df["AccountDescription"].fillna("")
+    # Append missing accounts til acc_df, slik at vi beholder de eksisterende saldoene uendret
+    combined = pd.concat([acc_df, missing_df], ignore_index=True, sort=False)
+    # Skriv tilbake til fil
+    cols = ["AccountID", "AccountDescription", "OpeningDebit", "OpeningCredit", "ClosingDebit", "ClosingCredit"]
+    # Sørg for at kolonnene finnes i combined
+    for col in cols:
+        if col not in combined.columns:
+            combined[col] = 0.0 if col in num_cols else ""
+    combined[cols].to_csv(acc_path if acc_path is not None else outdir / "accounts.csv", index=False)
+
+
 
 def _read_csv_safe(path: Path, dtype=str) -> Optional[pd.DataFrame]:
     """Les en CSV-fil hvis den finnes, returner None ellers.
@@ -308,6 +464,12 @@ def make_subledger(
     which = which.upper()
     if which not in {"AR", "AP"}:
         raise ValueError("which må være 'AR' eller 'AP'")
+    # Før vi starter, prøv å komplettere kontoplanen slik at
+    # kontrollkontoer har riktige UB-tall for skalering.
+    try:
+        _complete_accounts_file(outdir)
+    except Exception:
+        pass
     # Les transaksjoner
     # Forsøk å finne transactions.csv i outdir, parent eller nåværende katalog
     tx_path = _find_csv_file(outdir, "transactions.csv")
@@ -435,6 +597,14 @@ def make_trial_balance(
     date_to: Optional[str] = None,
 ) -> Path:
     """Generer trial balance (hovedboksaldoer) med IB, PR og UB per konto."""
+    # Før vi leser transaksjoner, sørg for at accounts.csv er komplett
+    # slik at UB-saldo kan summeres korrekt når vi fletter kontoplanen.
+    try:
+        _complete_accounts_file(outdir)
+    except Exception:
+        # Hvis noe går galt under komplettering, ignorer og fortsett med eksisterende data
+        pass
+
     tx_path = _find_csv_file(outdir, "transactions.csv")
     hdr_path = _find_csv_file(outdir, "header.csv")
     tx = _read_csv_safe(tx_path, dtype=str) if tx_path else None
@@ -532,9 +702,10 @@ def make_trial_balance(
         simple_df["IB"] = tb[ib_col]
         simple_df["Movement"] = tb[pr_col]
         simple_df["UB"] = tb[ub_col]
-        # Fjern eventuelle konto-IDer som er 0 (og tilhørende manglende navn)
-        if "AccountID" in simple_df.columns:
-            simple_df = simple_df[simple_df["AccountID"].astype(str) != "0"]
+        # Vi fjerner ikke lenger konto-ID "0" fra den enkle balansen. Selv om konto
+        # "0" typisk representerer en ubestemt eller midlertidig konto, kan den ha
+        # reell saldo som trengs for at summen av IB + bevegelse = UB skal bli null.
+        # Dermed beholdes også kontoen med ID "0" i denne enkle rapporten.
         # Skriv til en egen fane
         simple_df.sort_values("AccountID" if "AccountID" in simple_df.columns else None).to_excel(
             writer, index=False, sheet_name="SimpleTrialBalance"

@@ -938,25 +938,40 @@ class App(tk.Tk):
             # og 'regnskapsnavn'. Dersom vi ikke finner de forventede kolonnene "regnr" og
             # "regnskapslinje", prøver vi å gjenkjenne og omdøpe alternative feltnavn.
             if "regnr" not in rows_df.columns or "regnskapslinje" not in rows_df.columns:
-                rename_candidates: dict[str, str] = {}
+                rename_map: dict[str, str] = {}
                 # Finn alternativ kolonne for regnskapsnummer
-                for c in rows_df.columns:
-                    lc = str(c).strip().lower().replace("_", "").replace(" ", "")
-                    if lc in ("regnr", "regnskapsnr", "regnskapsnummer", "nummer", "sum", "sumnr"):
-                        rename_candidates[c] = "regnr"
-                        break
-                # Finn alternativ kolonne for regnskapslinjenavn
-                for c in rows_df.columns:
-                    lc = str(c).strip().lower().replace("_", "").replace(" ", "")
-                    if lc in ("regnskapslinje", "regnskapsnavn", "linje", "navn", "tekst"):
-                        rename_candidates[c] = "regnskapslinje"
-                        break
-                # Foreta omdøping hvis vi har funnet kandidater
-                if rename_candidates:
+                if "regnr" not in rows_df.columns:
+                    for c in rows_df.columns:
+                        lc = str(c).strip().lower().replace("_", "").replace(" ", "")
+                        # aksepter flere varianter for regnskapsnummer
+                        if lc in ("regnskapsnr", "regnskapsnummer", "nummer", "sumnr", "sum", "regnr"):
+                            rename_map[c] = "regnr"
+                            break
+                # Finn alternativ kolonne for regnskapslinje-navn
+                if "regnskapslinje" not in rows_df.columns:
+                    for c in rows_df.columns:
+                        lc = str(c).strip().lower().replace("_", "").replace(" ", "")
+                        # aksepter flere varianter for linjenavn
+                        if lc in ("regnskapslinje", "regnskapsnavn", "linje", "navn", "tekst", "regnskapslinjenavn"):
+                            rename_map[c] = "regnskapslinje"
+                            break
+                # Om nødvendige kolonner fortsatt mangler, prøv å gjøre rename
+                if rename_map:
                     try:
-                        rows_df = rows_df.rename(columns=rename_candidates)
+                        rows_df = rows_df.rename(columns=rename_map)
                     except Exception:
                         pass
+                # Hvis vi fremdeles ikke har en kolonne 'regnr', kan vi ikke fortsette mapping
+                if "regnr" not in rows_df.columns:
+                    messagebox.showerror(
+                        "Mapping feilet",
+                        "Fant ingen kolonne for regnskapsnummer i resultatet fra mapping-tjenesten.",
+                        parent=self,
+                    )
+                    return
+                # Hvis vi fremdeles ikke har 'regnskapslinje', legg til en tom kolonne
+                if "regnskapslinje" not in rows_df.columns:
+                    rows_df["regnskapslinje"] = ""
             # rows_df har bare mappede rader; flett inn i originalen for å beholde umappede
             lut = rows_df[["konto", "regnr", "regnskapslinje"]].dropna(subset=["regnr"]).copy()
             # sørg for int konto
