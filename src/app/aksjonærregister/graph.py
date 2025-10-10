@@ -116,10 +116,13 @@ def _svg_html(labels: Dict[NodeId, str], edges: List[Edge], pos: Dict[NodeId, Tu
     # beregn viewbox
     xs = [x for x, _ in pos.values()] + [0]
     ys = [y for _, y in pos.values()] + [0]
-    min_x, max_x = min(xs)-200, max(xs)+200
-    min_y, max_y = min(ys)-120, max(ys)+120
-    width  = max(900, (max_x - min_x) + 100)
-    height = max(600, (max_y - min_y) + 100)
+    # Beregn symmetrisk bredde og høyde slik at rot (0,0) ligger midt i SVG.
+    max_abs_x = max(abs(x) for x in xs)
+    max_abs_y = max(abs(y) for y in ys)
+    margin_x = 200  # ekstra luft på sidene
+    margin_y = 120  # ekstra luft oppe og nede
+    width  = max(900, int(2 * (max_abs_x + margin_x)))
+    height = max(600, int(2 * (max_abs_y + margin_y)))
 
     def esc(s: str) -> str:
         return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
@@ -128,8 +131,9 @@ def _svg_html(labels: Dict[NodeId, str], edges: List[Edge], pos: Dict[NodeId, Tu
     node_svgs: List[str] = []
     for nid, label in labels.items():
         x, y = pos[nid]
-        X = (x - min_x) + width//2
-        Y = (y - min_y) + 60
+        # Plasser noder midtstilt: legg til halv bredde/høyde på koordinatene (rot ligger på 0,0)
+        X = int(x + width // 2)
+        Y = int(y + height // 2)
         is_company = (nid == root) or nid.isdigit()
         fill = "#e9ecef" if is_company else "#ffffff"
         stroke = "#495057" if is_company else "#6c757d"
@@ -147,9 +151,10 @@ def _svg_html(labels: Dict[NodeId, str], edges: List[Edge], pos: Dict[NodeId, Tu
     # Bygg kanter
     edge_svgs: List[str] = []
     for src, dst, lbl in edges:
-        x1, y1 = pos[src]; X1 = (x1 - min_x) + width//2; Y1 = (y1 - min_y) + 60
-        x2, y2 = pos[dst]; X2 = (x2 - min_x) + width//2; Y2 = (y2 - min_y) + 60
-        # fra nederst på src til øverst på dst
+        # hent posisjon (x,y) for kilder og destinasjoner, og midtstill dem i SVG
+        x1, y1 = pos[src]; X1 = int(x1 + width // 2); Y1 = int(y1 + height // 2)
+        x2, y2 = pos[dst]; X2 = int(x2 + width // 2); Y2 = int(y2 + height // 2)
+        # piler går fra nederst på src (Y + 30) til øverst på dst (Y - 30)
         x1a, y1a = X1, Y1 + 30
         x2a, y2a = X2, Y2 - 30
         edge_svgs.append(

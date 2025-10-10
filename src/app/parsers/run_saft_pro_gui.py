@@ -447,27 +447,40 @@ def make_trial_balance(
     tx = _to_num(tx, ["Debit", "Credit"])
     dfrom, dto = _range_dates(hdr, date_from, date_to, tx)
     def _sum(df: pd.DataFrame) -> pd.DataFrame:
+        """Summer debet og kredit per konto og beregn netto.
+
+        Returnerer en DataFrame med AccountID og netto GL_Amount. Kolonnene
+        Debit og Credit beholdes ikke i det returnerte settet for å unngå
+        duplikater i senere merges. Hvis df er tom, returneres en tom
+        DataFrame med kun AccountID og GL_Amount.
+        """
         if df.empty:
-            return pd.DataFrame({"AccountID": [], "Debit": [], "Credit": [], "GL_Amount": []})
+            return pd.DataFrame({"AccountID": [], "GL_Amount": []})
         g = df.groupby("AccountID")[["Debit", "Credit"]].sum().reset_index()
         g["GL_Amount"] = g["Debit"] - g["Credit"]
-        return g
+        # Behold kun netto-kolonnen for å unngå unødige debit/credit-kolonner
+        return g[["AccountID", "GL_Amount"]]
     ib_gl = _sum(tx[tx["Date"] < dfrom]).rename(columns={"GL_Amount": "GL_IB"})
     pr_gl = _sum(tx[(tx["Date"] >= dfrom) & (tx["Date"] <= dto)]).rename(columns={"GL_Amount": "GL_PR"})
     ub_gl = _sum(tx[tx["Date"] <= dto]).rename(columns={"GL_Amount": "GL_UB"})
+    # Slå sammen på AccountID; bruk outer for å beholde alle konti
     tb = ub_gl.merge(ib_gl, on="AccountID", how="outer").merge(pr_gl, on="AccountID", how="outer").fillna(0.0)
-    acc = _read_csv_safe(outdir / "accounts.csv", dtype=str)
+    # Finn accounts.csv via søk for å støtte nested directories
+    acc = _find_accounts_file(outdir)
     if acc is not None and "AccountID" in acc.columns:
         acc = acc.copy()
         acc["AccountID"] = _norm_acc_series(acc["AccountID"])
         if {"OpeningDebit", "OpeningCredit", "ClosingDebit", "ClosingCredit"}.issubset(acc.columns):
+            # Konverter numeriske kolonner
             acc = _to_num(acc, ["OpeningDebit", "OpeningCredit", "ClosingDebit", "ClosingCredit"])
+            # IB, PR og UB fra kontoplanen
             acc["IB_OpenNet"] = acc["OpeningDebit"] - acc["OpeningCredit"]
             acc["UB_CloseNet"] = acc["ClosingDebit"] - acc["ClosingCredit"]
             acc["PR_Accounts"] = acc["UB_CloseNet"] - acc["IB_OpenNet"]
             cols = [
                 "AccountID",
-                "AccountDescription",
+                # AccountDescription kan mangle; inkludér hvis den finnes
+                *(["AccountDescription"] if "AccountDescription" in acc.columns else []),
                 "IB_OpenNet",
                 "PR_Accounts",
                 "UB_CloseNet",
@@ -477,24 +490,33 @@ def make_trial_balance(
                 "ClosingCredit",
             ]
             tb = tb.merge(acc[cols], on="AccountID", how="left")
-    # Reorganiser kolonner for lesbarhet
-    first = ["AccountID", "AccountDescription"]
-    money = [
-        c
-        for c in [
-            "IB_OpenNet",
-            "PR_Accounts",
-            "UB_CloseNet",
-            "GL_IB",
-            "GL_PR",
-            "GL_UB",
-            "ClosingDebit",
-            "ClosingCredit",
-        ]
-        if c in tb.columns
-    ]
-    other = [c for c in tb.columns if c not in first + money]
-    out = tb[first + money + other]
+    # Beregn differanser mellom GL-verdier og kontoplanen
+    if {"IB_OpenNet", "GL_IB"}.issubset(tb.columns):
+        tb["Diff_IB"] = tb["GL_IB"] - tb["IB_OpenNet"]
+    if {"PR_Accounts", "GL_PR"}.issubset(tb.columns):
+        tb["Diff_PR"] = tb["GL_PR"] - tb["PR_Accounts"]
+    if {"UB_CloseNet", "GL_UB"}.issubset(tb.columns):
+        tb["Diff_UB"] = tb["GL_UB"] - tb["UB_CloseNet"]
+    # Reorganiser kolonner: vis nettoverdier og differanser først
+    # Start med AccountID og AccountDescription hvis de finnes i data
+    first_cols = [c for c in ["AccountID", "AccountDescription"] if c in tb.columns]
+    value_cols = []
+    for pair in [
+        ("IB_OpenNet", "GL_IB", "Diff_IB"),
+        ("PR_Accounts", "GL_PR", "Diff_PR"),
+        ("UB_CloseNet", "GL_UB", "Diff_UB"),
+    ]:
+        for c in pair:
+            if c in tb.columns and c not in value_cols:
+                value_cols.append(c)
+    # Valgfrie saldo-kolonner
+    optional_cols = []
+    for c in ["OpeningDebit", "OpeningCredit", "ClosingDebit", "ClosingCredit"]:
+        if c in tb.columns:
+            optional_cols.append(c)
+    # Andre kolonner vi ikke ønsker å vise (f.eks. rå Debit/Credit fra tidligere merges) holdes utenfor
+    out_cols = first_cols + value_cols + optional_cols
+    out = tb[out_cols]
     path = outdir / "trial_balance.xlsx"
     with pd.ExcelWriter(path, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as writer:
         out.sort_values("AccountID").to_excel(writer, index=False, sheet_name="TrialBalance")
