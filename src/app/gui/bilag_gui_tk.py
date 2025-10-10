@@ -934,6 +934,29 @@ class App(tk.Tk):
             )
             return
         try:
+            # Noen versjoner av mapping-tjenesten returnerer andre kolonnenavn, f.eks. 'regnskapsnr'
+            # og 'regnskapsnavn'. Dersom vi ikke finner de forventede kolonnene "regnr" og
+            # "regnskapslinje", prøver vi å gjenkjenne og omdøpe alternative feltnavn.
+            if "regnr" not in rows_df.columns or "regnskapslinje" not in rows_df.columns:
+                rename_candidates: dict[str, str] = {}
+                # Finn alternativ kolonne for regnskapsnummer
+                for c in rows_df.columns:
+                    lc = str(c).strip().lower().replace("_", "").replace(" ", "")
+                    if lc in ("regnr", "regnskapsnr", "regnskapsnummer", "nummer", "sum", "sumnr"):
+                        rename_candidates[c] = "regnr"
+                        break
+                # Finn alternativ kolonne for regnskapslinjenavn
+                for c in rows_df.columns:
+                    lc = str(c).strip().lower().replace("_", "").replace(" ", "")
+                    if lc in ("regnskapslinje", "regnskapsnavn", "linje", "navn", "tekst"):
+                        rename_candidates[c] = "regnskapslinje"
+                        break
+                # Foreta omdøping hvis vi har funnet kandidater
+                if rename_candidates:
+                    try:
+                        rows_df = rows_df.rename(columns=rename_candidates)
+                    except Exception:
+                        pass
             # rows_df har bare mappede rader; flett inn i originalen for å beholde umappede
             lut = rows_df[["konto", "regnr", "regnskapslinje"]].dropna(subset=["regnr"]).copy()
             # sørg for int konto
