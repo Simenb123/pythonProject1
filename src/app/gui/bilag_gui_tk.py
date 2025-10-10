@@ -934,57 +934,71 @@ class App(tk.Tk):
             )
             return
         try:
-            # Noen versjoner av mapping-tjenesten returnerer andre kolonnenavn, f.eks. 'regnskapsnr'
-            # og 'regnskapsnavn'. Dersom vi ikke finner de forventede kolonnene "regnr" og
-            # "regnskapslinje", prøver vi å gjenkjenne og omdøpe alternative feltnavn.
-            if "regnr" not in rows_df.columns or "regnskapslinje" not in rows_df.columns:
-                rename_map: dict[str, str] = {}
-                # Finn alternativ kolonne for regnskapsnummer
-                if "regnr" not in rows_df.columns:
-                    for c in rows_df.columns:
-                        lc = str(c).strip().lower().replace("_", "").replace(" ", "")
-                        # aksepter flere varianter for regnskapsnummer
-                        if lc in ("regnskapsnr", "regnskapsnummer", "nummer", "sumnr", "sum", "regnr"):
-                            rename_map[c] = "regnr"
-                            break
-                # Finn alternativ kolonne for regnskapslinje-navn
-                if "regnskapslinje" not in rows_df.columns:
-                    for c in rows_df.columns:
-                        lc = str(c).strip().lower().replace("_", "").replace(" ", "")
-                        # aksepter flere varianter for linjenavn
-                        if lc in ("regnskapslinje", "regnskapsnavn", "linje", "navn", "tekst", "regnskapslinjenavn"):
-                            rename_map[c] = "regnskapslinje"
-                            break
-                # Om nødvendige kolonner fortsatt mangler, prøv å gjøre rename
-                if rename_map:
-                    try:
-                        rows_df = rows_df.rename(columns=rename_map)
-                    except Exception:
-                        pass
-                # Hvis vi fremdeles ikke har en kolonne 'regnr', kan vi ikke fortsette mapping
-                if "regnr" not in rows_df.columns:
-                    messagebox.showerror(
-                        "Mapping feilet",
-                        "Fant ingen kolonne for regnskapsnummer i resultatet fra mapping-tjenesten.",
-                        parent=self,
-                    )
-                    return
-                # Hvis vi fremdeles ikke har 'regnskapslinje', legg til en tom kolonne
-                if "regnskapslinje" not in rows_df.columns:
-                    rows_df["regnskapslinje"] = ""
-            # rows_df har bare mappede rader; flett inn i originalen for å beholde umappede
-            lut = rows_df[["konto", "regnr", "regnskapslinje"]].dropna(subset=["regnr"]).copy()
-            # sørg for int konto
+            # ---------------------------------------------------------------------
+            # Finn hvilke kolonner som inneholder regnskapsnummer og regnskapslinjenavn
+            # Enkelte mapping‑tjenester returnerer «regnskapsnr»/«regnskapsnavn» eller
+            # andre varianter. Vi identifiserer disse dynamisk og oppretter felt ved
+            # behov, slik at vi aldri får KeyError når vi refererer til kolonnen
+            # «regnskapslinje». Dersom det ikke finnes noen gyldig kolonne for
+            # regnskapsnummer, avbrytes mappingen med en klar feilmelding.
+            regnr_col: str | None = None
+            regname_col: str | None = None
+            # Sjekk om standard kolonner finnes først
+            if "regnr" in rows_df.columns:
+                regnr_col = "regnr"
+            if "regnskapslinje" in rows_df.columns:
+                regname_col = "regnskapslinje"
+            # Hvis ikke, se etter synonymer
+            if regnr_col is None:
+                for c in rows_df.columns:
+                    lc = str(c).strip().lower().replace("_", "").replace(" ", "")
+                    if lc in ("regnskapsnr", "regnskapsnummer", "nummer", "sumnr", "sum", "regnr"):
+                        regnr_col = c
+                        break
+            if regname_col is None:
+                for c in rows_df.columns:
+                    lc = str(c).strip().lower().replace("_", "").replace(" ", "")
+                    # aksepter flere varianter for linjenavn, inkludert flertallsformer
+                    if lc in (
+                        "regnskapslinje",
+                        "regnskapslinjer",
+                        "regnskapsnavn",
+                        "linje",
+                        "linjer",
+                        "navn",
+                        "tekst",
+                        "regnskapslinjenavn",
+                    ):
+                        regname_col = c
+                        break
+            # Hvis vi fremdeles ikke har en kolonne for regnskapsnummer, gi feilmelding
+            if regnr_col is None:
+                messagebox.showerror(
+                    "Mapping feilet",
+                    "Fant ingen kolonne for regnskapsnummer i resultatet fra mapping‑tjenesten.",
+                    parent=self,
+                )
+                return
+            # Bygg et lite lookup‑table (lut) med konto, regnr og (valgfritt) regnskapslinje
+            cols = ["konto", regnr_col]
+            lut = rows_df[cols].dropna(subset=[regnr_col]).copy()
+            lut = lut.rename(columns={regnr_col: "regnr"})
+            # Sørg for at konto er int, og trekk ut heltall fra regnr (kan være tekst som "510 - Utvikling")
             lut["konto"] = pd.to_numeric(lut["konto"], errors="coerce").astype("Int64")
-            # tolke regnr: kan være tekst som "510 - Utvikling" eller string med sifre
             lut["regnr_int"] = lut["regnr"].apply(_extract_first_int)
+            # Legg til regnskapslinje hvis vi fant en kolonne for navnet
+            if regname_col is not None:
+                lut["regnskapslinje"] = rows_df[regname_col].astype(str)
+            else:
+                lut["regnskapslinje"] = ""
+            # Flett inn i originalen for å beholde umappede
             base = self.df_full.copy()
             base["konto"] = pd.to_numeric(base["konto"], errors="coerce").astype("Int64")
             out = base.merge(lut, how="left", on="konto")
-            # vis som tekst uten desimaler i tabellen
+            # Vis regnr som tekst uten desimaler
             out["regnr"] = out["regnr_int"].astype("Int64").astype("string")
             out["regnskapslinje"] = out["regnskapslinje"].astype("string")
-            # oppdater interne mappinger og lagre for senere bruk
+            # Oppdater interne mappinger og lagre for senere bruk
             reg_map = lut.dropna(subset=["konto", "regnr_int"]).copy()
             for _, row in reg_map.iterrows():
                 konto_val = row["konto"]
@@ -996,16 +1010,16 @@ class App(tk.Tk):
                 if k_int is None or r_int is None:
                     continue
                 self._konto2regnr[str(k_int)] = r_int
-                # bruk navnekolonnen hvis tilgjengelig
+                # bruk navnekolonnen hvis tilgjengelig og ikke tom
                 nm = row.get("regnskapslinje")
                 if isinstance(nm, str) and nm:
                     self._regnr2name[r_int] = nm
             self._save_regnr_map()
-            # rydd og vis
+            # Rydd og vis resultatet i tabellen
             self.df_full = out.drop(columns=[c for c in ("regnr_int",) if c in out.columns])
-            cols = [c for c in ("konto", "kontonavn", "regnr", "regnskapslinje") if c in self.df_full.columns]
-            cols += [c for c in self.df_full.columns if c not in cols and not str(c).startswith("__")]
-            self.table.set_dataframe(self.df_full[cols], reset=True)
+            cols_disp = [c for c in ("konto", "kontonavn", "regnr", "regnskapslinje") if c in self.df_full.columns]
+            cols_disp += [c for c in self.df_full.columns if c not in cols_disp and not str(c).startswith("__")]
+            self.table.set_dataframe(self.df_full[cols_disp], reset=True)
             self.table.refresh()
             mapped = int(lut["konto"].nunique())
             total = int(base["konto"].dropna().nunique())
