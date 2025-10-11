@@ -406,6 +406,24 @@ def parse_saft(input_path: Path, outdir: Path) -> None:
             credit = _amount_of(el, "CreditAmount") or DEC(0)
             amount = debit - credit
 
+            # Always update voucher totals, even for lines without AccountID, since these are part of the
+            # journal totals. However, we will not write such lines to transactions.csv to avoid
+            # contaminating the ledger with non-journal details.  If AccountID is missing, treat the
+            # line as an analysis-line and skip writing it to the transactions file. The Analysis
+            # section (handled later) will capture the detailed breakdown.
+
+            # Update voucher totals first
+            cur_voucher.debit += debit
+            cur_voucher.credit += credit
+
+            # Skip writing to transactions.csv if AccountID is missing or blank
+            if not acc_id:
+                # Clear memory for the element and continue
+                el.clear()
+                while el.getprevious() is not None:
+                    del el.getparent()[0]
+                continue
+
             amt_cur = _first(el, ["AmountCurrency", "ForeignAmount"])
             ex_rate = _first(el, ["ExchangeRate"])
             tax_type = _first(el, ["TaxType"])
@@ -459,10 +477,6 @@ def parse_saft(input_path: Path, outdir: Path) -> None:
                     "TaxAmount": f"{tax_amt}",
                 }
             )
-
-            # update voucher totals
-            cur_voucher.debit += debit
-            cur_voucher.credit += credit
 
             # free memory
             el.clear()
