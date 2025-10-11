@@ -25,6 +25,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import pandas as pd
+import numpy as np
 
 # -------------------------------------------------------------
 # Synonymer for standardkolonner i saldobalanse
@@ -162,6 +163,26 @@ try:
 except Exception:
     map_saldobalanse_df = None  # type: ignore
     MapSources = None  # type: ignore
+
+# Vi kan også importere individuelle funksjoner fra regnskapslinjer-modulen for manual mapping
+try:
+    # Prøv å importere fra app.services først
+    from app.services.regnskapslinjer import (
+        load_regnskapslinjer as _load_regnskapslinjer,
+        load_konto_intervaller as _load_konto_intervaller,
+        _assign_intervals_vectorized as _assign_intervals_vectorized_fn,
+    )
+except Exception:
+    try:
+        from services.regnskapslinjer import (
+            load_regnskapslinjer as _load_regnskapslinjer,
+            load_konto_intervaller as _load_konto_intervaller,
+            _assign_intervals_vectorized as _assign_intervals_vectorized_fn,
+        )  # type: ignore
+    except Exception:
+        _load_regnskapslinjer = None  # type: ignore
+        _load_konto_intervaller = None  # type: ignore
+        _assign_intervals_vectorized_fn = None  # type: ignore
 
 # -------------------------------------------------------------
 # Hjelpere
@@ -360,6 +381,10 @@ class App(tk.Tk):
         self._regnr_map_path = year_paths(self.root_dir, self.client, self.year).mapping / "sb_regnr.json"
         self._konto2regnr: dict[str, int] = self._load_regnr_map()
         self._regnr2name: dict[int, str] = {}  # fylles første gang du mapper/overstyrer
+        # Liste over (regnr, regnskapslinje) brukt i nedtrekksmenyen for manuelle endringer.
+        # Denne fylles opp etter en vellykket mapping og brukes når brukeren velger
+        # et annet regnskapsnummer fra en nedtrekksliste via «Sett regnr …».
+        self._all_regnr_choices: list[tuple[str, str]] = []
 
         # sørg for at self.df_full også har regnr/linje‑kolonner fra start slik at
         # de dukker opp i søkemenyen og andre operasjoner som bruker self.df_full
@@ -400,7 +425,9 @@ class App(tk.Tk):
             ttk.Button(top, text="Map til regnskapslinjer …",
                        command=self._map_regn).pack(side="left", padx=(8, 0))
 
-        ttk.Button(top, text="Sett regnr …", command=self._set_regnr_manual).pack(side="left")
+        # Erstatt manuell tekstinntasting med en nedtrekksliste for regnr/regnskapslinje
+        # som gjør det enklere å overstyre mappingen.
+        ttk.Button(top, text="Sett regnr …", command=self._set_regnr_dropdown).pack(side="left")
 
         # Info‑linje
         info_txt = f"Kilde: {Path(self.src_path).name}"
@@ -876,44 +903,33 @@ class App(tk.Tk):
         return out
 
     def _map_regn(self):
-        """Kjør intervall‑mapping (konto -> regnr/regnskapslinje) og oppdater tabellen."""
         """
-        Prøv å kjøre mapping via den sentrale tjenesten
-        ``try_map_saldobalanse_to_regnskapslinjer`` (fra app/services/regnskapslinjer).
-        Hvis den ikke er tilgjengelig eller returnerer ``None``, bruker vi vår egen
-        fallback-mapping fra ``sb_regnskapsmapping`` som leser Regnskapslinjer.xlsx og
-        Mapping standard kontoplan.xlsx fra brukervalgte filer. Resultatet flettes inn
-        i ``self.df_full`` og kolonnene ``regnr`` og ``regnskapslinje`` vises i tabellen.
+        Kjør mapping (konto -> regnr/regnskapslinje) og oppdater tabellen.
+
+        Denne versjonen bruker kun den robuste fallback-mappingen fra
+        ``sb_regnskapsmapping``. Vi forsøker ikke å bruke den sentrale
+        tjenesten ``try_map_saldobalanse_to_regnskapslinjer`` ettersom den
+        returnerer andre kolonnenavn og kan forårsake KeyError. I stedet
+        ber vi brukeren velge kildefilene (Regnskapslinjer.xlsx og
+        Mapping standard kontoplan.xlsx) hvis de ikke er husket fra før.
+        Resultatet flettes inn i ``self.df_full`` og kolonnene ``regnr`` og
+        ``regnskapslinje`` vises i tabellen.
         """
-        # Først: forsøk via modulen (hvis tilgjengelig)
-        rows_df: pd.DataFrame | None = None
-        meta: dict = {}
-        if try_map_saldobalanse_to_regnskapslinjer is not None:
-            try:
-                rows_df, _agg, meta = try_map_saldobalanse_to_regnskapslinjer(self.df_full)
-            except Exception:
-                # Ignorer feil her; vi prøver fallback i neste steg
-                rows_df = None
-        if rows_df is None:
-            # Hvis modul ikke finnes eller returnerer None, prøv fallback med direkte filvalg
-            if map_saldobalanse_df is None or MapSources is None:
-                # Ingen mappingfunksjon tilgjengelig
-                reason = meta.get("reason") if meta else "ukjent"
-                messagebox.showwarning(
-                    "Ingen mapping",
-                    "Fant ikke kildefiler for regnskapslinjer eller mapping-funksjon mangler.\n"
-                    f"Detalj: {reason}",
-                    parent=self,
-                )
-                return
-            # Sørg for at vi vet hvilke filer som skal brukes
+        # Forsøk robust fallback-mapping hvis tilgjengelig
+        rows_df = None
+        if map_saldobalanse_df is not None and MapSources is not None:
             files = self._ensure_regn_files()
             if not files:
                 return
             rl_path, map_path = files
             try:
-                # Kjør robust mapping: returnerer DataFrame med 'regnr' og 'regnskapslinje'
-                mapped_df, _ = map_saldobalanse_df(self.df_full, MapSources(regnskapslinjer_path=rl_path, intervall_path=map_path))
+                mapped_df, _ = map_saldobalanse_df(
+                    self.df_full,
+                    MapSources(
+                        regnskapslinjer_path=rl_path,
+                        intervall_path=map_path,
+                    ),
+                )
                 rows_df = mapped_df
             except Exception as exc:
                 messagebox.showerror(
@@ -922,49 +938,154 @@ class App(tk.Tk):
                     parent=self,
                 )
                 return
-            # Oppdater info-linjen for fallback
-            meta = {"reason": "fallback"}
-        # Hvis vi fortsatt ikke har rader, gi beskjed
-        if rows_df is None:
-            reason = (meta or {}).get("reason", "ukjent")
-            messagebox.showwarning(
-                "Ingen mapping",
-                f"Fant ikke kildefiler for regnskapslinjer.\nDetalj: {reason}",
-                parent=self,
-            )
-            return
+        else:
+            # Fall back to manual mapping via direkte pandas hvis robust fallback ikke finnes.
+            # Vi leser Regnskapslinjer.xlsx og Mapping standard kontoplan.xlsx fra bruker, normaliserer
+            # kolonnenavn og bruker en enkel intervall-matcher for å tilordne regnr til hver konto.
+            files = self._ensure_regn_files()
+            if not files:
+                return
+            rl_path, map_path = files
+            # Les regnskapslinjer og identifiser kolonner
+            try:
+                lines_df = pd.read_excel(rl_path, engine="openpyxl")
+            except Exception as exc:
+                messagebox.showerror(
+                    "Mapping feilet",
+                    f"Kunne ikke lese regnskapslinjer-filen:\n{type(exc).__name__}: {exc}",
+                    parent=self,
+                )
+                return
+            # Normaliser kolonnenavn i lines_df for regnr og regnskapslinje
+            rename_lines: dict[str, str] = {}
+            for c in lines_df.columns:
+                lc = str(c).lower().replace(" ", "").replace("_", "")
+                if lc in {"regnskapsnr", "regnskapsnummer", "linjenr", "nr", "nummer", "sumnr", "regnr"}:
+                    rename_lines[c] = "regnr"
+                elif lc in {"regnskapsnavn", "regnskapslinje", "linje", "navn", "regnskapslinjenavn"}:
+                    rename_lines[c] = "regnskapslinje"
+            if rename_lines:
+                lines_df = lines_df.rename(columns=rename_lines)
+            # Etter omdøping må vi ha regnr-kolonne
+            if "regnr" not in lines_df.columns:
+                messagebox.showerror(
+                    "Mapping feilet",
+                    "Fant ingen kolonne for regnskapsnummer i regnskapslinjer-filen.",
+                    parent=self,
+                )
+                return
+            if "regnskapslinje" not in lines_df.columns:
+                lines_df["regnskapslinje"] = ""
+            # Normaliser regnr til å bare inneholde tall
+            lines_df["regnr"] = lines_df["regnr"].astype(str).str.replace(r"\D", "", regex=True)
+            lines_df = lines_df[lines_df["regnr"].str.len() > 0].copy()
+            # Les intervallfil og identifiser kolonner
+            try:
+                interval_df = pd.read_excel(map_path, engine="openpyxl")
+            except Exception as exc:
+                messagebox.showerror(
+                    "Mapping feilet",
+                    f"Kunne ikke lese mapping-filen:\n{type(exc).__name__}: {exc}",
+                    parent=self,
+                )
+                return
+            rename_int: dict[str, str] = {}
+            for c in interval_df.columns:
+                lc = str(c).lower().replace(" ", "").replace("_", "")
+                if lc in {"fra", "fom", "start", "frakonto", "kontofra", "lo", "from", "kontofra"}:
+                    rename_int[c] = "lo"
+                elif lc in {"til", "tom", "slutt", "tilkonto", "kontotil", "hi", "to", "kontotil"}:
+                    rename_int[c] = "hi"
+                elif lc in {"regnskapsnr", "regnskapsnummer", "linjenr", "nr", "nummer", "sumnr", "regnr"}:
+                    rename_int[c] = "regnr"
+            if rename_int:
+                interval_df = interval_df.rename(columns=rename_int)
+            # Sørg for at vi har nødvendige kolonner
+            for col in ["lo", "hi", "regnr"]:
+                if col not in interval_df.columns:
+                    messagebox.showerror(
+                        "Mapping feilet",
+                        f"Mapping-filen mangler kolonnen '{col}'.",
+                        parent=self,
+                    )
+                    return
+            # Normaliser og kast rader med ugyldige intervaller
+            interval_df["lo"] = pd.to_numeric(interval_df["lo"], errors="coerce").fillna(0).astype(int)
+            interval_df["hi"] = pd.to_numeric(interval_df["hi"], errors="coerce").fillna(0).astype(int)
+            interval_df["regnr"] = interval_df["regnr"].astype(str).str.replace(r"\D", "", regex=True)
+            interval_df = interval_df[(interval_df["lo"] <= interval_df["hi"]) & (interval_df["regnr"].str.len() > 0)].copy()
+            if interval_df.empty:
+                messagebox.showerror(
+                    "Mapping feilet",
+                    "Intervall-tabellen er tom etter filtrering av ugyldige rader.",
+                    parent=self,
+                )
+                return
+            # Sortér intervaller etter lo for vektoriserte søk
+            interval_df = interval_df.sort_values(["lo", "hi"]).reset_index(drop=True)
+            # Konstruer arrays for vektorisert matching
+            lo_arr = interval_df["lo"].to_numpy()
+            hi_arr = interval_df["hi"].to_numpy()
+            regnr_arr = interval_df["regnr"].to_numpy(dtype=object)
+            # Lag konto-array fra df_full
+            konto_series = self.df_full["konto"]
+            konto_vals = pd.to_numeric(konto_series, errors="coerce").fillna(-10**9).astype(int).to_numpy()
+            # Finn intervall for hver konto
+            idx = np.searchsorted(lo_arr, konto_vals, side="right") - 1
+            valid_mask = (idx >= 0) & (konto_vals <= hi_arr[np.clip(idx, 0, len(hi_arr) - 1)])
+            # Lag regnr-serie
+            regnr_series = np.empty_like(konto_vals, dtype=object)
+            regnr_series[:] = None
+            if valid_mask.any():
+                valid_idx = np.clip(idx[valid_mask], 0, len(regnr_arr) - 1)
+                regnr_series[valid_mask] = regnr_arr[valid_idx]
+            regnr_series = pd.Series(regnr_series, index=self.df_full.index, dtype="string")
+            # Lag rows_df med konto og regnr, dropp NaN
+            temp_df = pd.DataFrame({
+                "konto": self.df_full["konto"],
+                "regnr": regnr_series,
+            })
+            rows_df = temp_df.dropna(subset=["regnr"]).copy()
+            # Slå opp regnskapslinje via regnr
+            rows_df = rows_df.merge(lines_df, on="regnr", how="left")
+            # Hvis det fortsatt er tomt, så gi opp
+            if rows_df.empty:
+                messagebox.showwarning(
+                    "Ingen mapping",
+                    "Ingen kontoer i saldobalansen ble mappet til regnskapslinjer.",
+                    parent=self,
+                )
+                return
+            # Flyt ut manual mapping som rows_df
+        # End of manual fallback
         try:
-            # Noen versjoner av mapping-tjenesten returnerer andre kolonnenavn (f.eks. 'regnskapsnr',
-            # 'regnskapsnavn'), og GUI-en kan allerede inneholde tomme placeholder-kolonner 'regnr'
-            # og 'regnskapslinje'. For å unngå KeyError og sikre at riktige data brukes, gjør vi
-            # følgende:
-            # 1. Fjern eksisterende 'regnr' og 'regnskapslinje' fra rows_df hvis de bare inneholder
-            #    tomme verdier. Dette hindrer at vi tror kolonnen finnes når den egentlig er en
-            #    placeholder uten data.
-            for col_name in ("regnr", "regnskapslinje"):
-                if col_name in rows_df.columns:
-                    s = rows_df[col_name]
-                    if s.isna().all() or s.astype(str).str.strip().eq("").all():
-                        rows_df = rows_df.drop(columns=[col_name])
-            # 2. Definer synonymer for regnskapsnummer og regnskapslinje
-            _syn_regnr = {"regnr", "regnskapsnr", "regnskapsnummer", "nummer", "nr", "linjenr", "sumnr", "sum"}
-            _syn_regnlinje = {"regnskapslinje", "regnskapsnavn", "linje", "navn", "tekst", "regnskapslinjenavn"}
-            # 3. Normaliser: leter etter disse synonymene og kopierer innholdet til standardnavnene
-            #    (prioriterer første treff). Vi gjør dette uavhengig av om kolonnene allerede finnes.
-            found_regnr = None
-            found_regline = None
+            # Hvis mappingen returnerer andre kolonnenavn enn 'regnr'/'regnskapslinje'
+            # kan det hende placeholder-kolonner allerede finnes i rows_df. Fjern dem hvis de kun er tomme.
+            for col in ["regnr", "regnskapslinje"]:
+                if col in rows_df.columns:
+                    col_series = rows_df[col]
+                    # tom dersom alle er NaN eller tom str
+                    if col_series.isna().all() or (col_series.astype(str).str.strip() == "").all():
+                        rows_df = rows_df.drop(columns=[col])
+
+            # Gjenkjenning av synonymer for kolonnene. Vi bygger en liste over mulige navn
+            rename_map: dict[str, str] = {}
             for c in rows_df.columns:
-                lc = str(c).strip().lower().replace("_", "").replace(" ", "")
-                if not found_regnr and lc in _syn_regnr:
-                    found_regnr = c
-                if not found_regline and lc in _syn_regnlinje:
-                    found_regline = c
-            # Kopier innholdet til standardkolonner
-            if found_regnr:
-                rows_df["regnr"] = rows_df[found_regnr]
-            if found_regline:
-                rows_df["regnskapslinje"] = rows_df[found_regline]
-            # 4. Kontroller at vi har 'regnr'
+                lc = str(c).strip().lower().replace(" ", "").replace("_", "")
+                # regnskapsnummer
+                if lc in {
+                    "regnskapsnr", "regnskapsnummer", "nummer", "nr", "sumnr", "sum", "regnr"
+                }:
+                    rename_map[c] = "regnr"
+                # regnskapslinjenavn
+                if lc in {
+                    "regnskapslinje", "regnskapsnavn", "linje", "navn", "tekst", "regnskapslinjenavn"
+                }:
+                    rename_map[c] = "regnskapslinje"
+            if rename_map:
+                rows_df = rows_df.rename(columns=rename_map)
+
+            # Nå må vi ha minst kolonnen regnr, ellers feiler vi
             if "regnr" not in rows_df.columns:
                 messagebox.showerror(
                     "Mapping feilet",
@@ -972,22 +1093,24 @@ class App(tk.Tk):
                     parent=self,
                 )
                 return
-            # 5. Hvis 'regnskapslinje' fortsatt mangler etter renaming, opprett tom kolonne
+            # Dersom regnskapslinje mangler, legg til blank kolonne
             if "regnskapslinje" not in rows_df.columns:
                 rows_df["regnskapslinje"] = ""
+
             # rows_df har bare mappede rader; flett inn i originalen for å beholde umappede
             lut = rows_df[["konto", "regnr", "regnskapslinje"]].dropna(subset=["regnr"]).copy()
             # sørg for int konto
             lut["konto"] = pd.to_numeric(lut["konto"], errors="coerce").astype("Int64")
             # tolke regnr: kan være tekst som "510 - Utvikling" eller string med sifre
             lut["regnr_int"] = lut["regnr"].apply(_extract_first_int)
-            # start fra self.df_full, men fjern eksisterende regnr/regnskapslinje-kolonner for å unngå duplikat_suffiks
-            base = self.df_full.drop(columns=[c for c in ("regnr", "regnskapslinje") if c in self.df_full.columns]).copy()
+            # base: dropp gamle regnr/regnskapslinje for å unngå duplikater
+            base = self.df_full.drop(columns=[c for c in ("regnr", "regnskapslinje") if c in self.df_full.columns], errors="ignore").copy()
             base["konto"] = pd.to_numeric(base["konto"], errors="coerce").astype("Int64")
             out = base.merge(lut, how="left", on="konto")
             # vis som tekst uten desimaler i tabellen
             out["regnr"] = out["regnr_int"].astype("Int64").astype("string")
             out["regnskapslinje"] = out["regnskapslinje"].astype("string")
+
             # oppdater interne mappinger og lagre for senere bruk
             reg_map = lut.dropna(subset=["konto", "regnr_int"]).copy()
             for _, row in reg_map.iterrows():
@@ -999,7 +1122,7 @@ class App(tk.Tk):
                 r_int = _extract_first_int(regnr_val)
                 if k_int is None or r_int is None:
                     continue
-                # Ikke overskriv eksisterende manuelle mappinger
+                # ikke overskriv eksisterende manuelle mappinger
                 if str(k_int) not in self._konto2regnr:
                     self._konto2regnr[str(k_int)] = r_int
                 # bruk navnekolonnen hvis tilgjengelig
@@ -1008,7 +1131,22 @@ class App(tk.Tk):
                     self._regnr2name[r_int] = nm
             self._save_regnr_map()
             # rydd og vis
+            # Dropp midlertidige kolonner og oppdater DataFrame
             self.df_full = out.drop(columns=[c for c in ("regnr_int",) if c in out.columns])
+            # Oppdater listen over alle regnr/regnskapslinje-kombinasjoner for nedtrekksmenyen
+            try:
+                # Generer og sorter kombinasjoner basert på self._regnr2name
+                self._all_regnr_choices = sorted(
+                    [
+                        (str(int(rn)), nm)
+                        for rn, nm in self._regnr2name.items()
+                        if rn is not None and nm is not None
+                    ],
+                    key=lambda x: int(x[0]) if x[0].isdigit() else 0,
+                )
+            except Exception:
+                self._all_regnr_choices = []
+            # Sett opp kolonnerekkefølge og oppdater tabellen
             cols = [c for c in ("konto", "kontonavn", "regnr", "regnskapslinje") if c in self.df_full.columns]
             cols += [c for c in self.df_full.columns if c not in cols and not str(c).startswith("__")]
             self.table.set_dataframe(self.df_full[cols], reset=True)
@@ -1108,6 +1246,108 @@ class App(tk.Tk):
         self.table.set_dataframe(self.df_full[cols], reset=False)
         self.table.refresh()
         messagebox.showinfo("OK", f"Satt regnr={rn} på {cnt} konto(er).", parent=self)
+
+    def _set_regnr_dropdown(self):
+        """
+        La brukeren velge et regnskapsnummer/regnskapslinje fra en nedtrekksliste.
+        Valget brukes til å oppdatere regnr for valgte rader og lagres automatisk.
+        """
+        # Hent valgte rader fra tabellen
+        rows = self.table.selected_rows()
+        if rows is None or rows.empty:
+            messagebox.showwarning("Velg rader", "Marker minst én rad i tabellen.", parent=self)
+            return
+        # Hvis vi ikke har tilgjengelige regnr-kombinasjoner, fall tilbake til tekstinntasting
+        choices = getattr(self, "_all_regnr_choices", None)
+        if not choices:
+            # ingen valg tilgjengelig → bruk eksisterende manual funksjon
+            self._set_regnr_manual()
+            return
+        # Forslag: hvis alle rader har samme regnr, prevelg dette
+        default_regnr = ""
+        try:
+            rns = set([
+                str(x) for x in rows.get("regnr", "").astype(str).unique() if str(x).strip()
+            ])
+            if len(rns) == 1:
+                default_regnr = list(rns)[0]
+        except Exception:
+            default_regnr = ""
+        # Lag liste med visningsverdier "<regnr> - <linjenavn>"
+        display_values: list[str] = []
+        default_index = 0
+        for i, (rn, navn) in enumerate(choices):
+            # Formater streng med tall og navn
+            vis = f"{rn} - {navn}" if navn else f"{rn}"
+            display_values.append(vis)
+            if default_regnr and rn == default_regnr:
+                default_index = i
+        # Opprett nytt vindu for valg
+        win = tk.Toplevel(self)
+        win.title("Velg regnskapslinje")
+        win.grab_set()
+        ttk.Label(win, text="Velg regnskapslinje for valgt(e) konti:").pack(padx=10, pady=(10, 5))
+        var = tk.StringVar(value=display_values[default_index] if display_values else "")
+        cmb = ttk.Combobox(win, values=display_values, state="readonly", width=60, textvariable=var)
+        cmb.pack(padx=10, pady=(0, 10))
+        cmb.current(default_index)
+        # OK-knappens logikk
+        def on_ok() -> None:
+            val = var.get()
+            if not val:
+                win.destroy()
+                return
+            # Ekstraher regnr fra starten av strengen
+            m = re.match(r"(\d+)", val)
+            if not m:
+                messagebox.showwarning("Ugyldig", "Klarte ikke å tolke valgt regnskapslinje.", parent=win)
+                return
+            rn_int = int(m.group(1))
+            # Oppdater mapping for alle valgte rader
+            cnt = 0
+            for _, r in rows.iterrows():
+                k = _digits_only(r.get("konto"))
+                if k:
+                    # Sett mapping (overskriv tidligere manuell hvis ønskelig)
+                    self._konto2regnr[str(int(k))] = rn_int
+                    cnt += 1
+            # Oppdater navn fra valget
+            navn = ""
+            try:
+                # Splitt på første "-"
+                parts = val.split("-", 1)
+                if len(parts) == 2:
+                    navn = parts[1].strip()
+            except Exception:
+                navn = ""
+            if navn:
+                self._regnr2name[rn_int] = navn
+            # Lagre map
+            self._save_regnr_map()
+            # Oppdater all_regnr_choices (inkl. nytt navn) sortert
+            try:
+                self._all_regnr_choices = sorted(
+                    [
+                        (str(int(r)), nav)
+                        for r, nav in self._regnr2name.items()
+                        if r is not None and nav is not None
+                    ],
+                    key=lambda x: int(x[0]) if x[0].isdigit() else 0,
+                )
+            except Exception:
+                pass
+            # Oppdater DataFrame og tabell
+            self.df_full = self._with_regnskapslinjer_cols(self.df_full)
+            cols = _preferred_order(self.df_full)
+            self.table.set_dataframe(self.df_full[cols], reset=False)
+            self.table.refresh()
+            messagebox.showinfo("OK", f"Satt regnr={rn_int} på {cnt} konto(er).", parent=win)
+            win.destroy()
+        # Plasser knapper i bunn
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(padx=10, pady=(0, 10))
+        ttk.Button(btn_frame, text="OK", command=on_ok).pack(side="left", padx=(0, 5))
+        ttk.Button(btn_frame, text="Avbryt", command=win.destroy).pack(side="left")
 
 
 # -------------------------------------------------------------

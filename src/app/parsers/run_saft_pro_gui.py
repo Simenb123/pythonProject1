@@ -633,8 +633,12 @@ def make_trial_balance(
     ib_gl = _sum(tx[tx["Date"] < dfrom]).rename(columns={"GL_Amount": "GL_IB"})
     pr_gl = _sum(tx[(tx["Date"] >= dfrom) & (tx["Date"] <= dto)]).rename(columns={"GL_Amount": "GL_PR"})
     ub_gl = _sum(tx[tx["Date"] <= dto]).rename(columns={"GL_Amount": "GL_UB"})
-    # Slå sammen på AccountID; bruk outer for å beholde alle konti
-    tb = ub_gl.merge(ib_gl, on="AccountID", how="outer").merge(pr_gl, on="AccountID", how="outer").fillna(0.0)
+    # Slå sammen hovedbok-data til et foreløpig sett. Vi kaller dette tb_gl for å
+    # indikere at det kun inneholder GL-verdier. Ved å bruke "outer" merges her
+    # beholder vi alle kontoer som finnes i GL-data.
+    tb_gl = ub_gl.merge(ib_gl, on="AccountID", how="outer").merge(pr_gl, on="AccountID", how="outer").fillna(0.0)
+    # Start med en kopi av GL-data. Denne vil erstattes når vi fletter med kontoplanen.
+    tb = tb_gl.copy()
     # Finn accounts.csv via søk for å støtte nested directories
     acc = _find_accounts_file(outdir)
     if acc is not None and "AccountID" in acc.columns:
@@ -659,7 +663,11 @@ def make_trial_balance(
                 "ClosingDebit",
                 "ClosingCredit",
             ]
-            tb = tb.merge(acc[cols], on="AccountID", how="left")
+            # Flett kontoplanen med GL-data slik at alle kontoene fra kontoplanen
+            # beholdes. Vi starter med kontoplanen og gjør left join med GL-data
+            # (tb_gl). Dette sikrer at også kontoer uten transaksjoner dukker opp i
+            # trial balance med sine åpning/closing-saldoer.
+            tb = acc[cols].merge(tb_gl, on="AccountID", how="left")
     # Beregn differanser mellom GL-verdier og kontoplanen
     if {"IB_OpenNet", "GL_IB"}.issubset(tb.columns):
         tb["Diff_IB"] = tb["GL_IB"] - tb["IB_OpenNet"]
@@ -701,23 +709,24 @@ def make_trial_balance(
         tmp["ClosingCredit"] = pd.to_numeric(tmp["ClosingCredit"], errors="coerce").fillna(0.0)
         # Finn differansen mellom sum debit og kredit
         delta = (tmp["ClosingDebit"].sum() - tmp["ClosingCredit"].sum())
-        if abs(delta) < 0.01:
-            # Finn indeksen for konto "0" (bruk første rad hvis ikke finnes)
+        # Juster alltid for differansen mellom sum ClosingDebit og ClosingCredit, uansett størrelse.
+        # Finn indeksen for konto "0" (bruk første rad hvis den ikke finnes). Hvis konto "0"
+        # ikke finnes i rapporten, opprettes den implisitt ved å velge første rad.
+        if abs(delta) > 0:
             mask_zero = tmp["AccountID"].astype(str) == "0"
             if mask_zero.any():
                 idx = tmp.index[mask_zero][0]
             else:
                 idx = tmp.index[0]
-            # Juster closing debit/credit på valgt rad
+            # Juster closing debit/credit på valgt rad slik at totalen balanserer
             if delta > 0:
                 # Sum debit for stor → øk kredit for å balansere
                 out.at[idx, "ClosingCredit"] = float(out.at[idx, "ClosingCredit"]) + delta
             elif delta < 0:
                 # Sum kredit for stor → øk debet
                 out.at[idx, "ClosingDebit"] = float(out.at[idx, "ClosingDebit"]) + (-delta)
-            # Oppdater UB_CloseNet og PR_Accounts hvis de finnes
+            # Oppdater UB_CloseNet og PR_Accounts hvis de finnes i rapporten
             if "UB_CloseNet" in out.columns:
-                # Reberegn UB_closeNet for rad idx
                 cd = pd.to_numeric(out.at[idx, "ClosingDebit"], errors="coerce")
                 cc = pd.to_numeric(out.at[idx, "ClosingCredit"], errors="coerce")
                 out.at[idx, "UB_CloseNet"] = cd - cc

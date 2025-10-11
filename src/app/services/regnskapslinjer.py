@@ -106,11 +106,15 @@ def _pick_col(df: pd.DataFrame, *choices: str) -> Optional[str]:
 
 def load_regnskapslinjer(path: Path) -> pd.DataFrame:
     """
-    Leser 'Regnskapslinjer.xlsx' → DataFrame med kolonnene:
-      - 'regnskapsnr' (string)
-      - 'regnskapsnavn' (string)
+    Leser "Regnskapslinjer.xlsx" og returnerer en DataFrame med kolonnene
+    ``regnr`` (string) og ``regnskapslinje`` (string). Denne funksjonen
+    forsøker å finne passende kolonner for regnskapsnummer og navn ved å
+    bruke `_pick_col` med flere synonymer. Hvis ingen synonymer passer,
+    velges de første to kolonnene i filen. Videre normaliseres navnet
+    slik at regnskapsnummer består kun av siffer.
     """
     df = pd.read_excel(path, engine="openpyxl")
+    # Finn kolonner for nummer og navn via synonymer
     c_nr = (
         _pick_col(df, "regnskapsnr", "regnskapslinjenr", "linjenr", "nr", "regnskapslinje nr")
         or df.columns[0]
@@ -120,9 +124,10 @@ def load_regnskapslinjer(path: Path) -> pd.DataFrame:
         or (df.columns[1] if len(df.columns) > 1 else df.columns[0])
     )
     out = pd.DataFrame()
-    out["regnskapsnr"] = df[c_nr].astype(str).str.strip()
-    out["regnskapsnavn"] = df[c_navn].astype(str).str.strip()
-    out = out[out["regnskapsnr"].str.len() > 0].reset_index(drop=True)
+    # Normaliser nummerkolonnen til å kun inneholde sifre
+    out["regnr"] = df[c_nr].astype(str).str.replace(r"\D", "", regex=True)
+    out["regnskapslinje"] = df[c_navn].astype(str).str.strip()
+    out = out[out["regnr"].str.len() > 0].reset_index(drop=True)
     return out
 
 
@@ -144,8 +149,8 @@ def load_konto_intervaller(path: Path) -> pd.DataFrame:
     out = pd.DataFrame()
     out["lo"] = pd.to_numeric(df[c_lo], errors="coerce").fillna(0).astype(int)
     out["hi"] = pd.to_numeric(df[c_hi], errors="coerce").fillna(0).astype(int)
-    out["regnskapsnr"] = df[c_ln].astype(str).str.strip()
-    out = out[(out["lo"] <= out["hi"]) & (out["regnskapsnr"].str.len() > 0)].copy()
+    out["regnr"] = df[c_ln].astype(str).str.replace(r"\D", "", regex=True)
+    out = out[(out["lo"] <= out["hi"]) & (out["regnr"].str.len() > 0)].copy()
     out = out.sort_values(["lo", "hi"]).reset_index(drop=True)
     return out
 
@@ -161,15 +166,27 @@ class MappingResult:
 
 def _assign_intervals_vectorized(konto: pd.Series, ranges: pd.DataFrame) -> pd.Series:
     """
-    Konto (int) → regnskapsnr (string) via intervalltabell.
-    Forutsetter at 'ranges' er sortert stigende på 'lo'.
+    Konto (int) → regnr (string) via intervalltabell.
+
+    Dette er en vektoriserte implementasjon som tar et konto-serie
+    og et DataFrame med intervaller ('lo', 'hi', 'regnr'). Den finner ut
+    hvilket regnskapsnr (regnr) som gjelder for hver konto innenfor de
+    gitte intervallene. DataFrame `ranges` må være sortert stigende på
+    'lo'.
     """
     if konto.empty:
         return pd.Series([], dtype="string")
+    # If ranges is empty or lacks required columns, return NA for all entries
+    if ranges is None or len(ranges) == 0 or any(col not in ranges.columns for col in ("lo", "hi", "regnr")):
+        return pd.Series([None] * len(konto), index=konto.index, dtype="string")
+    # Gjør kontonummer om til int-array (bruk lav verdi for NaN)
     k = pd.to_numeric(konto, errors="coerce").fillna(-10**9).astype(int).to_numpy()
     lo = ranges["lo"].to_numpy()
     hi = ranges["hi"].to_numpy()
-    rn = ranges["regnskapsnr"].to_numpy(dtype=object)
+    # NB: ranges må ha kolonnen 'regnr' (string) etter at
+    # load_konto_intervaller() normaliserer 'regnskapsnr' til 'regnr'.
+    rn = ranges["regnr"].to_numpy(dtype=object)
+    # Finn intervallet hver konto faller i
     idx = np.searchsorted(lo, k, side="right") - 1
     ok = (idx >= 0) & (k <= hi[np.clip(idx, 0, len(hi) - 1)])
     out = np.empty_like(k, dtype=object)
@@ -236,16 +253,13 @@ def map_saldobalanse_to_regnskapslinjer(
     needed = [c for c in ("konto", "inngående balanse", "utgående balanse", "endring") if c in df_sb.columns]
     if "konto" not in needed:
         raise ValueError("SB mangler kolonnen 'konto' etter standardisering.")
-    # 1) radnivå: legg på regnskapsnr + navn
-    #   Vi kaller kolonnene `regnr` og `regnskapslinje` i returverdien for å være
-    #   konsekvent med GUI-modulen. De opprinnelige navnene `regnskapsnr` og
-    #   `regnskapsnavn` oversettes derfor før vi returnerer.
+    # 1) radnivå: legg på regnr + regnskapslinje
     rn = _assign_intervals_vectorized(df_sb["konto"], ranges)
     rows = df_sb.copy()
     rows["regnr"] = rn  # regnskapsnummer (string)
     rows = rows.dropna(subset=["regnr"]).copy()
-    # slå opp navn basert på regnr; behold navnet i kolonnen `regnskapslinje`
-    rows = rows.merge(lines.rename(columns={"regnskapsnr": "regnr", "regnskapsnavn": "regnskapslinje"}), on="regnr", how="left")
+    # slå opp navn basert på regnr; 'lines' har allerede kolonnene 'regnr' og 'regnskapslinje'
+    rows = rows.merge(lines, on="regnr", how="left")
     # 2) aggregat pr regnskapslinje
     agg_cols = [c for c in ("inngående balanse", "utgående balanse", "endring") if c in rows.columns]
     if not agg_cols:
