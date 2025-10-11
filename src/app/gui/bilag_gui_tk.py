@@ -379,8 +379,10 @@ class App(tk.Tk):
 
         # 4) Last ev. tidligere regnr‑mapping fra disk og legg på kolonnene
         self._regnr_map_path = year_paths(self.root_dir, self.client, self.year).mapping / "sb_regnr.json"
-        self._konto2regnr: dict[str, int] = self._load_regnr_map()
+        # For at eventuelle navn lagret i mappingen skal bevares, initialiser _regnr2name før
+        # vi laster mapping. _load_regnr_map vil oppdatere self._regnr2name hvis den finner navn.
         self._regnr2name: dict[int, str] = {}  # fylles første gang du mapper/overstyrer
+        self._konto2regnr: dict[str, int] = self._load_regnr_map()
         # Liste over (regnr, regnskapslinje) brukt i nedtrekksmenyen for manuelle endringer.
         # Denne fylles opp etter en vellykket mapping og brukes når brukeren velger
         # et annet regnskapsnummer fra en nedtrekksliste via «Sett regnr …».
@@ -671,10 +673,28 @@ class App(tk.Tk):
             try:
                 data = json.loads(p.read_text("utf-8"))
                 out: dict[str, int] = {}
+                # Allow storing either bare integers or objects with regnr and name
                 for k, v in data.items():
-                    num = _extract_first_int(v)
-                    if num is not None:
-                        out[str(k)] = num
+                    # If value is a simple integer or string, extract number part
+                    if isinstance(v, (int, str)):
+                        num = _extract_first_int(v)
+                        if num is not None:
+                            out[str(k)] = num
+                    # If value is a dict, expect {"regnr": <int>, "name": <str>}
+                    elif isinstance(v, dict):
+                        rn = v.get("regnr")
+                        if rn is not None:
+                            try:
+                                rn_int = int(rn)
+                            except Exception:
+                                rn_int = _extract_first_int(rn)
+                            if rn_int is not None:
+                                out[str(k)] = rn_int
+                                # If we have a name, update name lookup
+                                nm = v.get("name") or v.get("linje") or v.get("navn")
+                                if nm:
+                                    self._regnr2name[rn_int] = str(nm)
+                    # Ignore other types
                 return out
             except Exception:
                 return {}
@@ -683,8 +703,37 @@ class App(tk.Tk):
     def _save_regnr_map(self):
         self._regnr_map_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._regnr_map_path.with_suffix(".tmp")
-        # lagre som {konto(str): regnr(int)}
-        data = {str(k): int(v) for k, v in self._konto2regnr.items() if v is not None}
+        # lagre som {konto(str): {regnr: <int>, name: <str>}}
+        data: dict[str, dict] = {}
+        for k, v in self._konto2regnr.items():
+            if v is None:
+                continue
+            try:
+                rn_int = int(v)
+            except Exception:
+                rn_int = None
+            if rn_int is None:
+                continue
+            # look up name from cached _regnr2name; if missing, try to populate from regnskapslinjer-filen
+            nm = self._regnr2name.get(rn_int, "")
+            if not nm:
+                # Attempt to load names from regnskapslinjer.xlsx via prefs
+                try:
+                    prefs = self._prefs_node()
+                    # _PREF_RL_PATH points to regnskapslinjer.xlsx
+                    rp = prefs.get(_PREF_RL_PATH)
+                    if rp:
+                        p = Path(rp)
+                        if p.exists():
+                            try:
+                                # update regnr→navn mapping
+                                self._regnr2name.update(self._read_regnskapslinjer_lut(p))
+                            except Exception:
+                                pass
+                            nm = self._regnr2name.get(rn_int, "")
+                except Exception:
+                    pass
+            data[str(k)] = {"regnr": rn_int, "name": nm}
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
         tmp.replace(self._regnr_map_path)
 
