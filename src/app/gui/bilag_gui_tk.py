@@ -26,6 +26,15 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import pandas as pd
 import numpy as np
+from typing import List, Tuple
+
+# Import helper for balance column renaming and summarisation if available.  We fall
+# back to simple logic below if the module cannot be imported.
+try:
+    from regnskap_utils import rename_balance_columns, summarize_regnskap
+except Exception:
+    rename_balance_columns = None  # type: ignore
+    summarize_regnskap = None  # type: ignore
 
 # -------------------------------------------------------------
 # Synonymer for standardkolonner i saldobalanse
@@ -430,6 +439,10 @@ class App(tk.Tk):
         # Erstatt manuell tekstinntasting med en nedtrekksliste for regnr/regnskapslinje
         # som gjør det enklere å overstyre mappingen.
         ttk.Button(top, text="Sett regnr …", command=self._set_regnr_dropdown).pack(side="left")
+
+        # Legg til en knapp for å vise regnskapsoppstilling.  Denne knappen oppretter
+        # en ny DataTable med summerte tall per regnskapslinje.
+        ttk.Button(top, text="Vis regnskap …", command=self._show_regnskapsoppstilling).pack(side="left", padx=(8, 0))
 
         # Info‑linje
         info_txt = f"Kilde: {Path(self.src_path).name}"
@@ -1397,6 +1410,240 @@ class App(tk.Tk):
         btn_frame.pack(padx=10, pady=(0, 10))
         ttk.Button(btn_frame, text="OK", command=on_ok).pack(side="left", padx=(0, 5))
         ttk.Button(btn_frame, text="Avbryt", command=win.destroy).pack(side="left")
+
+    def _show_regnskapsoppstilling(self) -> None:
+        """
+        Vis en regnskapsoppstilling i et nytt vindu.
+
+        Denne funksjonen genererer en full regnskapsoppstilling (resultat/balanse)
+        basert på mapperte saldobalanseposter i ``self.df_full`` og en
+        regnskapslinjer-fil. Den summerer IB, Endring og UB pr. regnskapsnummer,
+        vurderer eventuelle formler i regnskapslinjer-filen (som summerer andre
+        linjer), og beregner også summer for linjer merket som «Sumpost» uten
+        formel (basert på delsumnr eller sumnr). Resultatet sorteres stigende på
+        regnr og vises i en ny DataTable.
+        """
+        # Sørg for at regnr allerede finnes (mapping må være kjørt)
+        if "regnr" not in self.df_full.columns:
+            messagebox.showwarning(
+                "Ingen mapping",
+                "Du må mappe saldobalansen til regnskapslinjer før du kan vise regnskapsoppstillingen.",
+                parent=self,
+            )
+            return
+        # Kopier saldobalanse for behandling
+        df = self.df_full.copy()
+        import pandas as pd  # lokal import for å unngå global avhengighet
+
+        # Normaliser balansekolonnenavn dersom hjelpefunksjon finnes
+        if rename_balance_columns is not None:
+            try:
+                df = rename_balance_columns(df)
+            except Exception:
+                pass
+        # Dersom kolonner mangler, bruk synonymer fra COLUMN_SYNONYMS (IB, UB, Endring)
+        for std_col, synonyms in COLUMN_SYNONYMS.items():
+            if std_col not in df.columns:
+                for syn in synonyms:
+                    syn_norm = syn.strip().lower().replace(" ", "").replace("\u00a0", "")
+                    for c in df.columns:
+                        norm = str(c).strip().lower().replace(" ", "").replace("\u00a0", "")
+                        if norm == syn_norm:
+                            df = df.rename(columns={c: std_col})
+                            break
+                    if std_col in df.columns:
+                        break
+        # Sørg for at IB, Endring og UB finnes
+        for col in ("IB", "Endring", "UB"):
+            if col not in df.columns:
+                df[col] = 0.0
+        # Dersom alle regnr er NaN → ingenting å vise
+        if df["regnr"].isna().all():
+            messagebox.showwarning(
+                "Ingen regnr",
+                "Ingen av postene i saldobalansen har regnr (eller de er blanke).",
+                parent=self,
+            )
+            return
+        # Hent regnskapslinjer-filen. Vi bruker eksisterende _ensure_regn_files() fra mapping.
+        try:
+            files = self._ensure_regn_files()
+        except Exception:
+            files = None
+        if not files:
+            messagebox.showerror(
+                "Regnskapslinjer mangler",
+                "Fant ikke regnskapslinjer-filen. Velg den via mapping-dialogen først.",
+                parent=self,
+            )
+            return
+        rl_path, _map_path = files
+        # Les regnskapslinjer
+        try:
+            lines_df = pd.read_excel(rl_path, engine="openpyxl")
+        except Exception as exc:
+            messagebox.showerror(
+                "Feil ved lesing",
+                f"Kunne ikke lese regnskapslinjer-filen:\n{exc}",
+                parent=self,
+            )
+            return
+        # Vi forventer minst kolonnene 'nr', 'Regnskapslinje', 'Formel', 'delsumnr', 'sumnr', 'Sumpost'.
+        # Hvis de heter noe annet, bruk en enkel heuristikk for å plukke dem.
+        def _norm_col(name: str) -> str:
+            return str(name or "").strip().lower().replace(" ", "").replace("\u00a0", "").replace("_", "")
+
+        # Finn kolonner i lines_df
+        col_map = {c: _norm_col(c) for c in lines_df.columns}
+        def find_col(*keys) -> str | None:
+            for key in keys:
+                k = key.strip().lower().replace(" ", "").replace("\u00a0", "").replace("_", "")
+                for orig, norm in col_map.items():
+                    if norm == k:
+                        return orig
+            return None
+        nr_col = find_col("nr.", "nr", "regnr", "linjenr", "regnnr", "nummer")
+        name_col = find_col("regnskapslinje", "linjenavn", "navn", "regnskapslinjenavn")
+        form_col = find_col("formel")
+        delsumnr_col = find_col("delsumnr", "delsum", "delsumlinje")
+        sumnr_col = find_col("sumnr", "sumnummer")
+        sumpost_col = find_col("sumpost")
+        if not nr_col or not name_col:
+            messagebox.showerror(
+                "Ugyldig fil",
+                "Regnskapslinjer-filen mangler kolonnene 'nr' og/eller 'Regnskapslinje'.",
+                parent=self,
+            )
+            return
+        # Velg relevante kolonner og standardiser navn
+        use_cols = [nr_col, name_col]
+        for c in (form_col, delsumnr_col, sumnr_col, sumpost_col):
+            if c and c not in use_cols:
+                use_cols.append(c)
+        lines = lines_df[use_cols].copy()
+        rename_dict = {nr_col: "nr", name_col: "Regnskapslinje"}
+        if form_col:
+            rename_dict[form_col] = "Formel"
+        if delsumnr_col:
+            rename_dict[delsumnr_col] = "delsumnr"
+        if sumnr_col:
+            rename_dict[sumnr_col] = "sumnr"
+        if sumpost_col:
+            rename_dict[sumpost_col] = "Sumpost"
+        lines = lines.rename(columns=rename_dict)
+        # Konverter nr og gruppenr til int der mulig
+        lines["nr"] = pd.to_numeric(lines["nr"], errors="coerce")
+        if "delsumnr" in lines.columns:
+            lines["delsumnr"] = pd.to_numeric(lines["delsumnr"], errors="coerce")
+        if "sumnr" in lines.columns:
+            lines["sumnr"] = pd.to_numeric(lines["sumnr"], errors="coerce")
+        # Fjern rader uten nr
+        lines = lines.dropna(subset=["nr"]).copy()
+        lines["nr"] = lines["nr"].astype(int)
+        # Bygg aggregert kart fra saldobalanse: regnr -> (IB, Endring, UB)
+        # Konverter balansekolonnene til tall
+        work = df.dropna(subset=["regnr"]).copy()
+        work["regnr"] = pd.to_numeric(work["regnr"], errors="coerce")
+        for col in ("IB", "Endring", "UB"):
+            work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
+        agg_df = work.groupby("regnr", dropna=True, as_index=False)[["IB", "Endring", "UB"]].sum()
+        aggregated_map = {int(row["regnr"]): (row["IB"], row["Endring"], row["UB"]) for _, row in agg_df.iterrows()}
+        # Funksjon for å parse en formel (f.eks. "=19+79-155") til en liste av int (med fortegn)
+        def parse_formula(formula_str: str) -> list[int]:
+            expr = str(formula_str or "").strip()
+            if expr.startswith("="):
+                expr = expr[1:]
+            tokens: list[int] = []
+            num = ""
+            sign = 1
+            for ch in expr:
+                if ch.isdigit():
+                    num += ch
+                elif ch in "+-":
+                    if num:
+                        tokens.append(sign * int(num))
+                        num = ""
+                    sign = 1 if ch == "+" else -1
+                else:
+                    # ignorere andre tegn (mellomrom etc.)
+                    pass
+            if num:
+                tokens.append(sign * int(num))
+            return tokens
+        # Bygg mapping av grupper: hvilken nr har hvilke barn (delsum og sum)
+        delsum_children: dict[int, list[int]] = {}
+        sumnr_children: dict[int, list[int]] = {}
+        if "delsumnr" in lines.columns:
+            for _, row in lines.iterrows():
+                if pd.notna(row.get("delsumnr")):
+                    parent = int(row["delsumnr"])
+                    child = int(row["nr"])
+                    delsum_children.setdefault(parent, []).append(child)
+        if "sumnr" in lines.columns:
+            for _, row in lines.iterrows():
+                if pd.notna(row.get("sumnr")):
+                    parent = int(row["sumnr"])
+                    child = int(row["nr"])
+                    sumnr_children.setdefault(parent, []).append(child)
+        # Resultatkart for beregnede summer (regnr -> (IB, Endring, UB))
+        result_map: dict[int, tuple[float, float, float]] = {}
+        # Funksjon for å hente data for en regnr, enten fra tidligere beregnet eller fra aggregert_map
+        def get_data(nr: int) -> tuple[float, float, float]:
+            return result_map.get(nr, aggregated_map.get(nr, (0.0, 0.0, 0.0)))
+        # Gå gjennom linjene i stigende rekkefølge og beregn summer
+        for _, line_row in lines.sort_values("nr").iterrows():
+            nr = int(line_row["nr"])
+            formula = line_row.get("Formel")
+            is_sumpost = str(line_row.get("Sumpost")).strip().lower() == "ja"
+            # Bruk formel hvis den finnes
+            if pd.notna(formula) and str(formula).strip():
+                parts = parse_formula(str(formula))
+                IB = End = UB = 0.0
+                for ref in parts:
+                    ref_nr = abs(ref)
+                    ib0, end0, ub0 = get_data(ref_nr)
+                    if ref < 0:
+                        ib0, end0, ub0 = -ib0, -end0, -ub0
+                    IB += ib0
+                    End += end0
+                    UB += ub0
+                result_map[nr] = (IB, End, UB)
+            elif is_sumpost:
+                # summer barn fra delsum- eller sum-lister
+                children = []
+                if nr in delsum_children:
+                    children.extend(delsum_children[nr])
+                if nr in sumnr_children:
+                    children.extend(sumnr_children[nr])
+                if children:
+                    IB = End = UB = 0.0
+                    for child in children:
+                        ib0, end0, ub0 = get_data(child)
+                        IB += ib0
+                        End += end0
+                        UB += ub0
+                    result_map[nr] = (IB, End, UB)
+                else:
+                    # Ingen barn: bruk aggregert data (kan være 0)
+                    result_map[nr] = get_data(nr)
+            else:
+                # Vanlig linje: bruk aggregert data
+                result_map[nr] = get_data(nr)
+        # Bygg DataFrame for visning
+        rows = []
+        for _, row in lines.sort_values("nr").iterrows():
+            nr = int(row["nr"])
+            name = row["Regnskapslinje"]
+            ib, endr, ub = result_map.get(nr, (0.0, 0.0, 0.0))
+            rows.append({"regnr": nr, "regnskapslinje": name, "IB": ib, "Endring": endr, "UB": ub})
+        summary_df = pd.DataFrame(rows)
+        # Sorter etter regnr
+        summary_df = summary_df.sort_values("regnr")
+        # Vis i nytt vindu
+        win = tk.Toplevel(self)
+        win.title("Regnskapsoppstilling")
+        table = DataTable(win, df=summary_df, page_size=500)
+        table.pack(fill="both", expand=True, padx=8, pady=8)
 
 
 # -------------------------------------------------------------
