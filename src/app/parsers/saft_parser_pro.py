@@ -372,56 +372,102 @@ def parse_saft(input_path: Path, outdir: Path) -> None:
             cur_voucher.mod_date     = _first(el, ["ModificationDate"])
 
         # Line variants
-        if evt == "end" and tag in ("Line","TransactionLine","JournalLine"):
-            # context
+        if evt == "end" and tag in ("Line", "TransactionLine", "JournalLine"):
+            # Only process transaction lines that are part of a <Transaction> (GeneralLedgerEntries).
+            # SAF‑T SourceDocuments (Sales/Purchase invoices) also have <Line> elements which do not
+            # represent journal lines and often lack AccountID. To avoid polluting transactions.csv
+            # with these invoice lines, skip if we're not currently inside a Transaction.
             if cur_voucher is None:
-                v_id=v_no=j_id=None; currency=None
-                tr_date=_first(el,["TransactionDate","EntryDate","PostingDate"])
-                p_date=_first(el,["PostingDate"])
-            else:
-                v_id=cur_voucher.voucher_id; v_no=cur_voucher.voucher_no; j_id=cur_voucher.journal_id
-                currency = cur_voucher.currency_code
-                tr_date=cur_voucher.transaction_date; p_date=cur_voucher.posting_date
+                # Even if we skip writing, we still need to release memory for the element to avoid
+                # building up the XML tree. Clearing here mirrors the logic below.
+                el.clear()
+                while el.getprevious() is not None:
+                    del el.getparent()[0]
+                continue
+            # context comes from current voucher
+            v_id = cur_voucher.voucher_id
+            v_no = cur_voucher.voucher_no
+            j_id = cur_voucher.journal_id
+            currency = cur_voucher.currency_code
+            tr_date = cur_voucher.transaction_date
+            p_date = cur_voucher.posting_date
 
-            record_id = _first(el, ["RecordID","LineID"])
-            system_id = _first(el, ["SystemID"]); batch_id = _first(el, ["BatchID"])
-            doc_no = _first(el, ["DocumentNumber"]); line_src = _first(el, ["SourceDocumentID"])
+            record_id = _first(el, ["RecordID", "LineID"])
+            system_id = _first(el, ["SystemID"])
+            batch_id = _first(el, ["BatchID"])
+            doc_no = _first(el, ["DocumentNumber"])
+            line_src = _first(el, ["SourceDocumentID"])
             acc_id = _first(el, ["AccountID"])
-            cust_id= _first(el, ["CustomerID"]); sup_id=_first(el, ["SupplierID"])
-            desc = _first(el, ["Description","Narrative","LineDescription"])
-            debit = _amount_of(el,"DebitAmount") or DEC(0); credit = _amount_of(el,"CreditAmount") or DEC(0)
+            cust_id = _first(el, ["CustomerID"])
+            sup_id = _first(el, ["SupplierID"])
+            desc = _first(el, ["Description", "Narrative", "LineDescription"])
+
+            debit = _amount_of(el, "DebitAmount") or DEC(0)
+            credit = _amount_of(el, "CreditAmount") or DEC(0)
             amount = debit - credit
-            amt_cur = _first(el, ["AmountCurrency","ForeignAmount"]); ex_rate = _first(el, ["ExchangeRate"])
-            tax_type = _first(el, ["TaxType"]); tax_country = _first(el, ["TaxCountryRegion"])
-            tax_code = _first(el, ["TaxCode"]); tax_perc = _first(el, ["TaxPercentage"])
+
+            amt_cur = _first(el, ["AmountCurrency", "ForeignAmount"])
+            ex_rate = _first(el, ["ExchangeRate"])
+            tax_type = _first(el, ["TaxType"])
+            tax_country = _first(el, ["TaxCountryRegion"])
+            tax_code = _first(el, ["TaxCode"])
+            tax_perc = _first(el, ["TaxPercentage"])
             # v1.3 tax split
-            d_tax = _amount_of(el,"DebitTaxAmount") or DEC(0); c_tax=_amount_of(el,"CreditTaxAmount") or DEC(0)
-            tax_amt = _amount_of(el,"TaxAmount") or (d_tax - c_tax)
+            d_tax = _amount_of(el, "DebitTaxAmount") or DEC(0)
+            c_tax = _amount_of(el, "CreditTaxAmount") or DEC(0)
+            tax_amt = _amount_of(el, "TaxAmount") or (d_tax - c_tax)
 
-            acc_desc = accounts.get(acc_id,{}).get("AccountDescription","") if acc_id else ""
-            cust_name = customers.get(cust_id,{}).get("Name","") if cust_id else ""
-            cust_vat  = customers.get(cust_id,{}).get("VATNumber","") if cust_id else ""
-            sup_name  = suppliers.get(sup_id,{}).get("Name","") if sup_id else ""
-            sup_vat   = suppliers.get(sup_id,{}).get("VATNumber","") if sup_id else ""
+            acc_desc = accounts.get(acc_id, {}).get("AccountDescription", "") if acc_id else ""
+            cust_name = customers.get(cust_id, {}).get("Name", "") if cust_id else ""
+            cust_vat = customers.get(cust_id, {}).get("VATNumber", "") if cust_id else ""
+            sup_name = suppliers.get(sup_id, {}).get("Name", "") if sup_id else ""
+            sup_vat = suppliers.get(sup_id, {}).get("VATNumber", "") if sup_id else ""
 
-            w_lines.writerow({
-                "RecordID": record_id or "", "VoucherID": v_id or "", "VoucherNo": v_no or "",
-                "JournalID": j_id or "", "TransactionDate": tr_date or "", "PostingDate": p_date or "",
-                "SystemID": system_id or "", "BatchID": batch_id or "", "DocumentNumber": doc_no or "", "LineSourceDocumentID": line_src or "",
-                "AccountID": acc_id or "", "AccountDescription": acc_desc,
-                "CustomerID": cust_id or "", "CustomerName": cust_name, "CustomerVATNumber": cust_vat,
-                "SupplierID": sup_id or "", "SupplierName": sup_name, "SupplierVATNumber": sup_vat,
-                "Description": desc or "", "Debit": f"{debit}", "Credit": f"{credit}", "Amount": f"{amount}",
-                "CurrencyCode": currency or "", "AmountCurrency": amt_cur or "", "ExchangeRate": ex_rate or "",
-                "TaxType": tax_type or "", "TaxCountryRegion": tax_country or "", "TaxCode": tax_code or "", "TaxPercentage": tax_perc or "",
-                "DebitTaxAmount": f"{d_tax}", "CreditTaxAmount": f"{c_tax}", "TaxAmount": f"{tax_amt}"
-            })
-            if cur_voucher is not None:
-                cur_voucher.debit += debit; cur_voucher.credit += credit
+            w_lines.writerow(
+                {
+                    "RecordID": record_id or "",
+                    "VoucherID": v_id or "",
+                    "VoucherNo": v_no or "",
+                    "JournalID": j_id or "",
+                    "TransactionDate": tr_date or "",
+                    "PostingDate": p_date or "",
+                    "SystemID": system_id or "",
+                    "BatchID": batch_id or "",
+                    "DocumentNumber": doc_no or "",
+                    "LineSourceDocumentID": line_src or "",
+                    "AccountID": acc_id or "",
+                    "AccountDescription": acc_desc,
+                    "CustomerID": cust_id or "",
+                    "CustomerName": cust_name,
+                    "CustomerVATNumber": cust_vat,
+                    "SupplierID": sup_id or "",
+                    "SupplierName": sup_name,
+                    "SupplierVATNumber": sup_vat,
+                    "Description": desc or "",
+                    "Debit": f"{debit}",
+                    "Credit": f"{credit}",
+                    "Amount": f"{amount}",
+                    "CurrencyCode": currency or "",
+                    "AmountCurrency": amt_cur or "",
+                    "ExchangeRate": ex_rate or "",
+                    "TaxType": tax_type or "",
+                    "TaxCountryRegion": tax_country or "",
+                    "TaxCode": tax_code or "",
+                    "TaxPercentage": tax_perc or "",
+                    "DebitTaxAmount": f"{d_tax}",
+                    "CreditTaxAmount": f"{c_tax}",
+                    "TaxAmount": f"{tax_amt}",
+                }
+            )
+
+            # update voucher totals
+            cur_voucher.debit += debit
+            cur_voucher.credit += credit
 
             # free memory
             el.clear()
-            while el.getprevious() is not None: del el.getparent()[0]
+            while el.getprevious() is not None:
+                del el.getparent()[0]
 
         # Analysis connected to nearest line
         if evt == "end" and tag == "Analysis":
