@@ -37,6 +37,7 @@ class StartPortal(tk.Tk):
 
         # sørg for at Klienthub kan lese master.clients_root (brukes i ClientHub.__init__) :contentReference[oaicite:5]{index=5}
         self.clients_root = get_clients_root()
+        # ensure we have a valid clients root; if not, prompt the user
         if not self.clients_root or not self.clients_root.exists():
             self._choose_root()
             if not self.clients_root:
@@ -86,10 +87,18 @@ class StartPortal(tk.Tk):
         ttk.Button(btns, text="Klientinfo…", command=self._open_info).pack(side="left", padx=(6, 0))
         ttk.Button(btns, text="Team…", command=self._open_team).pack(side="left", padx=(6, 0))
         ttk.Button(btns, text="AR‑import…", command=self._open_ar_import).pack(side="left", padx=(6, 0))
-        ttk.Button(btns, text="Oppdater", command=self._refresh_list).pack(side="right")
+        ttk.Button(btns, text="Oppdater", command=self._update_clients).pack(side="right")
 
-        # init liste
-        self._all_clients: list[str] = list_clients(self.clients_root)
+        # init list of clients
+        self._all_clients: list[str] = []
+        # try to load from the central client list (Excel) first; if it fails, fall back to scanning directories
+        try:
+            self._load_clients_from_excel()
+        except Exception:
+            try:
+                self._all_clients = list_clients(self.clients_root)
+            except Exception:
+                self._all_clients = []
         # -- load team and employee data for "Mine klienter" filtering --
         # helper structures are initialised in _load_team_data()
         self.team_df: pd.DataFrame
@@ -107,17 +116,31 @@ class StartPortal(tk.Tk):
         return f"{e}  ({alias})"
 
     def _choose_root(self):
+        """
+        Prompt the user to choose a new clients root.  After the root is set
+        the client list is reloaded from the central client list if present;
+        otherwise we fall back to scanning the directory.
+        """
         p = filedialog.askdirectory(title="Velg klient‑rot eller en klientmappe")
-        if not p: return
+        if not p:
+            return
         root, single = resolve_root_and_client(Path(p))
         set_clients_root(root)
         self.clients_root = root
-        self._all_clients = list_clients(self.clients_root)
+        # reload client list: try excel first, then fallback to scanning directories
+        try:
+            self._load_clients_from_excel()
+        except Exception:
+            try:
+                self._all_clients = list_clients(self.clients_root)
+            except Exception:
+                self._all_clients = []
         self._refresh_list()
         if single and single in self._all_clients:
             self.lb.selection_clear(0, tk.END)
             idx = self._all_clients.index(single)
-            self.lb.selection_set(idx); self.lb.see(idx)
+            self.lb.selection_set(idx)
+            self.lb.see(idx)
 
     # ---------------- Actions ----------------
     def _pick_user(self):
@@ -304,6 +327,84 @@ class StartPortal(tk.Tk):
                     self.client_to_initials[cid] = set()
                 if ini:
                     self.client_to_initials[cid].add(ini)
+
+    def _load_clients_from_excel(self) -> None:
+        """
+        Populate self._all_clients from a central Excel client list instead of scanning
+        the client folders.  This method attempts to locate the Excel file in the
+        configured 'Kildefiler' directory.  Expected column names are
+        'KLIENT_NR' (client number) and 'KLIENT_NAVN' (client name).  If the file
+        cannot be found or read, this function does nothing.
+        """
+        # reset client list
+        self._all_clients = []
+        # find kildefiler directory using the same logic as in _load_team_data
+        base_dir = None
+        try:
+            from app.services.regnskapslinjer import find_kildefiler_dir  # type: ignore
+            bd = find_kildefiler_dir()
+            if bd:
+                base_dir = Path(bd)
+        except Exception:
+            pass
+        if base_dir is None:
+            # fallback: Kildefiler directory relative to src root
+            possible_dir = Path(__file__).resolve().parents[2] / "Kildefiler"
+            if possible_dir.exists():
+                base_dir = possible_dir
+        if base_dir is None:
+            return
+        # possible filenames for client list
+        possible_files = [
+            "BHL AS klientliste - kopi.xlsx",
+            "BHL AS klientliste.xlsx",
+            "BHLAS klientliste.xlsx",
+        ]
+        client_file = None
+        for fn in possible_files:
+            fp = base_dir / fn
+            if fp.exists():
+                client_file = fp
+                break
+        if client_file is None:
+            return
+        try:
+            df = pd.read_excel(client_file)
+        except Exception:
+            return
+        # Expect columns 'KLIENT_NR' and 'KLIENT_NAVN'
+        nr_col, name_col = None, None
+        lower_cols = {str(c).strip().lower(): c for c in df.columns}
+        for key, orig in lower_cols.items():
+            if key in {"klient_nr", "klientnr", "nr", "client_nr", "clientnr"}:
+                nr_col = orig
+            if key in {"klient_navn", "klientnavn", "navn", "client_navn", "clientnavn"}:
+                name_col = orig
+        if nr_col is None or name_col is None:
+            return
+        # build list of "<nr> <name>"
+        clients: list[str] = []
+        for _, row in df[[nr_col, name_col]].dropna().iterrows():
+            try:
+                cid = int(float(str(row[nr_col]).strip()))
+            except Exception:
+                continue
+            name = str(row[name_col]).strip()
+            if not name:
+                continue
+            clients.append(f"{cid} {name}")
+        # remove duplicates and sort
+        clients = sorted(set(clients), key=lambda s: s.lower())
+        self._all_clients = clients
+
+    def _update_clients(self) -> None:
+        """Reload the client list from Excel and refresh the display."""
+        try:
+            self._load_clients_from_excel()
+        except Exception:
+            # ignore if load fails; just refresh existing list
+            pass
+        self._refresh_list()
 
     def _selected_client(self) -> str | None:
         sel = self.lb.curselection()
