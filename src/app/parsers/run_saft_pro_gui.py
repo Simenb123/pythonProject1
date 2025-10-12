@@ -89,6 +89,10 @@ def _complete_accounts_file(outdir: Path) -> None:
     tx["Date"] = tx["PostingDate"].fillna(tx["TransactionDate"])
     tx["AccountID"] = _norm_acc_series(tx["AccountID"].astype(str))
     tx = _to_num(tx, ["Debit", "Credit"])
+    # Unngå dobbeltsummering: bruk kun GL-linjer hvis kolonnen finnes
+    if "IsGL" in tx.columns:
+        tx = tx.loc[tx["IsGL"].astype(str).str.lower() == "true"].copy()
+
     # Bestem periode (bruk hele året dersom header mangler)
     dfrom, dto = _range_dates(hdr, None, None, tx)
     # Hent eksisterende accounts.csv (kan være None)
@@ -587,7 +591,15 @@ def make_general_ledger(outdir: Path) -> Path:
     tx["Amount"] = tx["Debit"] - tx["Credit"]
     path = outdir / "general_ledger.xlsx"
     with pd.ExcelWriter(path, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as writer:
-        tx.sort_values(["AccountID", "Date"]).to_excel(writer, index=False, sheet_name="GeneralLedger")
+        # GL-only visning hvis IsGL finnes
+        if "IsGL" in tx.columns:
+            mask_gl = tx["IsGL"].astype(str).str.lower() == "true"
+            tx_gl = tx.loc[mask_gl].sort_values(["AccountID", "Date"])
+            tx_gl.to_excel(writer, index=False, sheet_name="GeneralLedger")
+            # Full transaksjonslogg for sporbarhet
+            tx.sort_values(["AccountID", "Date"]).to_excel(writer, index=False, sheet_name="AllTransactions")
+        else:
+            tx.sort_values(["AccountID", "Date"]).to_excel(writer, index=False, sheet_name="GeneralLedger")
     return path
 
 
@@ -615,6 +627,10 @@ def make_trial_balance(
     tx["Date"] = tx["PostingDate"].fillna(tx["TransactionDate"])
     tx["AccountID"] = _norm_acc_series(tx["AccountID"] if "AccountID" in tx.columns else pd.Series([], dtype=str))
     tx = _to_num(tx, ["Debit", "Credit"])
+    # Unngå dobbeltsummering: bruk kun GL-linjer hvis kolonnen finnes
+    if "IsGL" in tx.columns:
+        tx = tx.loc[tx["IsGL"].astype(str).str.lower() == "true"].copy()
+
     dfrom, dto = _range_dates(hdr, date_from, date_to, tx)
     def _sum(df: pd.DataFrame) -> pd.DataFrame:
         """Summer debet og kredit per konto og beregn netto.
