@@ -55,6 +55,8 @@ class DataTable(ttk.Frame):
         ttk.Button(bar, text="Oppdater", command=self.refresh).pack(side="left", padx=(0,6))
         ttk.Button(bar, text="Autotilpass", command=self.autosize).pack(side="left", padx=(0,6))
         ttk.Button(bar, text="Kolonner …", command=self.choose_columns).pack(side="left")
+        # Legg til eksport til Excel-knapp på høyre side av toppbaren
+        ttk.Button(bar, text="Eksporter Excel …", command=self.export_view_excel).pack(side="right")
 
         # Tabell
         self.tree = ttk.Treeview(self, show="headings", style="DataTable.Treeview")
@@ -74,6 +76,7 @@ class DataTable(ttk.Frame):
         self.menu = tk.Menu(self, tearoff=False)
         self.menu.add_command(label="Kopier valgte rader", command=self.copy_selection)
         self.menu.add_command(label="Eksporter visning (CSV)…", command=self.export_view)
+        self.menu.add_command(label="Eksporter visning (Excel)…", command=self.export_view_excel)
         self.menu.add_separator()
         self.menu.add_command(label="Autotilpass kolonner", command=self.autosize)
         self.menu.add_command(label="Velg kolonner…", command=self.choose_columns)
@@ -241,6 +244,23 @@ class DataTable(ttk.Frame):
                                          title="Eksporter visning (CSV)")
         if not p: return
         self.df_view.to_csv(p, index=False, encoding="utf-8-sig")
+
+    def export_view_excel(self):
+        """Export the current view to an Excel file (.xlsx)."""
+        p = filedialog.asksaveasfilename(defaultextension=".xlsx",
+                                         filetypes=[("Excel", "*.xlsx"), ("Alle filer", "*.*")],
+                                         title="Eksporter visning (Excel)")
+        if not p:
+            return
+        try:
+            # Use pandas to export view to Excel. Ensure numeric columns remain numbers.
+            self.df_view.to_excel(p, index=False)
+        except Exception as exc:
+            try:
+                from tkinter import messagebox
+                messagebox.showerror("Eksportfeil", f"Kunne ikke eksportere til Excel: {exc}")
+            except Exception:
+                pass
 
     def _popup_menu(self, event):
         try: self.menu.tk_popup(event.x_root, event.y_root)
