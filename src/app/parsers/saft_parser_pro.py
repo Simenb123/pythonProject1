@@ -442,12 +442,13 @@ def parse_saft(input_path: Path, outdir: Path) -> None:
                     acc_id = customer_ctrl[cust_id]
                 elif sup_id and sup_id in supplier_ctrl:
                     acc_id = supplier_ctrl[sup_id]
-            # Hvis kontoen fremdeles er blank etter mapping, skriv ikke til transactions.csv.
+            # Hvis kontoen fremdeles er blank etter mapping, sett den til en
+            # placeholder "UNDEFINED" slik at linjen likevel kommer med i
+            # transaksjonsfilen. Dette sikrer at hovedboken blir komplett og
+            # at saldoen kan følges opp. Revisor kan filtrere på AccountID="UNDEFINED"
+            # for å identifisere linjer som manglet konto i SAF‑T.
             if not acc_id:
-                el.clear()
-                while el.getprevious() is not None:
-                    del el.getparent()[0]
-                continue
+                acc_id = "UNDEFINED"
 
             amt_cur = _first(el, ["AmountCurrency", "ForeignAmount"])
             ex_rate = _first(el, ["ExchangeRate"])
