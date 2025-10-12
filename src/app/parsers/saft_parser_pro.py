@@ -184,7 +184,8 @@ def parse_saft(input_path: Path, outdir: Path) -> None:
         "Description","Debit","Credit","Amount",
         "CurrencyCode","AmountCurrency","ExchangeRate",
         "TaxType","TaxCountryRegion","TaxCode","TaxPercentage",
-        "DebitTaxAmount","CreditTaxAmount","TaxAmount"
+        "DebitTaxAmount","CreditTaxAmount","TaxAmount",
+        "IsGL","SourceType"
     ]); w_lines.writeheader()
 
     w_anl = csv.DictWriter(f_anl, fieldnames=["RecordID","Type","ID","Amount"]); w_anl.writeheader()
@@ -207,6 +208,11 @@ def parse_saft(input_path: Path, outdir: Path) -> None:
     accounts: Dict[str, Dict[str, str]] = {}
     customers: Dict[str, Dict[str, str]] = {}
     suppliers: Dict[str, Dict[str, str]] = {}
+    # control account mapping for customers and suppliers (BalanceAccountStructure).
+    # For each party ID, we will store the associated control account to use when lines lack AccountID.
+    # See handling in Customer/Supplier sections below.
+    customer_ctrl: Dict[str, str] = {}
+    supplier_ctrl: Dict[str, str] = {}
     cur_voucher: Optional[VoucherAgg] = None
 
     # streaming parse
@@ -323,9 +329,15 @@ def parse_saft(input_path: Path, outdir: Path) -> None:
                 })
                 # BalanceAccountStructure (1.3)
                 for b in el.findall(f".//{{{NS['s']}}}BalanceAccountStructure"):
+                    # Extract the control account for this customer. If multiple BalanceAccountStructure
+                    # elements exist, the last one will overwrite earlier ones, which is acceptable
+                    # because SAF‑T v1.3 typically defines one account per party.
+                    acct = _first(b, ["AccountID"])
+                    if acct:
+                        customer_ctrl[cid] = acct
                     w_arap.writerow({
                         "PartyType":"Customer","PartyID":cid,
-                        "AccountID": _first(b, ["AccountID"]) or "",
+                        "AccountID": acct or "",
                         "OpeningDebit": f"{_amount_of(b,'OpeningDebitBalance') or DEC(0)}",
                         "OpeningCredit": f"{_amount_of(b,'OpeningCreditBalance') or DEC(0)}",
                         "ClosingDebit": f"{_amount_of(b,'ClosingDebitBalance') or DEC(0)}",
@@ -345,9 +357,12 @@ def parse_saft(input_path: Path, outdir: Path) -> None:
                     "Email": _first(el, ["Email"]) or "", "Telephone": _first(el, ["Telephone"]) or ""
                 })
                 for b in el.findall(f".//{{{NS['s']}}}BalanceAccountStructure"):
+                    acct = _first(b, ["AccountID"])
+                    if acct:
+                        supplier_ctrl[sid] = acct
                     w_arap.writerow({
                         "PartyType":"Supplier","PartyID":sid,
-                        "AccountID": _first(b, ["AccountID"]) or "",
+                        "AccountID": acct or "",
                         "OpeningDebit": f"{_amount_of(b,'OpeningDebitBalance') or DEC(0)}",
                         "OpeningCredit": f"{_amount_of(b,'OpeningCreditBalance') or DEC(0)}",
                         "ClosingDebit": f"{_amount_of(b,'ClosingDebitBalance') or DEC(0)}",
@@ -407,18 +422,28 @@ def parse_saft(input_path: Path, outdir: Path) -> None:
             amount = debit - credit
 
             # Always update voucher totals, even for lines without AccountID, since these are part of the
-            # journal totals. However, we will not write such lines to transactions.csv to avoid
-            # contaminating the ledger with non-journal details.  If AccountID is missing, treat the
-            # line as an analysis-line and skip writing it to the transactions file. The Analysis
-            # section (handled later) will capture the detailed breakdown.
+            # journal totals.
+            #
+            # Hvis AccountID mangler forsøker vi å tilordne en kontrollkonto basert på CustomerID
+            # eller SupplierID. SAF‑T v1.3 lar hver kunde/leverandør ha en BalanceAccountStructure
+            # som spesifiserer hvilken hovedbokskonto reskontrolinjer skal føres mot (f.eks. 1510,
+            # 1550, 2410 osv.). Dersom en linje mangler AccountID men har CustomerID eller SupplierID,
+            # henter vi kontoen fra de respektive mappingene. Dersom vi ikke finner en konto på
+            # denne måten, skriver vi ikke linjen til transactions.csv (for å unngå å inkludere
+            # rene analyselinjer eller fakturalinjer uten konto).
 
             # Update voucher totals first
             cur_voucher.debit += debit
             cur_voucher.credit += credit
 
-            # Skip writing to transactions.csv if AccountID is missing or blank
+            # Dersom konto mangler, forsøk å finne en kontrollkonto via kunde- eller leverandørmapping.
             if not acc_id:
-                # Clear memory for the element and continue
+                if cust_id and cust_id in customer_ctrl:
+                    acc_id = customer_ctrl[cust_id]
+                elif sup_id and sup_id in supplier_ctrl:
+                    acc_id = supplier_ctrl[sup_id]
+            # Hvis kontoen fremdeles er blank etter mapping, skriv ikke til transactions.csv.
+            if not acc_id:
                 el.clear()
                 while el.getprevious() is not None:
                     del el.getparent()[0]
@@ -475,6 +500,8 @@ def parse_saft(input_path: Path, outdir: Path) -> None:
                     "DebitTaxAmount": f"{d_tax}",
                     "CreditTaxAmount": f"{c_tax}",
                     "TaxAmount": f"{tax_amt}",
+                    "IsGL": "True",
+                    "SourceType": "GL",
                 }
             )
 
