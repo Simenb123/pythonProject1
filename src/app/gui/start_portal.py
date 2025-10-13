@@ -11,7 +11,14 @@ if str(SRC) not in sys.path:
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 
-from app.gui.klient_launcher import ClientHub                # Klienthub (analyse/mapping/versjoner) :contentReference[oaicite:3]{index=3}
+"""
+Import our local `ClientHub` implementation unconditionally.  In packaged
+environments there may also exist an `app.gui.klient_launcher.ClientHub`,
+but that version does not include recent enhancements (such as the
+`Eierskap` button).  To ensure a consistent user experience we always
+import `ClientHub` from the local `client_hub` module.
+"""
+from client_hub import ClientHub
 from app.services.clients import (                           # Klient-rot + klientliste, samme som før  :contentReference[oaicite:4]{index=4}
     get_clients_root, set_clients_root, resolve_root_and_client, list_clients,
 )
