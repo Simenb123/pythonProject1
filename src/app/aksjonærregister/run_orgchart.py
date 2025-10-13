@@ -6,7 +6,13 @@ defined in ``org_controller.py``.  Use this script to start the
 Tkinter-based interface for exploring shareholder ownership graphs.
 """
 
-from org_controller import OrgChartApp
+# Import OrgChartApp.  Use relative import if this file is part of a
+# package; otherwise fall back to absolute import.  This allows running
+# via ``python -m app.aksjonærregister.run_orgchart`` or directly.
+try:
+    from .org_controller import OrgChartApp  # type: ignore[import-not-found]
+except ImportError:
+    from org_controller import OrgChartApp  # type: ignore[import-not-found]
 
 
 def main() -> None:

@@ -26,9 +26,18 @@ from typing import Optional, Tuple
 # so that this module can be run as a script without requiring a package
 # context.  The modules ``db``, ``org_model`` and ``org_view`` live in
 # the project root alongside this file.
-import db
-from org_model import OrgChartModel, Node
-from org_view import OrgChartCanvas
+# Import modules relative to this file if part of a package; fall back to
+# absolute imports when running as a script.  This allows the controller
+# to be executed both via ``python -m app.aksjonærregister.run_orgchart``
+# and via ``python org_controller.py``.
+try:
+    from . import db  # type: ignore[import-not-found]
+    from .org_model import OrgChartModel, Node  # type: ignore[import-not-found]
+    from .org_view import OrgChartCanvas  # type: ignore[import-not-found]
+except ImportError:
+    import db  # type: ignore[import-not-found]
+    from org_model import OrgChartModel, Node  # type: ignore[import-not-found]
+    from org_view import OrgChartCanvas  # type: ignore[import-not-found]
 
 
 class OrgChartApp(tk.Tk):
@@ -82,6 +91,19 @@ class OrgChartApp(tk.Tk):
         ttk.Radiobutton(search_frame, text="Orgnr", variable=self.search_by, value="orgnr").pack(side=tk.LEFT)
         ttk.Button(search_frame, text="Søk", command=self._do_search).pack(side=tk.LEFT, padx=4)
 
+        # Toggle button to collapse/expand the left panel. When collapsed,
+        # the graph takes full width; when expanded, the search/results
+        # panel is visible.  Use a simple arrow for the button label that
+        # flips depending on state.  See `_toggle_left_panel` for logic.
+        self.left_collapsed = False
+        self.toggle_btn = ttk.Button(
+            search_frame,
+            text="◀",  # black left-pointing triangle
+            width=2,
+            command=self._toggle_left_panel,
+        )
+        self.toggle_btn.pack(side=tk.RIGHT, padx=(4, 0))
+
         # Main content: horizontally split into list and canvas+details
         content = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         content.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
@@ -98,6 +120,40 @@ class OrgChartApp(tk.Tk):
         self.result_tree.column("name", width=300, anchor=tk.W)
         self.result_tree.pack(fill=tk.BOTH, expand=False, pady=(0, 6))
         self.result_tree.bind("<<TreeviewSelect>>", self._on_select_company)
+        # Also bind double-click on result tree items to immediately trigger selection
+        self.result_tree.bind("<Double-1>", lambda e: self._on_select_company())
+
+        # Depth controls: allow user to choose how many levels up/down to traverse
+        depth_frame = ttk.Frame(left_frame)
+        depth_frame.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(depth_frame, text="Dybde opp:").pack(side=tk.LEFT)
+        # 0 means unlimited
+        self.depth_up_var = tk.IntVar(value=0)
+        up_spin = ttk.Spinbox(depth_frame, from_=0, to=8, width=3, textvariable=self.depth_up_var)
+        up_spin.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(depth_frame, text="Dybde ned:").pack(side=tk.LEFT)
+        self.depth_down_var = tk.IntVar(value=0)
+        down_spin = ttk.Spinbox(depth_frame, from_=0, to=8, width=3, textvariable=self.depth_down_var)
+        down_spin.pack(side=tk.LEFT)
+
+        # Slider/spinbox for minimum ownership percentage filtering
+        thresh_frame = ttk.Frame(left_frame)
+        thresh_frame.pack(fill=tk.X, pady=(2, 4))
+        ttk.Label(thresh_frame, text="Min eierandel %:").pack(side=tk.LEFT)
+        # Using a DoubleVar; values between 0 and 10 (percentage), step 0.5
+        self.min_pct_var = tk.DoubleVar(value=0.0)
+        self.min_pct_spin = ttk.Spinbox(
+            thresh_frame,
+            from_=0.0,
+            to=100.0,
+            increment=0.5,
+            width=6,
+            textvariable=self.min_pct_var,
+            format="%.1f",
+        )
+        self.min_pct_spin.pack(side=tk.LEFT, padx=(4, 0))
+        # When the value changes, rebuild the graph for the current company
+        self.min_pct_var.trace_add("write", lambda *_args: self._on_min_pct_change())
 
         # Owners table for the selected company
         owners_label = ttk.Label(left_frame, text="Eiere i valgt selskap", font=("Helvetica", 10, "bold"))
@@ -138,7 +194,11 @@ class OrgChartApp(tk.Tk):
         content.add(right_frame, weight=2)
 
         # Canvas for drawing the graph
-        self.canvas = OrgChartCanvas(right_frame, on_node_click=self._on_node_click)
+        self.canvas = OrgChartCanvas(
+            right_frame,
+            on_node_click=self._on_node_click,
+            on_node_double_click=self._on_node_double_click,
+        )
         # Put canvas in a scrollable frame to allow panning
         canvas_scroll_y = ttk.Scrollbar(right_frame, orient=tk.VERTICAL, command=self.canvas.yview)
         canvas_scroll_x = ttk.Scrollbar(right_frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
@@ -147,8 +207,47 @@ class OrgChartApp(tk.Tk):
         self.canvas.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
         canvas_scroll_y.pack(fill=tk.Y, side=tk.RIGHT)
         canvas_scroll_x.pack(fill=tk.X, side=tk.BOTTOM)
+        # Zoom controls (above legend and details)
+        zoom_frame = ttk.Frame(right_frame)
+        zoom_frame.pack(fill=tk.X, pady=(4, 0))
+        # Use Unicode plus/minus symbols for compact zoom buttons
+        # Plus button to zoom in
+        ttk.Button(zoom_frame, text="＋", width=3, command=self.canvas.zoom_in).pack(side=tk.LEFT, padx=2)
+        # Minus button to zoom out
+        ttk.Button(zoom_frame, text="－", width=3, command=self.canvas.zoom_out).pack(side=tk.LEFT)
+        # Refresh button to re-draw the graph and reset zoom.  Use a circular arrow symbol.
+        ttk.Button(zoom_frame, text="⟳", width=3, command=self._refresh_graph).pack(side=tk.LEFT, padx=(10, 0))
 
-        # Details panel below canvas
+        # Legend explaining shapes and line colours
+        legend_frame = ttk.Frame(right_frame)
+        legend_frame.pack(fill=tk.X, pady=(4, 0), anchor="w")
+        # Create a small canvas to draw legend shapes
+        # Allocate a bit more width to avoid line wrapping of legend text
+        legend_canvas = tk.Canvas(legend_frame, width=220, height=70, highlightthickness=0, bg="white")
+        legend_canvas.pack(side=tk.LEFT)
+        # Draw company box
+        x, y = 5, 5
+        comp_fill = self.canvas.NODE_COLORS[True]["fill"]
+        comp_out = self.canvas.NODE_COLORS[True]["outline"]
+        person_fill = self.canvas.NODE_COLORS[False]["fill"]
+        person_out = self.canvas.NODE_COLORS[False]["outline"]
+        legend_canvas.create_rectangle(x, y, x + 16, y + 12, fill=comp_fill, outline=comp_out)
+        legend_canvas.create_text(x + 20, y + 6, text="Selskap", anchor="w", font=("Helvetica", 8))
+        y += 18
+        legend_canvas.create_oval(x, y, x + 16, y + 12, fill=person_fill, outline=person_out)
+        legend_canvas.create_text(x + 20, y + 6, text="Privatperson", anchor="w", font=("Helvetica", 8))
+        y += 20
+        # Colour bars for edge percentages
+        legend_canvas.create_line(5, y, 21, y, fill="#3CB371", width=3)
+        legend_canvas.create_text(24, y, text="≥ 50 % eierandel", anchor="w", font=("Helvetica", 8))
+        y += 14
+        legend_canvas.create_line(5, y, 21, y, fill="#F4D03F", width=3)
+        legend_canvas.create_text(24, y, text="10–49 % eierandel", anchor="w", font=("Helvetica", 8))
+        y += 14
+        legend_canvas.create_line(5, y, 21, y, fill="#E74C3C", width=3)
+        legend_canvas.create_text(24, y, text="< 10 % eierandel", anchor="w", font=("Helvetica", 8))
+
+        # Details panel below legend
         details_frame = ttk.Labelframe(right_frame, text="Detaljer", padding=6)
         details_frame.pack(fill=tk.X, expand=False, pady=(4, 0))
         # Labels for details (we'll update text when node clicked)
@@ -157,6 +256,12 @@ class OrgChartApp(tk.Tk):
             lbl = ttk.Label(details_frame, text=f"{field}: ")
             lbl.pack(anchor="w")
             self.detail_labels[field] = lbl
+
+        # Store frames for toggling visibility later
+        self.left_frame = left_frame
+        self.right_frame = right_frame
+        self.content = content
+
 
     # ------------------------------------------------------------------
     # Actions
@@ -233,11 +338,31 @@ class OrgChartApp(tk.Tk):
 
     def _build_and_draw(self, orgnr: str) -> None:
         """Create OrgChartModel for the given orgnr and draw it on canvas."""
-        # Default depth values; could be configurable
-        max_up = 2
-        max_down = 2
-        min_pct = 0.0
-        self.model = OrgChartModel(self.conn, root_orgnr=orgnr, max_up=max_up, max_down=max_down, min_pct=min_pct)
+        # Read depth preferences from UI. 0 means unlimited (None)
+        up_val = self.depth_up_var.get() if hasattr(self, "depth_up_var") else 2
+        down_val = self.depth_down_var.get() if hasattr(self, "depth_down_var") else 2
+        max_up = None if up_val == 0 else up_val
+        max_down = None if down_val == 0 else down_val
+        # Read minimum percentage threshold from UI; treat as percent value (0-100)
+        try:
+            val = self.min_pct_var.get() if hasattr(self, "min_pct_var") else 0.0
+            min_pct = float(val)
+        except Exception:
+            min_pct = 0.0
+        # Reset the canvas zoom to default before drawing a new graph.  This
+        # prevents edges from misaligning after repeated zoom operations
+        # when switching companies.  Only reset the zoom factor; the canvas
+        # will be cleared and redrawn below.
+        if hasattr(self.canvas, "_zoom"):
+            self.canvas._zoom = 1.0
+        # Create model with threshold; percentages below this value are filtered
+        self.model = OrgChartModel(
+            self.conn,
+            root_orgnr=orgnr,
+            max_up=max_up,
+            max_down=max_down,
+            min_pct=min_pct,
+        )
         try:
             self.model.build_graph()
         except Exception as exc:
@@ -276,6 +401,95 @@ class OrgChartApp(tk.Tk):
         for key, label in self.detail_labels.items():
             val = details_map.get(key, "")
             label.config(text=f"{key}: {val}")
+
+    def _on_node_double_click(self, node: Node) -> None:
+        """
+        Called when a node in the canvas is double-clicked.  This
+        selects the double-clicked company or person as the new root
+        of the graph by rebuilding the model and owners table for its ID.
+
+        If the node represents a company, its ID is used directly as
+        the organisation number.  If it's a person node (without orgnr),
+        we cannot build an ownership graph, so we ignore the double-click.
+        """
+        # If the node has an ID and is a company, rebuild graph for that ID
+        if node and node.id and node.is_company:
+            # Set the current_orgnr to the node's id
+            self.current_orgnr = node.id
+            # Load owners of this new company in the owners table
+            self._load_owners(node.id)
+            # Build and draw the graph for the new root
+            self._build_and_draw(node.id)
+
+    def _on_min_pct_change(self) -> None:
+        """Callback when the minimum ownership percentage spinner changes."""
+        # If a company is currently selected, rebuild the graph with the new threshold
+        if self.current_orgnr:
+            # Debounce: avoid too many rapid redraws; schedule redraw after idle
+            self.after(200, lambda: self._build_and_draw(self.current_orgnr))
+
+    def _refresh_graph(self) -> None:
+        """Reset zoom and redraw the current graph.
+
+        This method resets the canvas zoom back to its default (1.0),
+        recenters the scrollbars, and rebuilds the graph for the
+        currently selected organisation number.  Useful when the
+        layout has become misaligned after extensive zooming and
+        panning.
+        """
+        # Only proceed if a company is selected
+        if not self.current_orgnr:
+            return
+        # Reset zoom on the canvas
+        try:
+            # Bring zoom back to 1x by scaling all items inversely
+            if self.canvas._zoom != 1.0:
+                factor = 1.0 / self.canvas._zoom
+                self.canvas.scale("all", 0, 0, factor, factor)
+                self.canvas._zoom = 1.0
+            # Reset scroll position to top-left
+            self.canvas.xview_moveto(0)
+            self.canvas.yview_moveto(0)
+        except Exception:
+            pass
+        # Redraw graph from model (rebuild not strictly necessary, but
+        # ensures lines and positions are recalculated).  We call
+        # `_build_and_draw` with the current orgnr so that the graph is
+        # reconstructed using existing depth and threshold settings.
+        self._build_and_draw(self.current_orgnr)
+
+    # ------------------------------------------------------------------
+    # Left panel toggle
+    # ------------------------------------------------------------------
+    def _toggle_left_panel(self) -> None:
+        """
+        Collapse or expand the left panel.  When collapsed, the left
+        pane containing the search and owners table is removed from
+        the PanedWindow so that the canvas occupies all available
+        space.  When expanded, the pane is reinserted.
+        The toggle button's arrow changes direction accordingly.
+        """
+        # If currently expanded, remove left_frame
+        if not getattr(self, "left_collapsed", False):
+            try:
+                self.content.forget(self.left_frame)
+            except Exception:
+                pass
+            self.left_collapsed = True
+            # Change button arrow to right-pointing triangle
+            self.toggle_btn.config(text="▶")  # ▶
+        else:
+            # Insert left_frame back into panedwindow as first pane
+            try:
+                # Ensure left_frame isn't already in content
+                self.content.add(self.left_frame, weight=1)
+                # Optionally reorder panes: PanedWindow adds at end; we want left
+                # so we may remove and re-add right_frame to reorder
+            except Exception:
+                pass
+            self.left_collapsed = False
+            # Change button arrow to left-pointing triangle
+            self.toggle_btn.config(text="◀")  # ◀
 
     # ------------------------------------------------------------------
     # Public entry point

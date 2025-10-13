@@ -521,8 +521,9 @@ def parse_saft(input_path: Path, outdir: Path) -> None:
                 "RecordID": rec_id or "", "Type": _first(el, ["AnalysisType"]) or "",
                 "ID": _first(el, ["AnalysisID"]) or "", "Amount": f"{_amount_of(el,'Amount') or DEC(0)}"
             })
+            # Important: do NOT delete previous siblings here; we still need other children
+            # (e.g., AccountID, DebitAmount) of the parent <Line> until the line end event.
             el.clear()
-            while el.getprevious() is not None: del el.getparent()[0]
 
         # SourceDocuments – Sales & Purchase (for DueDate i aging)
         if evt == "end" and tag == "Invoice":
@@ -566,8 +567,9 @@ def parse_saft(input_path: Path, outdir: Path) -> None:
                     "DebitTotal": f"{cur_voucher.debit}", "CreditTotal": f"{cur_voucher.credit}", "Balanced": "Y" if balanced else "N"
                 })
             cur_voucher = None
+            # Important: do NOT delete previous siblings here; we still need other children
+            # (e.g., AccountID, DebitAmount) of the parent <Line> until the line end event.
             el.clear()
-            while el.getprevious() is not None: del el.getparent()[0]
 
         # stream root GC
         if root is None:
