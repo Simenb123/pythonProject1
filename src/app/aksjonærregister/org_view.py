@@ -54,8 +54,12 @@ class OrgChartCanvas(tk.Canvas):
     }
     ROOT_OUTLINE_WIDTH = 3
 
-    def __init__(self, master: tk.Misc, on_node_click: Optional[Callable[[Node], None]] = None,
+    def __init__(self,
+                 master: tk.Misc,
+                 on_node_click: Optional[Callable[[Node], None]] = None,
                  on_node_double_click: Optional[Callable[[Node], None]] = None,
+                 *,
+                 read_only: bool = False,
                  **kwargs: Any) -> None:
         super().__init__(master, background="white", highlightthickness=0, **kwargs)
         # Callback invoked when a node is clicked; receives Node instance
@@ -103,6 +107,9 @@ class OrgChartCanvas(tk.Canvas):
         # Zoom state; 1.0 is default. Adjust via zoom_in/zoom_out methods
         self._zoom = 1.0
 
+        # Read-only flag: if True, disable dragging and selection interactions.
+        self.read_only = read_only
+
         # Bind Control+MouseWheel for zooming (Ctrl+scroll up/down)
         # Use a generic MouseWheel binding and check the Control modifier bit (0x0004).
         # This allows consistent zoom behaviour across platforms.
@@ -111,8 +118,9 @@ class OrgChartCanvas(tk.Canvas):
         self.bind("<ButtonPress-3>", self._start_pan)
         self.bind("<B3-Motion>", self._on_pan)
 
-        # Bindings for dragging (the events will be bound on each node tag)
-        # These generic bindings ensure that unhandled drags don't flood events.
+        # Bindings for dragging and selection.  If read_only is True,
+        # clicks will still trigger node selection/details, but dragging
+        # and rectangle selection are disabled in the handlers themselves.
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_motion)
         self.bind("<ButtonRelease-1>", self._on_release)
@@ -568,6 +576,20 @@ class OrgChartCanvas(tk.Canvas):
             item_id = item[0]
             node_id = self._item_to_node.get(item_id)
             if node_id:
+                # In read-only mode: treat this as a simple click.  Do not allow
+                # selection rectangle or dragging.  Just highlight and invoke callback.
+                if self.read_only:
+                    # Clear selection and highlight this node
+                    self._clear_selection()
+                    self.selected_nodes.add(node_id)
+                    self._highlight_node(node_id)
+                    # Invoke click callback if provided
+                    if self._on_node_click_callback and hasattr(self, "model"):
+                        node_obj = self.model.nodes.get(node_id)  # type: ignore[attr-defined]
+                        if node_obj:
+                            self._on_node_click_callback(node_obj)
+                    return
+                # Not read-only: handle selection and start drag as usual
                 # Modifier keys: Shift (0x0001), Control (0x0004)
                 shift_pressed = (event.state & 0x0001) != 0
                 ctrl_pressed = (event.state & 0x0004) != 0
@@ -598,6 +620,9 @@ class OrgChartCanvas(tk.Canvas):
         shift_pressed = (event.state & 0x0001) != 0
         if not shift_pressed:
             self._clear_selection()
+        # In read-only mode, do not start selection rectangle
+        if self.read_only:
+            return
         # Record starting point in canvas coordinates
         self._selection_start = (self.canvasx(event.x), self.canvasy(event.y))
         # Draw rectangle (initial zero size).  Use dashed outline for clarity.
@@ -611,6 +636,9 @@ class OrgChartCanvas(tk.Canvas):
 
     def _on_motion(self, event: tk.Event) -> None:
         """Handle mouse movement while button 1 is held (dragging)."""
+        # Ignore dragging if in read-only mode
+        if self.read_only:
+            return
         # If selection rectangle is active, update its size
         if self._selection_rect_id is not None and self._selection_start is not None:
             # Update rectangle coordinates based on drag
@@ -651,6 +679,15 @@ class OrgChartCanvas(tk.Canvas):
 
     def _on_release(self, event: tk.Event) -> None:
         """Handle mouse button release (end dragging or click)."""
+        # In read-only mode, ignore release events (no dragging or selection)
+        if self.read_only:
+            # Clear drag state and selection rectangle if any
+            if self._selection_rect_id is not None:
+                self.delete(self._selection_rect_id)
+                self._selection_rect_id = None
+                self._selection_start = None
+            self._drag_data = {}
+            return
         # If a selection rectangle was being dragged, finalize the selection
         if self._selection_rect_id is not None and self._selection_start is not None:
             # Get rectangle coords (x0,y0,x1,y1) in canvas coordinates

@@ -37,7 +37,6 @@ Merk:
 from __future__ import annotations
 
 import argparse
-import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -132,13 +131,6 @@ def _coerce_amount(s: pd.Series) -> pd.Series:
     )
     out.loc[~eu] = pd.to_numeric(raw.loc[~eu], errors="coerce")
     return out.fillna(0.0)
-
-
-def _digits_only(v) -> Optional[str]:
-    if v is None:
-        return None
-    s = re.sub(r"\D", "", str(v))
-    return s or None
 
 
 def _to_int_safe(v) -> Optional[int]:
@@ -411,17 +403,29 @@ def compute_statement(sb: pd.DataFrame,
     - Formel overstyrer automatisk sum der det finnes.
     - Fortegn for resultatlinjer (hvis apply_resultat_fortegn=True).
     """
-    # 1) Sikre 'regnr' i saldobalansen
-    if "regnr" not in sb.columns or sb["regnr"].isna().all():
+    # 1) Sikre 'regnr' i saldobalansen (robust: håndter blanke/tekstlige regnr)
+    sb = sb.copy()
+    if "regnr" in sb.columns:
+        regnr_num = pd.to_numeric(sb["regnr"], errors="coerce")
+    else:
+        regnr_num = pd.Series([np.nan] * len(sb), index=sb.index)
+
+    need_map = ("regnr" not in sb.columns) or regnr_num.isna().all()
+    if need_map:
         if intervals is None:
             raise ValueError("Saldobalansen mangler 'regnr', og mapping (--map) er ikke gitt.")
-        sb = sb.copy()
         sb["regnr"] = map_accounts_to_regnr(sb, intervals)
-    sb["regnr"] = pd.to_numeric(sb["regnr"], errors="coerce").astype("Int64")
+    else:
+        sb["regnr"] = regnr_num.astype("Int64")
 
     # 2) Aggreger kontosummer pr. regnr
     aggr = sb.groupby("regnr")[["IB", "Endring", "UB"]].sum().reset_index()
     aggr.rename(columns={"regnr": "nr"}, inplace=True)
+
+    # Hvis aggr blir tom (alle regnr NaN), gi en tydelig feilmelding
+    if aggr.empty:
+        raise ValueError("Ingen konti ble mappet til regnr. "
+                         "Sjekk at mapping-filen (intervaller) peker mot gyldige detalj-«nr» i Regnskapslinjer.")
 
     # 3) Normaliser regnskapslinjer
     rl = rl.copy()
@@ -454,6 +458,11 @@ def compute_statement(sb: pd.DataFrame,
     for c in ("IB", "Endring", "UB"):
         det[c] = det[c].fillna(0.0)
 
+    # Hvis det er 0 rader i 'det', betyr det at ingen detaljlinjer i RL matchet mappede nr
+    if det.empty:
+        raise ValueError("Ingen detaljlinjer i Regnskapslinjer matchet mappede regnr fra saldobalansen. "
+                         "Sjekk at intervallene peker mot detalj-«nr» (ikke sumrader), og at 'sumnivå' for detaljer er 0 eller 1.")
+
     # 5) Anvend fortegn for resultatlinjer
     if apply_resultat_fortegn:
         is_resultat = det["regnskapstype"].astype(str).str.lower().str.startswith("resultat")
@@ -480,10 +489,9 @@ def compute_statement(sb: pd.DataFrame,
             "UB": float(r["UB"]),
         }
     # summer (per nivå)
-    rl_levels = rl.set_index("nr")["sumnivå"].to_dict()
     for s in sums:
         for _, r in s.iterrows():
-            nr = _to_int_safe(r["nr"])
+            nr = int(pd.to_numeric(r["nr"], errors="coerce")) if pd.notna(r["nr"]) else None
             if nr is None:
                 continue
             # Sett/overstyr – vi henter ALLTID sum direkte fra detaljer
@@ -497,8 +505,31 @@ def compute_statement(sb: pd.DataFrame,
     if "formel" in rl.columns:
         # Evaluer formler *etter* at detalj og nivåsummer er på plass
         rl_formel = rl.loc[rl["formel"].astype(str).str.strip().ne("")].copy()
-        # For robusthet: evaluer i stigende rekkefølge av nr (ikke strikt nødvendig)
         rl_formel = rl_formel.sort_values("nr")
+        def _parse_formula(expr: str) -> List[Tuple[int, int]]:
+            s = str(expr).strip()
+            if not s:
+                return []
+            if s.startswith("="):
+                s = s[1:]
+            token = ""
+            sign = 1
+            out: List[Tuple[int, int]] = []
+            for ch in s:
+                if ch in "+-":
+                    if token.strip():
+                        m = re.search(r"\d+", token)
+                        if m:
+                            out.append((sign, int(m.group(0))))
+                    token = ""
+                    sign = (1 if ch == "+" else -1)
+                else:
+                    token += ch
+            if token.strip():
+                m = re.search(r"\d+", token)
+                if m:
+                    out.append((sign, int(m.group(0))))
+            return out
         for _, row in rl_formel.iterrows():
             nr = _to_int_safe(row["nr"])
             if nr is None:
@@ -531,7 +562,6 @@ def compute_statement(sb: pd.DataFrame,
             "formel": str(r.get("formel", "")),
         })
     oppstilling = pd.DataFrame(rows)
-    # sortér på nr (men bevar opprinnelig hvis ønskelig)
     oppstilling = oppstilling.sort_values("nr").reset_index(drop=True)
 
     # 10) Detaljtabell for drilldown

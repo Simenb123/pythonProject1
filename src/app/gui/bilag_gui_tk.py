@@ -1292,6 +1292,20 @@ class App(tk.Tk):
         # Klargjør SB fra dagens DataFrame
         sb = self._sb_from_df(self.df_full)
 
+
+        # Sikkerhet: advar hvis IB/Endring/UB summerer til 0 (typisk hvis kilde=Hovedbok)
+        try:
+            _tot_sum = float(abs(sb.get("IB", 0)).sum() + abs(sb.get("Endring", 0)).sum() + abs(sb.get("UB", 0)).sum())
+        except Exception:
+            _tot_sum = 0.0
+        if _tot_sum == 0.0:
+            messagebox.showwarning(
+                "Ingen tall i saldobalanse",
+                "Aktivt datasett ser ut til å mangle IB/Endring/UB (sum=0).\n"
+                "Er du sikker på at du har valgt *saldobalanse* som kilde?\n"
+                "Hvis ja, sjekk at kolonnene blir gjenkjent (synonymer) og at intervall‑mappingen peker på detalj‑nr.",
+                parent=self,
+            )
         # Beregn med kjedemodellen
         try:
             res = kj_compute_statement(sb, df_rl, intervals=intervals, apply_resultat_fortegn=True)

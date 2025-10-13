@@ -44,20 +44,54 @@ class OrgChartApp(tk.Tk):
     """
     A simple Tkinter application for exploring ownership structures.
 
+    Parameters
+    ----------
+    editable : bool, optional
+        If ``True`` (default), the user can drag nodes, multi‑select
+        and reposition them freely.  If ``False``, the graph is
+        read‑only: drag and multi‑select are disabled, but clicking
+        nodes still shows details.  This is useful for å bruke
+        aksjonærregisteret som oppslagsverk.
+
+    root_orgnr : Optional[str], optional
+        If provided, this orgnr is used as the initial root company.  The
+        app will automatically search for this organisation number and
+        select it, bypassing the manual search.  If not found, the
+        user must search manually.
+
+    layout_path : Optional[str], optional
+        Path to a JSON file used to persist node positions.  When
+        launching in editable modus for en klient, set ``layout_path``
+        to e.g. ``"/path/to/client/orgchart_layout.json"``.  The app
+        will attempt to load this file at startup and save node
+        coordinates to it via ``save_layout()``.  No saving is done
+        automatically; call ``save_layout()`` yourself when needed.
+
     The app presents a search bar for looking up companies by name or
     orgnr, a list of matching companies, and an interactive canvas
     showing the ownership graph for the selected company.  A details
     pane shows information about the currently selected node in the
-    graph.  Users can drag nodes to reposition them for clarity.
-
-    The application can be extended with editing features (adding
-    ownership relations) by updating the model and redrawing the
-    canvas.  Saving and loading of user modifications can be added
-    later via JSON (see OrgChartModel for suggestions).
+    graph.
     """
 
-    def __init__(self) -> None:
+    def __init__(self,
+                 *,
+                 editable: bool = True,
+                 root_orgnr: Optional[str] = None,
+                 layout_path: Optional[str] = None,
+                 ) -> None:
         super().__init__()
+        # Store editable flag and layout path.  When ``editable`` is
+        # False, the graph is read‑only: drag and multi‑select are
+        # disabled.  ``root_orgnr`` may be supplied to automatically
+        # select a company on startup.  ``layout_path`` points to a
+        # JSON file that stores node positions when editing a client
+        #‑specific org chart.  See :meth:`save_layout` and
+        # :meth:`load_layout` for details.
+        self.editable: bool = editable
+        self.root_orgnr_arg: Optional[str] = root_orgnr
+        self.layout_path: Optional[str] = layout_path
+
         self.title("Aksjonærregister – interaktiv orgkart (Tkinter)")
         # Default window size; user can resize
         self.geometry("1200x800")
@@ -69,8 +103,42 @@ class OrgChartApp(tk.Tk):
         self.current_orgnr: Optional[str] = None
         # Current OrgChartModel
         self.model: Optional[OrgChartModel] = None
+
         # Build UI components
         self._build_ui()
+
+        # Automatically select a root company if supplied.  This is
+        # handy when launching the app from a client hub: the
+        # ``root_orgnr_arg`` is used to prefill the search field, set
+        # the search mode to organisation number and trigger the search.
+        if self.root_orgnr_arg:
+            # Set search term to the provided orgnr
+            self.search_var.set(self.root_orgnr_arg)
+            # Switch search mode to orgnr
+            self.search_by.set("orgnr")
+            # Perform the search
+            self._do_search()
+            # Automatically select the first result (if any)
+            root_items = self.result_tree.get_children()
+            if root_items:
+                self.result_tree.selection_set(root_items[0])
+                # Trigger selection handler to load model and draw graph
+                self._on_select_company()
+
+        # If a layout file is provided, we will load it after
+        # building the model.  The actual loading is deferred to
+        # :meth:`_build_and_draw` so that the model is available.
+
+        # When editing is enabled and a layout path is given, save
+        # node positions on close.  Override the window close protocol
+        # so that ``save_layout`` is invoked before the window is
+        # destroyed.  Read‑only/lookups should not write any files.
+        if self.editable and self.layout_path:
+            self.protocol("WM_DELETE_WINDOW", self._on_close)
+        else:
+            # Default close behaviour
+            self.protocol("WM_DELETE_WINDOW", self.destroy)
+
 
     # ------------------------------------------------------------------
     # UI construction
@@ -193,11 +261,15 @@ class OrgChartApp(tk.Tk):
         right_frame = ttk.Frame(content)
         content.add(right_frame, weight=2)
 
-        # Canvas for drawing the graph
+        # Canvas for drawing the graph.  Pass read_only based on the
+        # editable flag: when editing is disabled, the canvas will
+        # disable drag/selection interactions but still allow clicks
+        # for details.
         self.canvas = OrgChartCanvas(
             right_frame,
             on_node_click=self._on_node_click,
             on_node_double_click=self._on_node_double_click,
+            read_only=not self.editable,
         )
         # Put canvas in a scrollable frame to allow panning
         canvas_scroll_y = ttk.Scrollbar(right_frame, orient=tk.VERTICAL, command=self.canvas.yview)
@@ -368,6 +440,12 @@ class OrgChartApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Feil", f"Kunne ikke bygge graf: {exc}")
             return
+        # If a layout file exists and editing is enabled, load node positions
+        if self.editable and self.layout_path:
+            try:
+                self.load_layout()
+            except Exception:
+                pass
         # Attach model to canvas so edges update when dragging
         self.canvas.set_model(self.model)
         # Draw graph
@@ -457,6 +535,68 @@ class OrgChartApp(tk.Tk):
         # `_build_and_draw` with the current orgnr so that the graph is
         # reconstructed using existing depth and threshold settings.
         self._build_and_draw(self.current_orgnr)
+
+    # ------------------------------------------------------------------
+    # Layout persistence
+    # ------------------------------------------------------------------
+    def save_layout(self) -> None:
+        """Save current node positions to ``self.layout_path``.
+
+        When editing is enabled and ``layout_path`` is provided, this
+        method writes a JSON file mapping node IDs to their ``x`` and
+        ``y`` coordinates.  Coordinates are stored in model space
+        (before zoom/scaling).  If no model is loaded or no
+        ``layout_path`` is defined, nothing is saved.
+        """
+        # Only save when editing and layout_path are set
+        if not (self.editable and self.layout_path and self.model):
+            return
+        import json
+        try:
+            data = {nid: [node.x, node.y] for nid, node in self.model.nodes.items()}
+            with open(self.layout_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception as exc:
+            print(f"Error saving layout to {self.layout_path}: {exc}")
+
+    def load_layout(self) -> None:
+        """Load node positions from ``self.layout_path`` into the current model.
+
+        If a layout file exists, it is parsed as JSON and any node IDs
+        found in the model have their ``x`` and ``y`` coordinates
+        updated to the saved values.  Unknown node IDs are ignored.
+        If no model is loaded or ``layout_path`` is undefined, this
+        method has no effect.
+        """
+        if not (self.layout_path and self.model):
+            return
+        import json, os
+        if not os.path.exists(self.layout_path):
+            return
+        try:
+            with open(self.layout_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        for nid, coords in data.items():
+            if nid in self.model.nodes and isinstance(coords, (list, tuple)) and len(coords) == 2:
+                try:
+                    x, y = float(coords[0]), float(coords[1])
+                    self.model.nodes[nid].x = x
+                    self.model.nodes[nid].y = y
+                except Exception:
+                    continue
+
+    def _on_close(self) -> None:
+        """Window close handler for editable mode.
+
+        When editing is enabled and a layout path is provided, save
+        the layout before destroying the window.  Otherwise just
+        destroy the window.
+        """
+        if self.editable and self.layout_path:
+            self.save_layout()
+        self.destroy()
 
     # ------------------------------------------------------------------
     # Left panel toggle

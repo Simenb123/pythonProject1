@@ -1,6 +1,6 @@
 from __future__ import annotations
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 import subprocess, sys
 from pathlib import Path
 
@@ -53,7 +53,9 @@ class ClientHub(tk.Toplevel):
         ttk.Button(btns, text="Analyse",        command=lambda: self._start_bilag("analyse")).grid(row=0, column=0, padx=4)
         ttk.Button(btns, text="Bilagsuttrekk",  command=lambda: self._start_bilag("uttrekk")).grid(row=0, column=1, padx=4)
         ttk.Button(btns, text="Mapping …",      command=self._ensure_mapping_now).grid(row=0, column=2, padx=4)
-        ttk.Button(btns, text="Åpne klientmappe", command=self._open_folder).grid(row=0, column=3, padx=4)
+        # New: button to open interactive org chart for this client
+        ttk.Button(btns, text="Eierskap", command=self._open_orgchart).grid(row=0, column=3, padx=4)
+        ttk.Button(btns, text="Åpne klientmappe", command=self._open_folder).grid(row=0, column=4, padx=4)
 
         self._on_year_change()
 
@@ -125,3 +127,50 @@ class ClientHub(tk.Toplevel):
             subprocess.Popen(args, shell=False)
         except Exception as exc:
             messagebox.showerror("Feil", f"Kunne ikke starte Bilag-GUI: {exc}", parent=self)
+
+    # -------- Eierskap (orgkart) ----------
+    def _open_orgchart(self) -> None:
+        """
+        Launch the interactive ownership chart for the current client.
+
+        If the client's organisasjonsnummer (``KLIENT_ORGNR``) is not
+        already stored in the metadata, the user is prompted to enter
+        it.  The value is persisted to the client's ``meta.json``
+        file.  A layout file named ``orgchart_layout.json`` in the
+        client's root directory is used to load/save node positions
+        when editing.  The org chart is launched in a separate
+        process via ``run_orgchart.py`` with appropriate command line
+        arguments.
+        """
+        # Ensure metadata exists
+        if not hasattr(self, 'meta') or self.meta is None:
+            self.meta = {}
+        orgnr = self.meta.get("KLIENT_ORGNR")
+        if not orgnr:
+            # ask the user for the organisation number
+            orgnr = simpledialog.askstring(
+                "Organisasjonsnummer",
+                "Skriv organisasjonsnummer for klienten",
+                parent=self,
+            )
+            if not orgnr:
+                return  # user cancelled
+            # Save to meta
+            self.meta["KLIENT_ORGNR"] = orgnr
+            save_meta(self.root_dir, self.client, self.meta)
+        # Determine layout path under client directory
+        layout_path = Path(self.root_dir) / self.client / "orgchart_layout.json"
+        try:
+            import subprocess, sys
+            # Path to run_orgchart.py in the same directory as this file
+            script_path = Path(__file__).with_name("run_orgchart.py")
+            args = [
+                sys.executable,
+                str(script_path),
+                f"--orgnr={orgnr}",
+                "--editable",
+                f"--layout={layout_path}",
+            ]
+            subprocess.Popen(args, shell=False)
+        except Exception as exc:
+            messagebox.showerror("Feil", f"Kunne ikke starte eierskapskart: {exc}", parent=self)
