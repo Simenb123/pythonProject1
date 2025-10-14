@@ -6,20 +6,19 @@ Utvidet med opsjon for aksjonærregister-sjekk.
 
 Kjørbar direkte (Run i IDE) ELLER via -m.
 """
+from __future__ import annotations
 
 # ====== BOOTSTRAP så fila kan kjøres direkte ======
 if __name__ == "__main__" and __package__ is None:
     import sys, pathlib
     here = pathlib.Path(__file__).resolve()
-    for up in range(2, 6):  # parents[2] .. parents[5]
+    for up in range(2, 6):
         cand = here.parents[up] / "src"
         if cand.exists():
             sys.path.insert(0, str(cand))
             __package__ = "app.ICRtracker"
             break
 # ==================================================
-
-from __future__ import annotations
 
 import csv
 import re
@@ -29,12 +28,19 @@ from pathlib import Path
 import win32com.client  # pywin32
 from openpyxl import load_workbook
 
-# --- AR-kobling (valgfri) ---
+# --- AR-kobling (adapter først, fallback til standard) ---
 try:
-    from .registry_db import open_db, get_owners, companies_owned_by, normalize_orgnr
+    from .db_compat_adapter import open_db, get_owners, companies_owned_by, normalize_orgnr
     AR_AVAILABLE = True
+    print("Bruker db_compat_adapter (eksisterende AR-DB).")
 except Exception:
-    AR_AVAILABLE = False
+    try:
+        from .registry_db import open_db, get_owners, companies_owned_by, normalize_orgnr  # type: ignore
+        AR_AVAILABLE = True
+        print("Bruker registry_db (standard holdings/companies).")
+    except Exception:
+        AR_AVAILABLE = False
+        print("AR-kobling ikke tilgjengelig – kjører uten aksjonær-sjekk.")
 
 # ========================== KONFIG ==========================
 SENDER_EMAIL = "IRC-Norway@no.gt.com"

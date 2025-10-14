@@ -462,7 +462,7 @@ class A07App(BaseTk):
         # generalised to support multiple codes per account.  Use lists of
         # strings as values.  When a list contains more than one code, the
         # account's amount will be split equally among those codes.
-        self.acc_to_codes: Dict[str, List[str]] = {}
+        self.acc_to_codess: Dict[str, List[str]] = {}
         self.auto_suggestions: Dict[str, Dict[str,Any]] = {}
 
         self.gl_basis = tk.StringVar(value="auto")
@@ -746,10 +746,10 @@ class A07App(BaseTk):
             # Hvis koden er tom eller None, fjern mapping for denne kontoen; ellers sett
             if code:
                 # Legg til eller erstatte mapping.  Vi bruker kun én kode per konto for nå
-                self.acc_to_codes[str(accno)] = [str(code)]
+                self.acc_to_codess[str(accno)] = [str(code)]
             else:
                 try:
-                    self.acc_to_codes.pop(str(accno), None)
+                    self.acc_to_codess.pop(str(accno), None)
                 except Exception:
                     pass
             self.use_lp_assignment = False
@@ -888,7 +888,7 @@ class A07App(BaseTk):
         except Exception as e:
             messagebox.showerror("Feil ved lesing", f"Kunne ikke lese CSV: {e}"); return
         self.gl_accounts = rows; self.gl_meta = meta
-        self.acc_to_codes.clear(); self.auto_suggestions.clear()
+        self.acc_to_codess.clear(); self.auto_suggestions.clear()
         self.use_lp_assignment = False; self.lp_assignment.clear(); self.lp_fixed.clear(); self.lp_amounts.clear()
         self.ctrl_status.configure(text=f"Saldobalanse: {len(rows)} konti.  Kolonner: IB={'ja' if meta.get('ib') else 'nei'}, D={'ja' if meta.get('debet') else 'nei'}, K={'ja' if meta.get('kredit') else 'nei'}, Endr={'ja' if meta.get('endring') else 'nei'}, UB={'ja' if meta.get('ub') else 'nei'}  • Enc: {meta.get('encoding')} • Sep: '{meta.get('delimiter')}'")
         self.refresh_control_tables()
@@ -906,7 +906,7 @@ class A07App(BaseTk):
             accno = acc["konto"]
             if accno in suggestions:
                 # Replace any existing mapping with a single‑code list
-                self.acc_to_codes[accno] = [suggestions[accno]["kode"]]
+                self.acc_to_codess[accno] = [suggestions[accno]["kode"]]
         self.use_lp_assignment = False
         # Etter at regelbok/fallback har foreslått koder, forsøk enkel beløpsmatch
         try:
@@ -936,9 +936,9 @@ class A07App(BaseTk):
                 accno = self.tbl_gl.item(item, "values")[0]
                 if val:
                     # Set a single‑code list for this account
-                    self.acc_to_codes[accno] = [val]
+                    self.acc_to_codess[accno] = [val]
                 else:
-                    self.acc_to_codes.pop(accno, None)
+                    self.acc_to_codess.pop(accno, None)
             self.use_lp_assignment = False
             win.destroy(); self.refresh_control_tables()
         ttk.Button(box, text="OK", command=ok).pack(side=tk.RIGHT); ttk.Button(box, text="Avbryt", command=win.destroy).pack(side=tk.RIGHT, padx=6)
@@ -949,13 +949,13 @@ class A07App(BaseTk):
         for item in sel:
             accno = self.tbl_gl.item(item, "values")[0]
             # Fjern mapping for denne kontoen (kan være én eller flere koder)
-            self.acc_to_codes.pop(accno, None)
+            self.acc_to_codess.pop(accno, None)
         self.use_lp_assignment = False
         self.refresh_control_tables()
 
     def on_reset_mapping(self):
         if messagebox.askyesno("Nullstill mapping", "Fjern all mapping (manuell + auto + LP)?"):
-            self.acc_to_codes.clear(); self.auto_suggestions.clear()
+            self.acc_to_codess.clear(); self.auto_suggestions.clear()
             self.use_lp_assignment = False; self.lp_assignment.clear(); self.lp_fixed.clear(); self.lp_amounts.clear()
             self.refresh_control_tables()
 
@@ -981,7 +981,7 @@ class A07App(BaseTk):
         # Beregn GL-sum per kode med gjeldende mapping (uten LP)
         gl_per_code: Dict[str, float] = defaultdict(float)
         for acc in self.gl_accounts:
-            codes = self.acc_to_codes.get(acc["konto"])
+            codes = self.acc_to_codess.get(acc["konto"])
             if not codes:
                 continue
             amt, _lbl = self._gl_amount(acc)
@@ -1012,7 +1012,7 @@ class A07App(BaseTk):
             matched = False
         for acc in self.gl_accounts:
             accno = acc["konto"]
-            if accno in self.acc_to_codes:
+            if accno in self.acc_to_codess:
                 continue
                 try:
                     amt, _lbl = self._gl_amount(acc)
@@ -1021,7 +1021,7 @@ class A07App(BaseTk):
                 try:
                     if abs(float(amt) - target) <= thr:
                         # Sett mapping og gå videre til neste kode
-                        self.acc_to_codes[accno] = [code]
+                        self.acc_to_codess[accno] = [code]
                         matched = True
                         break
                 except Exception:
@@ -1032,7 +1032,7 @@ class A07App(BaseTk):
                 remaining: List[Tuple[str, float]] = []
                 for acc2 in self.gl_accounts:
                     accno2 = acc2["konto"]
-                    if accno2 in self.acc_to_code:
+                    if accno2 in self.acc_to_codes:
                         continue
                     try:
                         amt2, _lbl2 = self._gl_amount(acc2)
@@ -1048,8 +1048,8 @@ class A07App(BaseTk):
                         try:
                             if abs((amt_i + amt_j) - target) <= thr:
                                 # Kartlegg begge kontiene til koden
-                                self.acc_to_codes[acc_i] = [code]
-                                self.acc_to_codes[acc_j] = [code]
+                                self.acc_to_codess[acc_i] = [code]
+                                self.acc_to_codess[acc_j] = [code]
                                 matched = True
                                 break
                         except Exception:
@@ -1104,11 +1104,11 @@ class A07App(BaseTk):
             messagebox.showerror("LP-feil", str(e)); return
 
         self.lp_assignment = assignment; self.use_lp_assignment = True
-        self.acc_to_codes.clear()
+        self.acc_to_codess.clear()
         for accno, parts in assignment.items():
             if parts:
                 code = max(parts.items(), key=lambda kv: kv[1])[0]
-                self.acc_to_codes[accno] = [code]
+                self.acc_to_codess[accno] = [code]
         self.refresh_control_tables()
         messagebox.showinfo("Optimalisering", "LP‑løsning ferdig. Avstemmingstabellen er oppdatert.")
 
@@ -1222,11 +1222,19 @@ class A07App(BaseTk):
                 # When choosing an alternative code, replace any existing
                 # mappings with a single‑code list.  Using a list allows
                 # accounts to be mapped to multiple codes in the future.
-                self.acc_to_codes[self._detail_accno] = [code]
+                self.acc_to_codess[self._detail_accno] = [code]
                 self.use_lp_assignment = False
                 self.refresh_control_tables()
         except Exception:
             pass
+
+
+def _get_first_code(self, accno: str) -> str:
+    """Returner første valgte kode for kontoen (hvis listen brukes), ellers tom streng."""
+    v = self.acc_to_codes.get(accno)
+    if isinstance(v, (list, tuple)):
+        return v[0] if v else ""
+    return v or ""
 
     def _refresh_gl_detail_panel(self, accno: str):
         self._detail_accno = accno
@@ -1246,7 +1254,7 @@ class A07App(BaseTk):
         # Retrieve chosen code from our multi-code mapping.  If the account
         # has been mapped to one or more codes, display the first code
         # in the list.  Otherwise fall back to the suggestion.
-        codes = self.acc_to_codes.get(accno)
+        codes = self.acc_to_codess.get(accno)
         if isinstance(codes, (list, tuple)):
             chosen = codes[0] if codes else ""
         else:
@@ -1279,7 +1287,7 @@ class A07App(BaseTk):
             if self.hide_zero.get() and abs(s) < 1e-9 and abs(float(acc.get("ub",0.0))) < 1e-9: continue
             if q and (q not in str(acc["konto"]).lower()) and (q not in str(acc.get("navn","")).lower()): continue
             sugg = self.auto_suggestions.get(acc["konto"], {})
-            codes = self.acc_to_codes.get(acc["konto"])
+            codes = self.acc_to_codess.get(acc["konto"])
             if isinstance(codes, (list, tuple)):
                 chosen = codes[0] if codes else ""
             else:
@@ -1322,7 +1330,7 @@ class A07App(BaseTk):
                 gl_per_code[code] += float(fx)
         else:
             for acc in self.gl_accounts:
-                codes = self.acc_to_codes.get(acc["konto"])
+                codes = self.acc_to_codess.get(acc["konto"])
                 if not codes:
                     continue
                 amt, _ = self._gl_amount(acc)
@@ -1338,7 +1346,7 @@ class A07App(BaseTk):
                     for spec in rule.get("special_add", []):
                         accno = str(spec.get("account","")); basis = str(spec.get("basis","endring")).lower(); weight = float(spec.get("weight", 1.0))
                         # Skip if account is already mapped in our multi-code mapping
-                        if accno in self.acc_to_codes:
+                        if accno in self.acc_to_codess:
                             continue
                         for acc in self.gl_accounts:
                             if str(acc.get("konto")) == accno:
@@ -1356,7 +1364,7 @@ class A07App(BaseTk):
             rowsB = [r for r in rowsB if abs(float(r["diff"])) > thr]
         rowsB.sort(key=lambda r: -abs(float(r["diff"]))); self.tbl_ctrl_codes.insert_rows(rowsB)
         self.lab_a07.configure(text=f"A07: {fmt_amount(total_a07)}"); self.lab_gl.configure(text=f"GL (mappet): {fmt_amount(total_gl)}"); self.lab_diff.configure(text=f"Diff: {fmt_amount(total_a07-total_gl)}")
-        unmapped = [acc for acc in self.gl_accounts if acc["konto"] not in self.acc_to_code]
+        unmapped = [acc for acc in self.gl_accounts if acc["konto"] not in self.acc_to_codes]
         self.lab_unmapped.configure(text=f"Uten mapping: {len([a for a in unmapped if not(self.hide_zero.get() and abs(self._gl_amount(a)[0])<1e-9)])}")
         self.lab_code_gap.configure(text=f"Koder uten GL: {len([c for c in a07 if gl_per_code.get(c,0.0)==0.0])}")
 
@@ -1375,14 +1383,14 @@ class A07App(BaseTk):
                 # DnD board by taking the first code in each list.  This board
                 # implementation currently expects a ``Dict[str,str]``.
                 mapping_for_board: Dict[str,str] = {}
-                for accno, codes in self.acc_to_codes.items():
+                for accno, codes in self.acc_to_codess.items():
                     if isinstance(codes, (list, tuple)) and codes:
                         mapping_for_board[accno] = codes[0]
                     elif isinstance(codes, str):
                         mapping_for_board[accno] = codes
                 self.board.supply_data(
                     accounts=accounts_for_board,
-                    acc_to_code=mapping_for_board,
+                    acc_to_codes=mapping_for_board,
                     suggestions=self.auto_suggestions,
                     a07_sums=a07,
                     diff_threshold=float(self.diff_threshold.get()),
@@ -1421,7 +1429,7 @@ class A07App(BaseTk):
                     gl_data.append({"konto": acc["konto"], "navn": acc.get("navn",""), "belop": amt, "basis": f"{lbl}·LP"})
         else:
             for acc in self.gl_accounts:
-                if self.acc_to_code.get(acc["konto"]) == kode:
+                if kode in (self.acc_to_codes.get(acc["konto"], []) if isinstance(self.acc_to_codes.get(acc["konto"]), (list, tuple, set)) else [self.acc_to_codes.get(acc["konto"])]) :
                     amt,lbl = self._gl_amount(acc)
                     gl_data.append({"konto": acc["konto"], "navn": acc.get("navn",""), "belop": amt, "basis": lbl})
         win = tk.Toplevel(self); win.title(f"Drilldown — {kode}"); win.geometry("1000x560")
