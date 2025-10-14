@@ -4,11 +4,21 @@ IRC-Tracker: Hent Outlook-eposter, lagre Excel-vedlegg, plukk 'Unique ID',
 match mot klientliste (KLIENT_ORGNR) og skriv match_rapport.csv.
 Utvidet med opsjon for aksjonærregister-sjekk.
 
-Krever: pip install pywin32 openpyxl
-Miljø: Windows + Outlook (logget inn)
-
-Denne versjonen bygger på tidligere tracker.py (Outlook/Excel-delen er bevart).  # ref: eksisterende fil
+Kjørbar direkte (Run i IDE) ELLER via -m.
 """
+
+# ====== BOOTSTRAP så fila kan kjøres direkte ======
+if __name__ == "__main__" and __package__ is None:
+    import sys, pathlib
+    here = pathlib.Path(__file__).resolve()
+    for up in range(2, 6):  # parents[2] .. parents[5]
+        cand = here.parents[up] / "src"
+        if cand.exists():
+            sys.path.insert(0, str(cand))
+            __package__ = "app.ICRtracker"
+            break
+# ==================================================
+
 from __future__ import annotations
 
 import csv
@@ -27,28 +37,20 @@ except Exception:
     AR_AVAILABLE = False
 
 # ========================== KONFIG ==========================
-# Riktig avsender (OBS: sjekk domenet – ofte "no.gt.com")
 SENDER_EMAIL = "IRC-Norway@no.gt.com"
-
-# Hvor langt tilbake i tid vi leter
 LOOKBACK_DAYS = 14
 
-# Hvor lagre vedlegg + hvor skrive rapport
 DOWNLOAD_DIR = Path(r"F:\Dokument\Kildefiler\irc\irc_vedlegg")
 RAPPORT_FIL  = Path(r"F:\Dokument\Kildefiler\irc\rapporter\match_rapport.csv")
 
-# Klientliste (foretrekker .xlsx med kolonnen 'KLIENT_ORGNR', men .csv støttes)
 KLIENTLISTE  = Path(r"F:\Dokument\Kildefiler\BHL AS klientliste - kopi.xlsx")
 
-# Ekstra: skriv en utvidet rapport med aksjonærregister-funn fra epostvedlegg
-REGISTRY_DB_PATH = Path(r"F:\Dokument\Kildefiler\aksjonarregister.db")  # pek til SQLite hvis du vil kjøre AR-sjekk
+REGISTRY_DB_PATH = Path(r"F:\Dokument\Kildefiler\aksjonarregister.db")  # pek til eksisterende .db
 RAPPORT_AR_FRA_EPOST = Path(r"F:\Dokument\Kildefiler\irc\rapporter\ar_funn_fra_epost.csv")
 
-# Skal vi sette Outlook-kategori på meldinger med treff?
 SET_OUTLOOK_CATEGORY = True
 OUTLOOK_CATEGORY_NAME = "Processed (IRC)"
 
-# Hent fra delt postboks i stedet for din primære?
 SHARED_MAILBOX_DISPLAYNAME = ""
 # ===========================================================
 
@@ -56,15 +58,14 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 def normalize_orgnr_local(val) -> str:
-    # lokal fallback hvis registry_db ikke er importert
     if AR_AVAILABLE:
         return normalize_orgnr(val)
     if val is None:
         return ""
     return re.sub(r"\D+", "", str(val))
 
+# ---------- klientliste ----------
 def read_client_orgs(path: Path) -> set[str]:
-    """Les klientliste fra .xlsx (KLIENT_ORGNR) eller .csv (orgnr/klient_orgnr/organisasjonsnummer)."""
     import csv
     from openpyxl import load_workbook
     if not path.exists():
@@ -114,15 +115,14 @@ def read_client_orgs(path: Path) -> set[str]:
     else:
         raise ValueError(f"Ukjent klientliste-format: {ext}")
 
-# ------------- Outlook utils -------------
-
+# ---------- Outlook ----------
 def get_namespace():
     return win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
 
 def get_root_folder(ns):
     if SHARED_MAILBOX_DISPLAYNAME.strip():
         return ns.Folders[SHARED_MAILBOX_DISPLAYNAME]
-    return ns.GetDefaultFolder(6).Parent
+    return ns.GetDefaultFolder(6).Parent  # rot for din postboks
 
 def walk_all_mail_folders(root_folder):
     folders=[]
@@ -212,8 +212,7 @@ def mark_processed(msg):
     except Exception:
         pass
 
-# --------- Excel vedlegg: finn 'Unique ID' og les verdiene --------------
-
+# ---------- Excel 'Unique ID' ----------
 def find_unique_id_col(ws):
     for i, row in enumerate(ws.iter_rows(min_row=1, max_row=50, values_only=True), start=1):
         if not any(row):
@@ -248,17 +247,14 @@ def extract_unique_ids(xlsx_path: Path):
             break
     return [x for x in ids if x]
 
-# --------------------------- MAIN ---------------------------
-
+# ---------- MAIN ----------
 def main():
     ensure_dir(DOWNLOAD_DIR)
     ensure_dir(RAPPORT_FIL.parent)
 
-    # 1) Klientliste (sett av orgnr for kjapp membership-test)
     client_orgs = read_client_orgs(KLIENTLISTE)
     print(f"Klientliste: {len(client_orgs)} orgnr lastet fra {KLIENTLISTE}")
 
-    # 2) Epost
     msgs = fetch_messages_from_sender(SENDER_EMAIL)
     print(f"Fant {len(msgs)} meldinger fra {SENDER_EMAIL} siste {LOOKBACK_DAYS} dager.")
 
@@ -266,8 +262,7 @@ def main():
     rows_ar=[]
     total_saved=0
 
-    # Åpne AR DB hvis konfigurert
-    ar_conn = None
+    ar_conn=None
     if AR_AVAILABLE and REGISTRY_DB_PATH and REGISTRY_DB_PATH.exists():
         try:
             ar_conn = open_db(REGISTRY_DB_PATH)
@@ -299,9 +294,8 @@ def main():
                     "match": hit
                 })
 
-                # Ekstra: slå opp i aksjonærregisteret for dette orgnr
                 if ar_conn:
-                    # 2a) eiere av org
+                    # eiere av org
                     for r in get_owners(ar_conn, org):
                         rel_hit = (normalize_orgnr_local(r["shareholder_orgnr"]) in client_orgs) if r["shareholder_orgnr"] else False
                         rows_ar.append({
@@ -317,7 +311,7 @@ def main():
                             "shares": r["shares"],
                             "flag_client_crosshit": "JA" if rel_hit else "NEI"
                         })
-                    # 2b) selskaper som org eier
+                    # selskaper org eier
                     for r in companies_owned_by(ar_conn, org):
                         rel_hit = (normalize_orgnr_local(r["company_orgnr"]) in client_orgs)
                         rows_ar.append({
@@ -327,7 +321,7 @@ def main():
                             "client_orgnr": org,
                             "direction": "owns",
                             "related_orgnr": r["company_orgnr"],
-                            "related_name": r.get("company_name","") if isinstance(r, dict) else (r["company_name"] if "company_name" in r.keys() else ""),
+                            "related_name": (r.get("company_name","") if hasattr(r, "get") else r["company_name"]),
                             "related_type": "company",
                             "stake_percent": r["stake_percent"],
                             "shares": r["shares"],
@@ -337,7 +331,7 @@ def main():
         if SET_OUTLOOK_CATEGORY and matches_found > 0:
             mark_processed(msg)
 
-    # 3) Rapporter
+    # Rapporter
     with RAPPORT_FIL.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["received","subject","attachment","orgnr","match"])
         writer.writeheader(); writer.writerows(rows_basic)

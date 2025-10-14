@@ -6,12 +6,23 @@ Kommandolinjeverktøy for å:
   - skanne klientliste mot registeret
   - skrive CSV-rapport + (valgfri) SQLite auditlog
 
-Eksempler:
-  python -m ICRtracker.scan_registry --import-csv "D:\\data\\aksjonarregister2024.csv" --db "D:\\data\\ar.db"
-  python -m ICRtracker.scan_registry --db "D:\\data\\ar.db" --clients "F:\\Dokument\\Kildefiler\\BHL AS klientliste - kopi.xlsx" --out "F:\\Dokument\\Kildefiler\\irc\\rapporter\\ar_match_report.csv"
+Kjørbar direkte (Run i IDE) ELLER via -m.
 """
-from __future__ import annotations
 
+# ====== BOOTSTRAP så fila kan kjøres direkte ======
+if __name__ == "__main__" and __package__ is None:
+    import sys, pathlib
+    here = pathlib.Path(__file__).resolve()
+    # prøv å finne <prosjektrot>/src automatisk
+    for up in range(2, 6):  # parents[2] .. parents[5]
+        cand = here.parents[up] / "src"
+        if cand.exists():
+            sys.path.insert(0, str(cand))
+            __package__ = "app.ICRtracker"
+            break
+# ==================================================
+
+from __future__ import annotations
 import argparse
 from pathlib import Path
 
