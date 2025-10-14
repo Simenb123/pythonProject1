@@ -2,6 +2,7 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import subprocess, sys
+import os
 from pathlib import Path
 
 from app.services.clients import (
@@ -22,7 +23,11 @@ class ClientHub(tk.Toplevel):
         self.resizable(False, False)
 
         self.client = client_name
+        # root directory for this client – used by VersionsPanel and other services
         self.root_dir = getattr(master, "clients_root")
+        # inherit kildefiler_dir from master if present (used to locate central client list)
+        self.kildefiler_dir = getattr(master, "kildefiler_dir", None)
+        # load per‑client metadata
         self.meta = load_meta(self.root_dir, self.client)
 
         frm = ttk.Frame(self, padding=10); frm.grid(row=0, column=0, sticky="nsew")
@@ -45,8 +50,13 @@ class ClientHub(tk.Toplevel):
         ttk.Radiobutton(frm, text="Saldobalanse", variable=self.source, value="saldobalanse").grid(row=2, column=2, sticky="w")
 
         # Versjonspaneler
-        self.hb_panel = VersionsPanel(frm, "hovedbok");     self.hb_panel.grid(row=3, column=0, columnspan=4, sticky="we")
-        self.sb_panel = VersionsPanel(frm, "saldobalanse"); self.sb_panel.grid(row=4, column=0, columnspan=4, sticky="we")
+        # The VersionsPanel needs access to attributes like root_dir, so we use ``self`` as master
+        # and place the widgets into the frame via the ``in_`` parameter.  This avoids
+        # AttributeError on Frame (no root_dir).
+        self.hb_panel = VersionsPanel(self, "hovedbok")
+        self.hb_panel.grid(row=3, column=0, columnspan=4, sticky="we", in_=frm)
+        self.sb_panel = VersionsPanel(self, "saldobalanse")
+        self.sb_panel.grid(row=4, column=0, columnspan=4, sticky="we", in_=frm)
 
         # Knapper
         btns = ttk.Frame(frm); btns.grid(row=5, column=0, columnspan=4, sticky="we", pady=(10,0))
@@ -142,12 +152,26 @@ class ClientHub(tk.Toplevel):
         process via ``run_orgchart.py`` with appropriate command line
         arguments.
         """
+        """
+        Launch the interactive ownership chart for the current client.
+
+        The organisation number is looked up automatically from metadata
+        (``KLIENT_ORGNR``) or, if missing, from the central client list.
+        Only if it still can't be found will the user be prompted to
+        provide it.  The value is persisted to ``meta.json`` when
+        entered.  The org chart is launched using ``-m app.gui.run_orgchart``
+        rather than invoking the script directly; this ensures that
+        relative imports in ``org_controller.py`` resolve correctly.
+        """
         # Ensure metadata exists
         if not hasattr(self, 'meta') or self.meta is None:
             self.meta = {}
         orgnr = self.meta.get("KLIENT_ORGNR")
         if not orgnr:
-            # ask the user for the organisation number
+            # Attempt to find orgnr automatically from client list
+            orgnr = self._find_client_orgnr()
+        if not orgnr:
+            # As a last resort, ask the user
             orgnr = simpledialog.askstring(
                 "Organisasjonsnummer",
                 "Skriv organisasjonsnummer for klienten",
@@ -155,15 +179,17 @@ class ClientHub(tk.Toplevel):
             )
             if not orgnr:
                 return  # user cancelled
-            # Save to meta
+        # Save orgnr to meta if new
+        if orgnr and self.meta.get("KLIENT_ORGNR") != orgnr:
             self.meta["KLIENT_ORGNR"] = orgnr
             save_meta(self.root_dir, self.client, self.meta)
         # Determine layout path under client directory
         layout_path = Path(self.root_dir) / self.client / "orgchart_layout.json"
         try:
-            import subprocess, sys
-            # Path to run_orgchart.py in the same directory as this file
+            # Construct the path to run_orgchart.py relative to this file
             script_path = Path(__file__).with_name("run_orgchart.py")
+            # Invoke the script directly.  run_orgchart.py adjusts sys.path to
+            # allow importing org_controller and db when run as a script.
             args = [
                 sys.executable,
                 str(script_path),
@@ -174,3 +200,62 @@ class ClientHub(tk.Toplevel):
             subprocess.Popen(args, shell=False)
         except Exception as exc:
             messagebox.showerror("Feil", f"Kunne ikke starte eierskapskart: {exc}", parent=self)
+
+    def _find_client_orgnr(self) -> str | None:
+        """
+        Attempt to find the client's organisasjonsnummer from the central
+        Excel client list.  Returns None if not found or an error occurs.
+        """
+        """
+        Attempt to find the client's organisation number from the central Excel client list.
+        The search uses the kildefiler directory inherited from the master (if available),
+        otherwise falls back to the default ``find_kildefiler_dir``.  Returns None if
+        not found or if an error occurs.
+        """
+        try:
+            import pandas as pd  # type: ignore
+        except Exception:
+            return None
+        # Determine the client name portion (after number) and normalise
+        parts = str(self.client).split(" ", 1)
+        client_name = parts[1].strip().lower() if len(parts) > 1 else ""
+        if not client_name:
+            return None
+        # Determine base directory for "Kildefiler".  Use master-provided override
+        base_dir: Path | None = None
+        if getattr(self, "kildefiler_dir", None):
+            base_dir = self.kildefiler_dir
+        if not base_dir:
+            # Fall back to the helper from regnskapslinjer
+            try:
+                from app.services.regnskapslinjer import find_kildefiler_dir  # type: ignore
+                found = find_kildefiler_dir()
+                if found:
+                    base_dir = Path(found)
+            except Exception:
+                base_dir = None
+        if not base_dir:
+            return None
+        # List of possible filenames for the client list
+        for fn in ["BHL AS klientliste - kopi.xlsx", "BHL AS klientliste.xlsx", "BHLAS klientliste.xlsx"]:
+            fpath = base_dir / fn
+            if not fpath.exists():
+                continue
+            try:
+                df = pd.read_excel(fpath)  # type: ignore
+            except Exception:
+                continue
+            # Build a mapping of lowercase column names to actual names
+            lower = {str(c).strip().lower(): c for c in df.columns}
+            org_col = next((lower[c] for c in lower if c in {"klient_orgnr", "orgnr", "organisasjonsnummer"}), None)
+            name_col = next((lower[c] for c in lower if c in {"klient_navn", "navn", "client_navn"}), None)
+            if org_col and name_col:
+                sub = df[[name_col, org_col]].dropna()
+                for _, row in sub.iterrows():
+                    nm = str(row[name_col]).strip().lower()
+                    if nm == client_name:
+                        val = str(row[org_col]).strip()
+                        import re
+                        digits = re.sub(r"[^0-9]", "", val)
+                        return digits or val
+        return None

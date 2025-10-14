@@ -41,9 +41,19 @@ class StartPortal(tk.Tk):
         super().__init__()
         self.title("Start – Klientportal")
         self.minsize(720, 420)
-
-        # sørg for at Klienthub kan lese master.clients_root (brukes i ClientHub.__init__) :contentReference[oaicite:5]{index=5}
+        # sørg for at Klienthub kan lese master.clients_root (brukes i ClientHub.__init__)
         self.clients_root = get_clients_root()
+        # Slå opp kildefiler‑katalogen via regnskapslinjer-modulen hvis mulig.
+        # Dette feltet brukes i _load_team_data og _load_clients_from_excel hvis det er satt.
+        self.kildefiler_dir: Path | None = None
+        try:
+            from app.services.regnskapslinjer import find_kildefiler_dir  # type: ignore
+            kdir = find_kildefiler_dir()
+            if kdir:
+                self.kildefiler_dir = Path(kdir)
+        except Exception:
+            # fallback: None; bruk eksisterende logikk for å finne kildefiler
+            pass
         # ensure we have a valid clients root; if not, prompt the user
         if not self.clients_root or not self.clients_root.exists():
             self._choose_root()
@@ -67,6 +77,11 @@ class StartPortal(tk.Tk):
 
         ttk.Checkbutton(header, text="Mine klienter", variable=self.only_mine, command=self._refresh_list)\
             .grid(row=0, column=3, sticky="e", padx=(8, 8))
+
+        # Legg til et innstillingshjul for å velge kildefiler‑katalog.
+        # Ikonet ⚙ signaliserer at brukeren kan endre eller sjekke katalog for kildefiler.
+        settings_btn = ttk.Button(header, text="⚙", width=3, command=self._choose_kildefiler_dir)
+        settings_btn.grid(row=0, column=4, sticky="e", padx=(8, 8))
 
         # søk
         wrap = ttk.Frame(self); wrap.pack(fill="both", expand=True, padx=8, pady=8)
@@ -112,6 +127,29 @@ class StartPortal(tk.Tk):
         self.emp_df: pd.DataFrame
         self.client_to_initials: dict[int, set[str]]
         self.email_to_initial: dict[str, str]
+        self._load_team_data()
+        self._refresh_list()
+
+    # ---------------- Settings helpers ----------------
+    def _choose_kildefiler_dir(self) -> None:
+        """
+        Allow the user to select the base directory for "Kildefiler".  When a new
+        directory is selected, reload the client list and team data.  This
+        directory will override the default lookup in _load_team_data and
+        _load_clients_from_excel.
+        """
+        p = filedialog.askdirectory(title="Velg kildefiler‑katalog", parent=self)
+        if not p:
+            return
+        self.kildefiler_dir = Path(p)
+        # Reload all dependent data using the new kildefiler_dir
+        try:
+            self._load_clients_from_excel()
+        except Exception:
+            try:
+                self._all_clients = list_clients(self.clients_root)
+            except Exception:
+                self._all_clients = []
         self._load_team_data()
         self._refresh_list()
 
