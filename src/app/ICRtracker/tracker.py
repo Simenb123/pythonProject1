@@ -2,7 +2,7 @@
 """
 IRC-Tracker: Hent Outlook-eposter, lagre Excel-vedlegg, plukk 'Unique ID',
 match mot klientliste (KLIENT_ORGNR) og skriv match_rapport.csv.
-Utvidet med opsjon for aksjonærregister-sjekk.
+Utvidet med opsjon for aksjonærregister-sjekk via ar_bridge eller registry_db.
 
 Kjørbar direkte (Run i IDE) ELLER via -m.
 """
@@ -12,7 +12,8 @@ from __future__ import annotations
 if __name__ == "__main__" and __package__ is None:
     import sys, pathlib
     here = pathlib.Path(__file__).resolve()
-    for up in range(2, 6):
+    # forsøk å finne <prosjektrot>/src automatisk
+    for up in range(2, 7):
         cand = here.parents[up] / "src"
         if cand.exists():
             sys.path.insert(0, str(cand))
@@ -28,35 +29,44 @@ from pathlib import Path
 import win32com.client  # pywin32
 from openpyxl import load_workbook
 
-# --- AR-kobling (adapter først, fallback til standard) ---
+# --- AR-kobling (prøv broen først, med tydelig feillogging) ---
+AR_AVAILABLE = False
+AR_BACKEND = "none"
+
 try:
-    from .db_compat_adapter import open_db, get_owners, companies_owned_by, normalize_orgnr
+    from .ar_bridge import open_db, get_owners, companies_owned_by, normalize_orgnr
     AR_AVAILABLE = True
-    print("Bruker db_compat_adapter (eksisterende AR-DB).")
-except Exception:
+    AR_BACKEND = "ar_bridge"
+    print("tracker: ar_bridge aktiv (aksjonaerregister).")
+except Exception as e:
+    print(f"tracker: ar_bridge feilet: {e!r}")
     try:
         from .registry_db import open_db, get_owners, companies_owned_by, normalize_orgnr  # type: ignore
         AR_AVAILABLE = True
-        print("Bruker registry_db (standard holdings/companies).")
-    except Exception:
+        AR_BACKEND = "registry_db"
+        print("tracker: registry_db (standard).")
+    except Exception as e2:
         AR_AVAILABLE = False
-        print("AR-kobling ikke tilgjengelig – kjører uten aksjonær-sjekk.")
+        AR_BACKEND = "none"
+        print(f"tracker: AR-kobling ikke tilgjengelig: {e2!r}")
 
 # ========================== KONFIG ==========================
-SENDER_EMAIL = "IRC-Norway@no.gt.com"
-LOOKBACK_DAYS = 14
+SENDER_EMAIL = "IRC-Norway@no.gt.com"             # Avsender å filtrere på
+LOOKBACK_DAYS = 14                                 # Hvor langt tilbake vi leter
 
 DOWNLOAD_DIR = Path(r"F:\Dokument\Kildefiler\irc\irc_vedlegg")
 RAPPORT_FIL  = Path(r"F:\Dokument\Kildefiler\irc\rapporter\match_rapport.csv")
 
 KLIENTLISTE  = Path(r"F:\Dokument\Kildefiler\BHL AS klientliste - kopi.xlsx")
 
-REGISTRY_DB_PATH = Path(r"F:\Dokument\Kildefiler\aksjonarregister.db")  # pek til eksisterende .db
+# For ar_bridge ignoreres stien; for registry_db peker den til SQLite-DB
+REGISTRY_DB_PATH = Path(r"F:\Dokument\Kildefiler\aksjonarregister.db")
 RAPPORT_AR_FRA_EPOST = Path(r"F:\Dokument\Kildefiler\irc\rapporter\ar_funn_fra_epost.csv")
 
 SET_OUTLOOK_CATEGORY = True
 OUTLOOK_CATEGORY_NAME = "Processed (IRC)"
 
+# Sett denne hvis epostene ligger i delt postboks (visningsnavn eller e-postadresse)
 SHARED_MAILBOX_DISPLAYNAME = ""
 # ===========================================================
 
@@ -73,51 +83,58 @@ def normalize_orgnr_local(val) -> str:
 # ---------- klientliste ----------
 def read_client_orgs(path: Path) -> set[str]:
     import csv
-    from openpyxl import load_workbook
     if not path.exists():
         raise FileNotFoundError(f"Fant ikke klientliste: {path}")
     ext = path.suffix.lower()
-    orgs = set()
-    if ext in {".xlsx",".xlsm"}:
+    orgs: set[str] = set()
+
+    if ext in {".xlsx", ".xlsm"}:
         wb = load_workbook(filename=path, data_only=True, read_only=True)
         ws = wb.active
         header = [str(c or "").strip().lower() for c in next(ws.iter_rows(min_row=1, max_row=1, values_only=True))]
+
         def pick(*alts):
             for a in alts:
                 if a in header:
                     return header.index(a)
             return None
-        i_org = pick("klient_orgnr","orgnr","organisasjonsnummer")
+
+        i_org = pick("klient_orgnr", "orgnr", "organisasjonsnummer")
         if i_org is None:
             raise ValueError("Fant ikke kolonne 'KLIENT_ORGNR'/'orgnr' i klientlista.")
         for row in ws.iter_rows(min_row=2, values_only=True):
-            org = normalize_orgnr_local(row[i_org] if len(row)>i_org else "")
+            org = normalize_orgnr_local(row[i_org] if len(row) > i_org else "")
             if org:
                 orgs.add(org)
         return orgs
-    elif ext==".csv":
-        def read_csv(encoding:str) -> set[str]:
-            s=set()
-            with path.open("r",encoding=encoding,newline="") as f:
-                r=csv.DictReader(f)
-                hdr=[h.lower().strip() for h in (r.fieldnames or [])]
+
+    elif ext == ".csv":
+        def read_csv(encoding: str) -> set[str]:
+            s: set[str] = set()
+            with path.open("r", encoding=encoding, newline="") as f:
+                r = csv.DictReader(f)
+                hdr = [h.lower().strip() for h in (r.fieldnames or [])]
+
                 def pick(*alts):
                     for a in alts:
                         if a in hdr:
                             return a
                     return None
-                col = pick("klient_orgnr","orgnr","organisasjonsnummer")
+
+                col = pick("klient_orgnr", "orgnr", "organisasjonsnummer")
                 if not col:
                     raise ValueError("CSV: fant ikke kolonne for orgnr.")
                 for row in r:
-                    n = normalize_orgnr_local(row.get(col,""))
+                    n = normalize_orgnr_local(row.get(col, ""))
                     if n:
                         s.add(n)
             return s
+
         try:
             return read_csv("utf-8-sig")
         except UnicodeDecodeError:
             return read_csv("latin-1")
+
     else:
         raise ValueError(f"Ukjent klientliste-format: {ext}")
 
@@ -131,11 +148,11 @@ def get_root_folder(ns):
     return ns.GetDefaultFolder(6).Parent  # rot for din postboks
 
 def walk_all_mail_folders(root_folder):
-    folders=[]
+    folders = []
     def rec(f):
         folders.append(f)
         try:
-            for i in range(1, f.Folders.Count+1):
+            for i in range(1, f.Folders.Count + 1):
                 rec(f.Folders.Item(i))
         except Exception:
             pass
@@ -148,11 +165,11 @@ def robust_received_filter():
 
 def get_smtp_address(msg) -> str:
     try:
-        if getattr(msg,"SenderEmailType","")=="EX":
+        if getattr(msg, "SenderEmailType", "") == "EX":
             exu = msg.Sender.GetExchangeUser()
             if exu:
                 return (exu.PrimarySmtpAddress or "").lower()
-        smtp = (getattr(msg,"SenderEmailAddress","") or "").lower()
+        smtp = (getattr(msg, "SenderEmailAddress", "") or "").lower()
         if smtp:
             return smtp
     except Exception:
@@ -170,15 +187,15 @@ def fetch_messages_from_sender(sender_email: str):
     root = get_root_folder(ns)
     folders = walk_all_mail_folders(root)
     since, since_str = robust_received_filter()
-    matched=[]
+    matched = []
     for f in folders:
         try:
-            items=f.Items
+            items = f.Items
             items.Sort("[ReceivedTime]", True)
             try:
                 candidates = items.Restrict(f"[ReceivedTime] >= '{since_str}'")
             except Exception:
-                candidates = [m for m in items if getattr(m,"ReceivedTime",datetime.min) >= since]
+                candidates = [m for m in items if getattr(m, "ReceivedTime", datetime.min) >= since]
             for m in candidates:
                 try:
                     if get_smtp_address(m) == sender_email:
@@ -190,14 +207,14 @@ def fetch_messages_from_sender(sender_email: str):
     return matched
 
 def save_excel_attachments(msg, dest_dir: Path):
-    saved=[]
-    atts = getattr(msg,"Attachments",None)
+    saved = []
+    atts = getattr(msg, "Attachments", None)
     if not atts:
         return saved
-    for i in range(1, atts.Count+1):
+    for i in range(1, atts.Count + 1):
         att = atts.Item(i)
-        name=str(att.FileName)
-        if name.lower().endswith((".xlsx",".xlsm")):
+        name = str(att.FileName)
+        if name.lower().endswith((".xlsx", ".xlsm")):
             try:
                 path = dest_dir / f"{msg.EntryID[:8]}_{name}"
                 att.SaveAsFile(str(path))
@@ -210,10 +227,10 @@ def mark_processed(msg):
     if not SET_OUTLOOK_CATEGORY:
         return
     try:
-        cats=[c.strip() for c in (msg.Categories or "").split(",") if c.strip()]
+        cats = [c.strip() for c in (msg.Categories or "").split(",") if c.strip()]
         if OUTLOOK_CATEGORY_NAME not in cats:
             cats.append(OUTLOOK_CATEGORY_NAME)
-            msg.Categories=", ".join(cats)
+            msg.Categories = ", ".join(cats)
             msg.Save()
     except Exception:
         pass
@@ -231,7 +248,7 @@ def find_unique_id_col(ws):
     return None, None
 
 def extract_unique_ids(xlsx_path: Path):
-    ids=[]
+    ids = []
     wb = load_workbook(filename=xlsx_path, data_only=True)
     for ws in wb.worksheets:
         header_row, col = find_unique_id_col(ws)
@@ -241,7 +258,7 @@ def extract_unique_ids(xlsx_path: Path):
         empty = 0
         while True:
             val = ws.cell(row=r, column=col).value
-            if val is None or str(val).strip()=="":
+            if val is None or str(val).strip() == "":
                 empty += 1
                 if empty >= 3:
                     break
@@ -264,17 +281,20 @@ def main():
     msgs = fetch_messages_from_sender(SENDER_EMAIL)
     print(f"Fant {len(msgs)} meldinger fra {SENDER_EMAIL} siste {LOOKBACK_DAYS} dager.")
 
-    rows_basic=[]
-    rows_ar=[]
-    total_saved=0
+    rows_basic = []
+    rows_ar = []
+    total_saved = 0
 
-    ar_conn=None
-    if AR_AVAILABLE and REGISTRY_DB_PATH and REGISTRY_DB_PATH.exists():
+    # Åpne AR (hvis tilgjengelig)
+    ar_conn = None
+    if AR_AVAILABLE:
         try:
+            # ar_bridge ignorerer REGISTRY_DB_PATH; registry_db bruker den
             ar_conn = open_db(REGISTRY_DB_PATH)
-            print(f"AR-kobling aktiv: {REGISTRY_DB_PATH}")
+            print(f"AR-kobling aktiv. Backend={AR_BACKEND}")
         except Exception as e:
-            print(f"Kunne ikke åpne AR-db: {e}")
+            print(f"Kunne ikke åpne AR-backend ({AR_BACKEND}): {e}")
+            ar_conn = None
 
     for msg in msgs:
         subject = getattr(msg, "Subject", "")
@@ -300,55 +320,67 @@ def main():
                     "match": hit
                 })
 
+                # AR-oppslag
                 if ar_conn:
                     # eiere av org
-                    for r in get_owners(ar_conn, org):
-                        rel_hit = (normalize_orgnr_local(r["shareholder_orgnr"]) in client_orgs) if r["shareholder_orgnr"] else False
-                        rows_ar.append({
-                            "received": received_iso,
-                            "subject": subject,
-                            "attachment": f.name,
-                            "client_orgnr": org,
-                            "direction": "owned_by",
-                            "related_orgnr": r["shareholder_orgnr"] or "",
-                            "related_name": r["shareholder_name"] or "",
-                            "related_type": r["shareholder_type"] or "",
-                            "stake_percent": r["stake_percent"],
-                            "shares": r["shares"],
-                            "flag_client_crosshit": "JA" if rel_hit else "NEI"
-                        })
+                    try:
+                        for r in get_owners(ar_conn, org):
+                            rel_hit = (normalize_orgnr_local(r["shareholder_orgnr"]) in client_orgs) if r["shareholder_orgnr"] else False
+                            rows_ar.append({
+                                "received": received_iso,
+                                "subject": subject,
+                                "attachment": f.name,
+                                "client_orgnr": org,
+                                "direction": "owned_by",
+                                "related_orgnr": r["shareholder_orgnr"] or "",
+                                "related_name": r["shareholder_name"] or "",
+                                "related_type": r["shareholder_type"] or "",
+                                "stake_percent": r["stake_percent"],
+                                "shares": r["shares"],
+                                "flag_client_crosshit": "JA" if rel_hit else "NEI"
+                            })
+                    except Exception as e:
+                        print(f"AR owners-feil for {org}: {e}")
+
                     # selskaper org eier
-                    for r in companies_owned_by(ar_conn, org):
-                        rel_hit = (normalize_orgnr_local(r["company_orgnr"]) in client_orgs)
-                        rows_ar.append({
-                            "received": received_iso,
-                            "subject": subject,
-                            "attachment": f.name,
-                            "client_orgnr": org,
-                            "direction": "owns",
-                            "related_orgnr": r["company_orgnr"],
-                            "related_name": (r.get("company_name","") if hasattr(r, "get") else r["company_name"]),
-                            "related_type": "company",
-                            "stake_percent": r["stake_percent"],
-                            "shares": r["shares"],
-                            "flag_client_crosshit": "JA" if rel_hit else "NEI"
-                        })
+                    try:
+                        for r in companies_owned_by(ar_conn, org):
+                            rel_hit = (normalize_orgnr_local(r["company_orgnr"]) in client_orgs)
+                            rows_ar.append({
+                                "received": received_iso,
+                                "subject": subject,
+                                "attachment": f.name,
+                                "client_orgnr": org,
+                                "direction": "owns",
+                                "related_orgnr": r["company_orgnr"],
+                                "related_name": r.get("company_name","") if hasattr(r, "get") else r["company_name"],
+                                "related_type": "company",
+                                "stake_percent": r["stake_percent"],
+                                "shares": r["shares"],
+                                "flag_client_crosshit": "JA" if rel_hit else "NEI"
+                            })
+                    except Exception as e:
+                        print(f"AR children-feil for {org}: {e}")
 
         if SET_OUTLOOK_CATEGORY and matches_found > 0:
             mark_processed(msg)
 
     # Rapporter
     with RAPPORT_FIL.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["received","subject","attachment","orgnr","match"])
-        writer.writeheader(); writer.writerows(rows_basic)
+        writer = csv.DictWriter(f, fieldnames=["received", "subject", "attachment", "orgnr", "match"])
+        writer.writeheader()
+        writer.writerows(rows_basic)
 
     if rows_ar:
         ensure_dir(RAPPORT_AR_FRA_EPOST.parent)
         with RAPPORT_AR_FRA_EPOST.open("w", encoding="utf-8", newline="") as f:
-            fieldnames = ["received","subject","attachment","client_orgnr","direction",
-                          "related_orgnr","related_name","related_type","stake_percent","shares","flag_client_crosshit"]
+            fieldnames = [
+                "received", "subject", "attachment", "client_orgnr", "direction",
+                "related_orgnr", "related_name", "related_type", "stake_percent", "shares", "flag_client_crosshit"
+            ]
             w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader(); w.writerows(rows_ar)
+            w.writeheader()
+            w.writerows(rows_ar)
 
     print(f"\nFerdig. {len(rows_basic)} linjer skrevet til: {RAPPORT_FIL}")
     if rows_ar:

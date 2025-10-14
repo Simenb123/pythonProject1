@@ -4,7 +4,7 @@ matcher.py
 Relasjonslogikk mellom klientliste og aksjonærregister.
 
 - Leser klientliste (xlsx/csv) -> [{'orgnr','navn'}]
-- Finner direkte og indirekte relasjoner via registry_db ELLER db_compat_adapter
+- Finner direkte og indirekte relasjoner via AR (ar_bridge) ELLER registry_db
 - Fuzzy navn med rapidfuzz (hvis tilgjengelig) eller difflib
 """
 from __future__ import annotations
@@ -16,22 +16,21 @@ from typing import Dict, List, Tuple
 
 from openpyxl import load_workbook
 
-# --- AR-kobling (adapter først, fallback til standard) ---
+# --- AR-kobling (bro først, fallback til registry_db) ---
 try:
-    from .db_compat_adapter import (
+    from .ar_bridge import (
         open_db, get_owners, companies_owned_by, get_company_name, search_name_candidates,
         normalize_orgnr, normalize_name,
     )
-    USING_ADAPTER = True
-    # print("matcher.py: bruker db_compat_adapter")
+    # print("matcher.py: bruker ar_bridge -> aksjonaerregister")
 except Exception:
     from .registry_db import (
         open_db, get_owners, companies_owned_by, get_company_name, search_name_candidates,
         normalize_orgnr, normalize_name,
     )
-    USING_ADAPTER = False
     # print("matcher.py: bruker registry_db")
 
+# Fuzzy score
 try:
     from rapidfuzz import fuzz
     def _score(a: str, b: str) -> int:
@@ -56,7 +55,7 @@ def load_clients(path: Path) -> List[Dict[str, str]]:
         i_navn = pick("klient_navn", "navn", "klientnavn", "company_name")
         if i_org is None:
             raise ValueError("Fant ikke kolonne for orgnr i klientlista.")
-        out = []
+        out: List[Dict[str, str]] = []
         for row in ws.iter_rows(min_row=2, values_only=True):
             org = normalize_orgnr(row[i_org] if len(row) > i_org else "")
             navn = normalize_name(row[i_navn] if (i_navn is not None and len(row) > i_navn) else "")
@@ -66,7 +65,7 @@ def load_clients(path: Path) -> List[Dict[str, str]]:
 
     elif ext == ".csv":
         def read_csv(encoding: str) -> List[Dict[str, str]]:
-            out = []
+            out: List[Dict[str, str]] = []
             with path.open("r", encoding=encoding, newline="") as f:
                 r = csv.DictReader(f)
                 hdr = [h.lower().strip() for h in (r.fieldnames or [])]

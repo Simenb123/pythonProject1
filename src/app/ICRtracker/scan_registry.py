@@ -2,8 +2,8 @@
 """
 scan_registry.py
 Kommandolinjeverktøy for å:
-  - importere aksjonærregister (CSV) til SQLite (valgfritt)
-  - skanne klientliste mot registeret
+  - (valgfritt) importere AR CSV -> DB via registry_db
+  - skanne klientliste mot registeret (via matcher + ar_bridge)
   - skrive CSV-rapport + (valgfri) SQLite auditlog
 
 Kjørbar direkte (Run i IDE) ELLER via -m.
@@ -25,19 +25,20 @@ if __name__ == "__main__" and __package__ is None:
 import argparse
 from pathlib import Path
 
-# --- AR-kobling (adapter først, fallback til standard) ---
+# --- AR-kobling (bro først, fallback til registry_db) ---
 try:
-    from .db_compat_adapter import open_db, get_owners, companies_owned_by, normalize_orgnr  # noqa: F401
-    print("Bruker db_compat_adapter (eksisterende AR-DB).")
+    from .ar_bridge import open_db  # bruker matcher for resten
+    print("scan_registry: ar_bridge aktiv (aksjonaerregister).")
 except Exception:
-    from .registry_db import import_csv_to_db, open_db  # type: ignore
-    print("Bruker registry_db (standard holdings/companies).")
+    from .registry_db import open_db  # type: ignore
+    from .registry_db import import_csv_to_db  # type: ignore
+    print("scan_registry: registry_db (standard).")
 
 from .matcher import load_clients, scan_all_clients
 from .reporting import write_csv, open_audit, log_findings
 
 # ---------- Standardverdier (så du kan trykke Run uten arguments) ----------
-DEFAULT_DB       = r"F:\Dokument\Kildefiler\aksjonarregister.db"
+DEFAULT_DB       = r"F:\Dokument\Kildefiler\aksjonarregister.db"  # For registry_db-varianten (ikke brukt av ar_bridge)
 DEFAULT_CLIENTS  = r"F:\Dokument\Kildefiler\BHL AS klientliste - kopi.xlsx"
 DEFAULT_OUT      = r"F:\Dokument\Kildefiler\irc\rapporter\ar_match_report.csv"
 DEFAULT_AUDIT_DB = ""  # f.eks. r"F:\Dokument\Kildefiler\irc\rapporter\audit_findings.db"
@@ -49,8 +50,8 @@ FIELDS = [
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--import-csv", help="Rå CSV fra aksjonærregisteret (stor)")
-    ap.add_argument("--db", default=DEFAULT_DB, help="SQLite databasefil for aksjonærregisteret")
+    ap.add_argument("--import-csv", help="Rå CSV for registry_db (ikke brukt av ar_bridge)")
+    ap.add_argument("--db", default=DEFAULT_DB, help="SQLite databasefil (registry_db). Ikke nødvendig med ar_bridge.")
     ap.add_argument("--clients", default=DEFAULT_CLIENTS, help="Klientliste (xlsx/csv)")
     ap.add_argument("--out", default=DEFAULT_OUT, help="CSV-rapport ut")
     ap.add_argument("--min-name-score", type=int, default=90)
@@ -59,12 +60,12 @@ def main():
 
     db_path = Path(args.db)
 
-    # 1) Importer CSV -> DB (valgfritt – kun støttet av registry_db-varianten)
+    # 1) (Valgfritt) Importer CSV -> DB (kun hvis du bruker registry_db-varianten)
     if args.import_csv:
         try:
             import_csv_to_db  # type: ignore[attr-defined]
         except Exception:
-            print("Import ikke tilgjengelig via adapter – hoppet over.")
+            print("Import ikke tilgjengelig via ar_bridge – hoppet over.")
         else:
             import_csv_to_db(Path(args.import_csv), db_path)  # type: ignore[attr-defined]
             print(f"Import ferdig -> {db_path}")
@@ -81,7 +82,7 @@ def main():
         clients = load_clients(clients_path)
         print(f"Klienter lastet: {len(clients)}")
 
-        conn = open_db(db_path)
+        conn = open_db(db_path)  # ar_bridge ignorerer stien og bruker egen (via settings)
         rows = scan_all_clients(conn, clients, min_name_score=args.min_name_score)
         print(f"Funn: {len(rows)}")
 
@@ -97,10 +98,10 @@ def main():
         # Ingen clients/out: helsesjekk på DB
         try:
             _ = open_db(db_path)
-            print(f"DB OK: {db_path}")
+            print("DB/AR-tilkobling OK.")
             print("Tips: legg inn --clients og --out for å generere rapport.")
         except Exception as e:
-            print(f"Kunne ikke åpne DB: {e}")
+            print(f"Kunne ikke åpne DB/AR: {e}")
 
 if __name__ == "__main__":
     main()
