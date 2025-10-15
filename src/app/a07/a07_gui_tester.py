@@ -1,1848 +1,1141 @@
 # -*- coding: utf-8 -*-
 """
-A07 Lønnsavstemming — komplett GUI (med DnD-board)
----------------------------------------------------
-- Parser A07 JSON
-- Leser GL (saldobalanse) fra CSV robust
-- Oversikt / Ansatte / Koder / Rådata
-- Kontrolloppstilling: Auto-forslag (regelbok/fallback) + LP-Optimalisering + drilldown
-- Innstillinger: Laste/Redigere regelbok + lagre/lese overstyringer (JSON)
-- Ny fane: "Board (DnD)" for interaktiv mapping via drag & drop
+A07 GUI Tester – modulært og DnD-basert kontrollpanel for mapping av A07-koder mot saldobalanse.
 
-Bygger videre på eksisterende prosjektstruktur (regelbok/fallback/LP).
+Hovedfunksjoner:
+- Last A07-agg CSV og Saldobalanse-CSV (fleksible headere/locale støttes i a07_models)
+- Last/lagre global regelbok (JSON) – alias, keywords, kontointervall, forventet fortegn
+- Dra-og-slipp (TkinterDnD2) for å bygge "Buckets" (enkeltkode/grupperte koder)
+- Auto-forslag (beløps-først solver) med toleranse og IB/BEV/UB-valg
+- Fargemerking (grønn=diff≈0, gul=delvis, grå=brukt)
+- "Sannsynlige konti": liste snevres inn basert på intervaller/teksttreff
+- Høyreklikk meny for å fjerne mapping, bytte metric per konto, hoppe til rett kode
+
+NB:
+- Denne fila er kortere enn din gamle ~1848-linjers monolitt – fordi
+  data-/parser-/modell-logikken er flyttet til a07_models for gjenbruk og testbarhet.
+- All nødvendig funksjonalitet er her, men delt i klarere lag.
 """
 
 from __future__ import annotations
 
-# ---------------------------------------------------------------------------
-# Path setup: dynamically adjust sys.path so that modules like ``models.py``
-# and ``a07_board.py`` can be imported regardless of the working directory.
-# This is necessary when running this script from a different location (e.g.
-# ``src/app/gui/widgets``) where relative imports fail.  We ascend the
-# directory tree until we find ``models.py`` and insert that directory into
-# ``sys.path``.  Once the root is on sys.path, normal absolute imports work.
-import os as _os, sys as _sys
-_this_dir = _os.path.dirname(_os.path.abspath(__file__))
-_potential_root = _this_dir
-for _i in range(6):
-    if _os.path.isfile(_os.path.join(_potential_root, 'models.py')):
-        if _potential_root not in _sys.path:
-            _sys.path.insert(0, _potential_root)
-        break
-    _parent = _os.path.dirname(_potential_root)
-    if _parent == _potential_root:
-        break
-    _potential_root = _parent
+import json
+import os
+import sys
+import math
+from dataclasses import dataclass, field
+from decimal import Decimal
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple, Set
 
-import csv, io, json, os, re, tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from collections import defaultdict, Counter
-from typing import Any, Dict, List, Tuple, Iterable, Optional, Set
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, simpledialog
 
-# ---------- DnD-brett ----------
-# Prøv relativ import hvis vi kjøres som del av pakke; ellers fall tilbake til absolutt import.
+# DnD
 try:
-    # Prefer the DnD-enabled board if available.
-    from .a07_board_dnd import A07Board  # type: ignore[attr-defined]
-except Exception:
+    from tkinterdnd2 import DND_TEXT, TkinterDnD
+except Exception as e:
+    DND_TEXT = None
+    TkinterDnD = None
+
+# Prosjektmodeller (separate, testbare)
+# Forventer a07_models i PYTHONPATH / samme prosjekt
+from a07_models import (
+    GLAccount, A07Entry, A07CodeDef, AmountMetric,
+    read_gl_csv, read_a07_csv,
+    to_money, add_money, sub_money,
+    amount_for_account, parse_account_ranges, ranges_to_spec,
+    jaccard, tokenize, account_in_ranges, sign_ok
+)
+
+APP_TITLE = "A07 – Matching & DnD Board"
+APP_MIN_W = 1280
+APP_MIN_H = 780
+
+# Standard lagringssti for regelbok (kan overstyres i GUI)
+DEFAULT_RULEBOOK_DIR = r"F:\Dokument\Kildefiler\a07"
+DEFAULT_RULEBOOK_NAME = "global_a07_rulebook.json"
+DEFAULT_RULEBOOK_PATH = os.path.join(DEFAULT_RULEBOOK_DIR, DEFAULT_RULEBOOK_NAME)
+
+# --------------------------
+# Verktøy / Formatering
+# --------------------------
+
+def fmt_amount(x: Decimal) -> str:
+    # norsk-ish formatering, ingen tusenskilletegn for enkelthetens skyld
+    # kan utvides lett til '12 345,67'
+    return f"{x:.2f}".replace(".", ",")
+
+def fmt_amount_spaced(x: Decimal) -> str:
+    # grov tusenskille med mellomrom
+    s = f"{x:.2f}"
+    whole, frac = s.split(".")
+    neg = whole.startswith("-")
+    if neg:
+        whole = whole[1:]
+    parts = []
+    while whole:
+        parts.append(whole[-3:])
+        whole = whole[:-3]
+    whole_fmt = " ".join(reversed(parts))
+    return f"{'-' if neg else ''}{whole_fmt},{frac}"
+
+def safe_int(s: str, default: int = 0) -> int:
     try:
-        from a07_board_dnd import A07Board  # type: ignore[attr-defined]
+        return int(str(s).strip())
     except Exception:
-        # Fallback to the basic board implementation
-        try:
-            from .a07_board import A07Board  # type: ignore[attr-defined]
-        except Exception:
-            from a07_board import A07Board  # type: ignore[attr-defined]
+        return default
 
-# Import GLAccount for wrapper board
-try:
-    from .models import GLAccount
-except Exception:
-    from models import GLAccount
+# --------------------------
+# Rulebook JSON store
+# --------------------------
 
-# Attempt to import TkinterDnD2 to enable native drag‑and‑drop at the root level
-try:
-    from tkinterdnd2 import TkinterDnD  # type: ignore
-    HAVE_DND_ROOT = True
-except Exception:
-    HAVE_DND_ROOT = False
-
-# Select the appropriate Tk base class: use TkinterDnD.Tk if available, else tkinter.Tk
-if HAVE_DND_ROOT:
-    BaseTk = TkinterDnD.Tk  # type: ignore
-else:
-    BaseTk = tk.Tk
-
-class AssignmentBoard(A07Board):
-    """Compatibility wrapper around A07Board to support legacy interface.
-
-    This class adapts the new ``A07Board`` interface to the API expected by
-    ``a07_gui_tester.py``.  It accepts legacy callback parameters
-    ``get_amount_fn``, ``on_drop`` and ``request_suggestions`` and provides a
-    ``supply_data()`` method.  Internally it converts the provided account
-    dictionaries into ``GLAccount`` instances and uses the ``A07Board``
-    update mechanism.  Mapping events are propagated back via the
-    ``on_drop`` callback.  The ``request_suggestions`` callback is
-    stored but not used directly by the board.
+class RulebookJSON:
     """
-
-    def __init__(self, master, get_amount_fn, on_drop, request_suggestions):
-        # Store legacy callbacks
-        self.get_amount_fn = get_amount_fn
-        self._on_drop_cb = on_drop
-        self._request_suggestions = request_suggestions
-        # Initialise parent board with our internal mapping callback
-        super().__init__(master, on_map=self._on_map_internal)
-
-    def _on_map_internal(self, account: GLAccount, code: str) -> None:
-        """Internal handler called when the user maps an account to a code.
-
-        Converts the ``GLAccount`` back to a plain account number and
-        invokes the original ``on_drop`` callback passed into the wrapper.
-        Any exceptions from the callback are suppressed to avoid crashing
-        the GUI.
-        """
-        try:
-            self._on_drop_cb(account.konto, code)
-        except Exception:
-            pass
-
-    def supply_data(
-        self,
-        *,
-        accounts: List[Dict[str, Any]],
-        acc_to_code: Dict[str, str],
-        suggestions: Dict[str, Any],
-        a07_sums: Dict[str, float],
-        diff_threshold: float,
-        only_unmapped: bool,
-        basis: str = "belop",
-    ) -> None:
-        """Populate the board with new data.
-
-        Args:
-            accounts: A list of dictionaries representing GL accounts.  Each
-                dictionary must contain at least ``konto`` and ``navn`` keys.
-            acc_to_code: The current mapping from account numbers to A07 codes.
-            suggestions: Not used in this wrapper but kept for API compatibility.
-            a07_sums: Dictionary of A07 code totals from the A07 report.
-            diff_threshold: Not used directly; colour coding is handled by
-                the underlying board.  Kept for API compatibility.
-            only_unmapped: If True, only show accounts that are not yet
-                mapped to a code.
-        """
-        gl_accounts: List[GLAccount] = []
-        # Convert raw account dicts to GLAccount dataclass instances
-        for acc in accounts:
-            try:
-                amount = float(self.get_amount_fn(acc))
-            except Exception:
-                amount = 0.0
-            try:
-                gl = GLAccount(
-                    konto=str(acc.get("konto", "")),
-                    navn=str(acc.get("navn", "")),
-                    ib=float(acc.get("ib", 0.0)),
-                    debet=float(acc.get("debet", 0.0)),
-                    kredit=float(acc.get("kredit", 0.0)),
-                    endring=amount,
-                    ub=amount,
-                    belop=amount,
-                )
-                gl_accounts.append(gl)
-            except Exception:
-                # Skip accounts that cannot be converted
-                pass
-        # Optionally filter to only unmapped accounts
-        if only_unmapped:
-            gl_accounts = [gl for gl in gl_accounts if gl.konto not in acc_to_code]
-        # Update the underlying board with the selected basis.  Any exceptions
-        # from the update are suppressed to avoid crashing the GUI.
-        try:
-            self.update(gl_accounts, a07_sums, acc_to_code, basis=basis or "belop")
-        except Exception:
-            pass
-
-# ---------- Regelbok / fallback / LP ----------
-try:
-    from a07_rulebook import load_rulebook, suggest_with_rulebook
-    HAVE_RULEBOOK = True
-except Exception:
-    load_rulebook = None     # type: ignore
-    suggest_with_rulebook = None  # type: ignore
-    HAVE_RULEBOOK = False
-
-try:
-    from matcher_fallback import suggest_mapping_for_accounts as fallback_suggest
-except Exception:
-    def fallback_suggest(*_a, **_k): return {}
-
-try:
-    from a07_optimize import generate_candidates_for_lp, solve_global_assignment_lp
-    HAVE_LP = True
-except Exception:
-    HAVE_LP = False
-    def generate_candidates_for_lp(*_a, **_k): return {}
-    def solve_global_assignment_lp(*_a, **_k): raise RuntimeError("PuLP/LP ikke tilgjengelig")
-
-# --------------------------- Utils ---------------------------
-
-def _to_float(x: Any) -> float:
-    if x is None: return 0.0
-    if isinstance(x,(int,float)): return float(x)
-    s = str(x).strip()
-    if s == "": return 0.0
-    s = s.replace("\xa0"," ").replace("−","-").replace("–","-").replace("—","-")
-    s = re.sub(r"(?i)\b(nok|kr)\b\.?", "", s).strip()
-    neg = s.startswith("(") and s.endswith(")")
-    if neg: s = s[1:-1].strip()
-    s = s.replace(" ","").replace("'","")
-    if "," in s and "." in s:
-        if s.rfind(",") > s.rfind("."): s = s.replace(".","").replace(",",".")
-        else:                            s = s.replace(",","")
-    elif "," in s: s = s.replace(",",".")
-    try: v = float(s)
-    except Exception:
-        s2 = re.sub(r"[^0-9\.\-]", "", s)
-        if s2 in {"","-","."}: return 0.0
-        try: v = float(s2)
-        except Exception: return 0.0
-    return -v if neg else v
-
-def fmt_amount(x: float) -> str:
-    try: return f"{x:,.2f}".replace(",", " ").replace(".", ",")
-    except Exception: return str(x)
-
-# --------------------------- A07 ---------------------------
-
-class A07Row(Dict[str,Any]): pass
-
-class A07Parser:
-    def parse(self, data: Dict[str, Any]) -> Tuple[List[A07Row], List[str]]:
-        rows: List[A07Row] = []; errs: List[str] = []
-        try:
-            oppg = (data.get("mottatt", {}) or {}).get("oppgave", {}) or data
-            virksomheter = oppg.get("virksomhet") or []
-            if isinstance(virksomheter, dict): virksomheter = [virksomheter]
-            for v in virksomheter:
-                orgnr = str(v.get("norskIdentifikator") or v.get("organisasjonsnummer") or v.get("orgnr") or "")
-                pers = v.get("inntektsmottaker") or []
-                if isinstance(pers, dict): pers = [pers]
-                for p in pers:
-                    fnr = str(p.get("norskIdentifikator") or p.get("identifikator") or p.get("fnr") or "")
-                    navn = (p.get("identifiserendeInformasjon") or {}).get("navn") or p.get("navn") or ""
-                    inns = p.get("inntekt") or []
-                    if isinstance(inns, dict): inns = [inns]
-                    for inc in inns:
-                        try:
-                            fordel = str(inc.get("fordel") or "").strip().lower()
-                            li = inc.get("loennsinntekt") or {}; alt = inc.get("ytelse") or inc.get("kontantytelse") or {}
-                            if not isinstance(li, dict): li = {}
-                            if not isinstance(alt, dict): alt = {}
-                            kode = li.get("beskrivelse") or alt.get("beskrivelse") or inc.get("type") or "ukjent_kode"
-                            antall = li.get("antall") if isinstance(li.get("antall"), (int,float)) else None
-                            beloep = _to_float(inc.get("beloep"))
-                            rows.append(A07Row(orgnr=orgnr, fnr=fnr, navn=str(navn), kode=str(kode),
-                                               fordel=fordel, beloep=beloep, antall=antall,
-                                               trekkpliktig=bool(inc.get("inngaarIGrunnlagForTrekk", False)),
-                                               aga=bool(inc.get("utloeserArbeidsgiveravgift", False)),
-                                               opptj_start=inc.get("startdatoOpptjeningsperiode"),
-                                               opptj_slutt=inc.get("sluttdatoOpptjeningsperiode")))
-                        except Exception as e:
-                            errs.append(f"Feil ved parsing: {e}")
-        except Exception as e:
-            errs.append(f"Kritisk feil: {e}")
-        return rows, errs
-
-    @staticmethod
-    def oppsummerte_virksomheter(root: Dict[str,Any]) -> Dict[str,float]:
-        res: Dict[str,float] = {}
-        oppg = (root.get("mottatt", {}) or {}).get("oppgave", {}) or root
-        ov = oppg.get("oppsummerteVirksomheter") or {}
-        inn = ov.get("inntekt") or []
-        if isinstance(inn, dict): inn = [inn]
-        for it in inn:
-            li = it.get("loennsinntekt") or {}
-            if not isinstance(li, dict): li = {}
-            alt = it.get("ytelse") or it.get("kontantytelse") or {}
-            if not isinstance(alt, dict): alt = {}
-            kode = li.get("beskrivelse") or alt.get("beskrivelse") or "ukjent_kode"
-            res[str(kode)] = res.get(str(kode),0.0) + _to_float(it.get("beloep"))
-        return res
-
-def summarize_by_code(rows: Iterable[A07Row]) -> Dict[str,float]:
-    out: Dict[str,float] = defaultdict(float)
-    for r in rows: out[str(r["kode"])] += float(r["beloep"])
-    return dict(out)
-
-def summarize_by_employee(rows: Iterable[A07Row]) -> Dict[str, Dict[str, Any]]:
-    idx: Dict[str, Dict[str, Any]] = {}
-    for r in rows:
-        fnr = str(r["fnr"])
-        d = idx.setdefault(fnr, {"navn": r.get("navn",""), "sum": 0.0, "per_kode": defaultdict(float), "antall_poster": 0})
-        d["navn"] = d["navn"] or r.get("navn","")
-        d["sum"] += float(r["beloep"])
-        d["per_kode"][str(r["kode"])] += float(r["beloep"])
-        d["antall_poster"] += 1
-    for v in idx.values(): v["per_kode"] = dict(v["per_kode"])
-    return idx
-
-def validate_against_summary(rows: List[A07Row], json_root: Dict[str,Any]) -> List[Tuple[str,float,float,float]]:
-    calc = summarize_by_code(rows); rep = A07Parser.oppsummerte_virksomheter(json_root)
-    out = []
-    for code in sorted(set(calc)|set(rep)):
-        c = calc.get(code,0.0); r = rep.get(code,0.0); out.append((code,c,r,c-r))
-    return out
-
-# --------------------------- GL CSV ---------------------------
-
-def _read_text_guess(path: str) -> tuple[str,str]:
-    encs = ["utf-8-sig","utf-16","utf-16le","utf-16be","cp1252","latin-1","utf-8"]
-    for enc in encs:
-        try:
-            with open(path,"r",encoding=enc,errors="strict") as f:
-                return f.read(), enc
-        except UnicodeDecodeError: continue
-        except Exception: continue
-    with open(path,"r",encoding="latin-1",errors="replace") as f:
-        return f.read(),"latin-1"
-
-def _find_header(fieldnames: List[str], exact: List[str], partial: List[str]) -> Optional[str]:
-    mp = { (h or "").strip().lower(): h for h in fieldnames if h }
-    for e in exact:
-        if e in mp: return mp[e]
-    for p in partial:
-        for n,h in mp.items():
-            if p in n: return h
-    return None
-
-def read_gl_csv(path: str) -> Tuple[List[Dict[str,Any]], Dict[str,Any]]:
-    text, encoding = _read_text_guess(path)
-    lines = text.splitlines()
-    delim = None
-    if lines and lines[0].strip().lower().startswith("sep="):
-        delim = lines[0].split("=",1)[1].strip()[:1] or ";"
-        text = "\n".join(lines[1:])
-    if not delim:
-        sample = text[:4096]
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-            delim = dialect.delimiter
-        except Exception:
-            delim = ";" if sample.count(";") >= sample.count(",") else ","
-
-    f = io.StringIO(text)
-    rd = csv.DictReader(f, delimiter=delim)
-    recs = list(rd); fns = rd.fieldnames or (list(recs[0].keys()) if recs else [])
-    if not recs: raise ValueError("CSV ser tom ut.")
-
-    acc_hdr  = _find_header(fns, ["konto","kontonummer","account","accountno","kontonr","account_number"], ["konto","account"])
-    name_hdr = _find_header(fns, ["kontonavn","navn","name","accountname","beskrivelse","description","tekst"], ["navn","name","tekst","desc"])
-    ib_hdr     = _find_header(fns, ["ib","inngaaende","ingaende","opening_balance"], ["ib","inng","open"])
-    debet_hdr  = _find_header(fns, ["debet","debit"], ["debet","debit"])
-    kredit_hdr = _find_header(fns, ["kredit","credit"], ["kredit","credit"])
-    endr_hdr   = _find_header(fns, ["endring","bevegelse","movement","ytd","hittil","resultat"], ["endr","beveg","ytd","hittil","period","result"])
-    ub_hdr     = _find_header(fns, ["ub","utgaaende","utgaende","closing_balance","ubsaldo"], ["ub","utg","clos"])
-    amt_hdr    = _find_header(fns, ["saldo","balance","belop","beloep","beløp","amount","sum"], ["saldo","bel","amount","sum"])
-
-    rows: List[Dict[str,Any]] = []
-    for r in recs:
-        konto = (r.get(acc_hdr) if acc_hdr else None) or ""
-        navn  = (r.get(name_hdr) if name_hdr else None) or ""
-        ib     = _to_float(r.get(ib_hdr, ""))     if ib_hdr     else 0.0
-        debet  = _to_float(r.get(debet_hdr, ""))  if debet_hdr  else 0.0
-        kredit = _to_float(r.get(kredit_hdr, "")) if kredit_hdr else 0.0
-        endr   = _to_float(r.get(endr_hdr, ""))   if endr_hdr   else None
-        ub     = _to_float(r.get(ub_hdr, ""))     if ub_hdr     else None
-        bel    = _to_float(r.get(amt_hdr, ""))    if amt_hdr    else None
-
-        if endr is None:
-            if debet_hdr and kredit_hdr: endr = debet - kredit
-            elif (ub is not None) and (ib_hdr is not None): endr = ub - ib
-            else: endr = bel if bel is not None else 0.0
-
-        if ub is None:
-            if ib_hdr is not None: ub = ib + endr
-            else: ub = bel if bel is not None else endr
-
-        if bel is None: bel = ub if ub is not None else endr
-
-        rows.append({
-            "konto": str(konto).strip(), "navn": str(navn).strip(),
-            "ib": ib, "debet": debet, "kredit": kredit, "endring": endr, "ub": ub, "belop": bel,
-        })
-
-    meta = {
-        "encoding": encoding, "delimiter": delim,
-        "account_header": acc_hdr, "name_header": name_hdr,
-        "ib": ib_hdr, "debet": debet_hdr, "kredit": kredit_hdr, "endring": endr_hdr, "ub": ub_hdr,
-        "amount_header": amt_hdr or ("UB" if ub_hdr else ("Endring" if (debet_hdr or ib_hdr) else "Beløp")),
+    Lagrer/Laster global A07-regelbok fra JSON:
+    {
+      "version": 1,
+      "codes": [
+         {
+           "code": "fastloenn",
+           "name": "Fast lønn",
+           "account_ranges": [[5000,5999],[2900,2949]],
+           "expected_sign": 1,
+           "aliases": ["lonn", "fastlønn","fast loenn"],
+           "keywords": ["fast", "lønn", "loenn"]
+         }, ...
+      ]
     }
-    return rows, meta
+    """
+    def __init__(self, json_path: str):
+        self.json_path = json_path
+        self.codes: Dict[str, A07CodeDef] = {}
 
-# --------------------------- Tk table ---------------------------
-
-class Table(ttk.Treeview):
-    def __init__(self, master, columns: List[Tuple[str,str]], **kwargs):
-        ids = [c for c,_ in columns]
-        super().__init__(master, columns=ids, show="headings", selectmode="extended", **kwargs)
-        self._cols = columns
-        for cid, header in columns:
-            self.heading(cid, text=header, command=lambda c=cid: self._sort_by(c, False))
-            self.column(cid, width=120, anchor=tk.W, stretch=True)
-        self.tag_configure("ok", background="#e8f5e9")
-        self.tag_configure("warn", background="#fff8e1")
-        self.tag_configure("bad", background="#ffebee")
-        self.tag_configure("muted", foreground="#7f7f7f")
-
-        self._data_cache: List[List[Any]] = []
-        self._column_formats: Dict[str,Any] = {}
-
-        yscroll = ttk.Scrollbar(master, orient="vertical", command=self.yview)
-        self.configure(yscrollcommand=yscroll.set)
-        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-    def set_column_format(self, column_id: str, fmt_func): self._column_formats[column_id] = fmt_func
-    def clear(self): self.delete(*self.get_children()); self._data_cache.clear()
-    def insert_rows(self, rows: Iterable[Dict[str,Any]]):
-        self.clear()
-        for r in rows:
-            values = []
-            for cid,_ in self._cols:
-                v = r.get(cid,"")
-                if cid in self._column_formats: v = self._column_formats[cid](v)
-                values.append(v)
-            tags = r.get("_tags", [])
-            self.insert("", tk.END, values=values, tags=tags)
-            self._data_cache.append(values)
-
-    def export_csv(self, path: str):
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f, delimiter=";")
-            w.writerow([h for _,h in self._cols]); w.writerows(self._data_cache)
-
-    def _sort_by(self, col: str, desc: bool):
-        data = [(self.set(k,col),k) for k in self.get_children("")]
-        def to_num(s):
-            ss = str(s).strip().replace(" ","").replace(".", "").replace(",", ".")
-            try: return float(ss)
-            except Exception: return s
-        data.sort(key=lambda t: to_num(t[0]), reverse=desc)
-        for i,(_,k) in enumerate(data): self.move(k,"",i)
-        self.heading(col, command=lambda c=col: self._sort_by(c, not desc))
-
-# --------------------------- GUI ---------------------------
-
-class A07App(BaseTk):
-    # ---------- Preferanser ----------
-    def _prefs_file(self) -> str:
-        return os.path.join(os.path.expanduser("~"), ".a07_prefs.json")
-    def _load_prefs(self) -> dict:
+    def load(self) -> None:
+        p = Path(self.json_path)
+        self.codes = {}
+        if not p.exists():
+            # tom regelbok
+            return
         try:
-            with open(self._prefs_file(), "r", encoding="utf-8") as f: return json.load(f)
-        except Exception: return {}
-    def _save_prefs(self, **updates):
-        prefs = self._load_prefs(); prefs.update(updates)
-        try:
-            with open(self._prefs_file(), "w", encoding="utf-8") as f: json.dump(prefs, f, ensure_ascii=False, indent=2)
-        except Exception: pass
-
-    def __init__(self):
-        super().__init__()
-        self.title("A07 Lønnsavstemming — GUI")
-        self.geometry("1320x820"); self.minsize(1080, 720)
-
-        self.json_root: Dict[str,Any] = {}
-        self.rows: List[A07Row] = []; self.errors: List[str] = []
-        self.gl_accounts: List[Dict[str,Any]] = []; self.gl_meta: Dict[str,Any] = {}
-        # Mapping from GL account numbers to one or more A07 codes.  In
-        # earlier versions this was a ``Dict[str,str]``; it has been
-        # generalised to support multiple codes per account.  Use lists of
-        # strings as values.  When a list contains more than one code, the
-        # account's amount will be split equally among those codes.
-        self.acc_to_codess: Dict[str, List[str]] = {}
-        self.auto_suggestions: Dict[str, Dict[str,Any]] = {}
-
-        self.gl_basis = tk.StringVar(value="auto")
-        self.diff_threshold = tk.DoubleVar(value=100.0)
-        self.hide_zero = tk.BooleanVar(value=True)
-        self.min_score = tk.DoubleVar(value=0.60)
-        self.allow_splits = tk.BooleanVar(value=True)
-
-        # UI-valg som vi også lagrer
-        self.only_diff = tk.BooleanVar(value=False)
-        self.only_unmapped = tk.BooleanVar(value=False)
-        self.compact_view = tk.BooleanVar(value=True)
-
-        # LP
-        self.use_lp_assignment = False
-        self.lp_assignment: Dict[str, Dict[str,float]] = {}
-        self.lp_fixed: Dict[str,float] = {}
-        self.lp_amounts: Dict[str,float] = {}
-
-        # Regelbok
-        self.rulebook: Optional[Dict[str,Any]] = None
-        self.rulebook_overrides: Dict[str,Any] = {}
-        self.rulebook_source = ""
-
-        self._build_ui()
-
-        # Autoload regelbok + UI-innstillinger
-        try:
-            prefs = self._load_prefs()
-            _p = prefs.get("rulebook_path")
-            if _p and load_rulebook is not None and os.path.exists(_p):
-                self.rulebook = load_rulebook(_p); self.rulebook_source = _p
-                self._refresh_settings_tables()
-                self.status.configure(text=f"Regelbok lastet automatisk: {os.path.basename(_p)}")
-            self.compact_view.set(bool(prefs.get("compact_view", True)))
-            self.only_diff.set(bool(prefs.get("only_diff", False)))
-            self.only_unmapped.set(bool(prefs.get("only_unmapped", False)))
-        except Exception:
-            pass
-
-        # Autoload from preferences only; do not attempt to automatically
-        # load a JSON file from a hard-coded directory.  Users should
-        # explicitly load the rulebook via the "Last regelbok (JSON)…" button.
-
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    # ---------- UI ----------
-
-    def _build_ui(self):
-        bar = ttk.Frame(self); bar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
-        ttk.Button(bar, text="Åpne A07 JSON…", command=self.on_open_json).pack(side=tk.LEFT)
-        ttk.Button(bar, text="Valider mot oppsummering", command=self.on_validate).pack(side=tk.LEFT, padx=(8,0))
-        ttk.Button(bar, text="Eksporter tabell → CSV", command=self.on_export_current_table).pack(side=tk.LEFT, padx=(8,0))
-        self.status = ttk.Label(bar, text="Ingen fil lastet.", anchor="w"); self.status.pack(side=tk.RIGHT, expand=True, fill=tk.X)
-
-        self.nb = ttk.Notebook(self); self.nb.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(0,8))
-        tab_overview = ttk.Frame(self.nb); self.nb.add(tab_overview, text="Oversikt"); self._build_overview(tab_overview)
-        tab_emp = ttk.Frame(self.nb); self.nb.add(tab_emp, text="Ansatte"); self._build_employees(tab_emp)
-        tab_codes = ttk.Frame(self.nb); self.nb.add(tab_codes, text="Koder"); self._build_codes(tab_codes)
-        tab_raw = ttk.Frame(self.nb); self.nb.add(tab_raw, text="Rådata"); self._build_raw(tab_raw)
-        tab_ctrl = ttk.Frame(self.nb); self.nb.add(tab_ctrl, text="Kontrolloppstilling"); self._build_control(tab_ctrl)
-        tab_settings = ttk.Frame(self.nb); self.nb.add(tab_settings, text="Innstillinger"); self._build_settings(tab_settings)
-
-    # ----- Oversikt -----
-    def _build_overview(self, root: ttk.Frame):
-        top = ttk.Frame(root); top.pack(side=tk.TOP, fill=tk.X)
-        self.ov_file = ttk.Label(top, text="Fil: –"); self.ov_file.pack(side=tk.TOP, anchor="w", pady=(6,0))
-        grid = ttk.Frame(root); grid.pack(side=tk.TOP, fill=tk.X, pady=10)
-        self.ov_labels = {
-            "clients": ttk.Label(grid, text="Virksomheter: –"),
-            "employees": ttk.Label(grid, text="Ansatte: –"),
-            "rows": ttk.Label(grid, text="Antall inntektslinjer: –"),
-            "sum": ttk.Label(grid, text="Total beløp (alle koder): –"),
-        }
-        for i,k in enumerate(["clients","employees","rows","sum"]): self.ov_labels[k].grid(row=0, column=i, sticky="w", padx=10)
-        ttk.Separator(root, orient="horizontal").pack(side=tk.TOP, fill=tk.X, pady=4)
-        ttk.Label(root, text="Summer pr lønnskode").pack(side=tk.TOP, anchor="w")
-        frame_tbl = ttk.Frame(root); frame_tbl.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        self.tbl_codes_overview = Table(frame_tbl, [("kode","Kode / beskrivelse"), ("sum","Sum (NOK)")])
-        self.tbl_codes_overview.set_column_format("sum", fmt_amount)
-
-    # ----- Ansatte -----
-    def _build_employees(self, root: ttk.Frame):
-        top = ttk.Frame(root); top.pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(top, text="Søk (navn/fnr):").pack(side=tk.LEFT)
-        self.emp_filter_var = tk.StringVar(); ttk.Entry(top, textvariable=self.emp_filter_var, width=40).pack(side=tk.LEFT, padx=6)
-        self.emp_filter_var.trace_add("write", lambda *_: self._refresh_employees_table())
-        frame_tbl = ttk.Frame(root); frame_tbl.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        self.tbl_emp = Table(frame_tbl, [("fnr","Fødselsnr"),("navn","Navn"),("antall_poster","Ant. poster"),("sum","Sum (NOK)")])
-        self.tbl_emp.set_column_format("sum", fmt_amount); self.tbl_emp.bind("<Double-1>", self._on_emp_double_click)
-
-    def _on_emp_double_click(self, _=None):
-        sel = self.tbl_emp.focus()
-        if not sel: return
-        fnr = self.tbl_emp.item(sel,"values")[0]
-        self._open_emp_detail_window(fnr)
-
-    def _open_emp_detail_window(self, fnr: str):
-        win = tk.Toplevel(self); win.title(f"Detaljer — ansatt {fnr}"); win.geometry("900x500")
-        data = [r for r in self.rows if str(r["fnr"]) == str(fnr)]
-        ttk.Label(win, text=f"Navn: {data[0]['navn'] if data else ''}  •  Antall poster: {len(data)}  •  Sum: {fmt_amount(sum(float(r['beloep']) for r in data))}").pack(side=tk.TOP, anchor="w", padx=8, pady=8)
-        frm = ttk.Frame(win); frm.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(0,8))
-        # Utled periode (år-måned) fra opptjeningsperioden når tilgjengelig
-        rows_with_period = []
-        for r in data:
-            start = r.get("opptj_start") or ""
-            end = r.get("opptj_slutt") or ""
-            periode = ""
-            if isinstance(start, str) and start:
-                # Bruk 'YYYY-MM' fra startdato
-                periode = start[:7]
-            elif isinstance(end, str) and end:
-                # Fallback til sluttdato
-                periode = end[:7]
-            rows_with_period.append({
-                "periode": periode,
-                "kode": r.get("kode", ""),
-                "fordel": r.get("fordel", ""),
-                "beloep": r.get("beloep", 0.0),
-                "antall": r.get("antall", ""),
-                "trekkpliktig": r.get("trekkpliktig", False),
-                "aga": r.get("aga", False),
-                "opptj_start": r.get("opptj_start", ""),
-                "opptj_slutt": r.get("opptj_slutt", ""),
-                "orgnr": r.get("orgnr", ""),
-            })
-        # Legg til periode-kolonne i tabellen for å vise hvilken måned beløpet tilhører
-        tbl = Table(frm, [
-            ("periode","Periode"),
-            ("kode","Kode"),
-            ("fordel","Fordel"),
-            ("beloep","Beløp"),
-            ("antall","Antall"),
-            ("trekkpliktig","Trekkpl."),
-            ("aga","AGA"),
-            ("opptj_start","Opptj. start"),
-            ("opptj_slutt","Opptj. slutt"),
-            ("orgnr","Orgnr"),
-        ])
-        tbl.set_column_format("beloep", fmt_amount)
-        tbl.insert_rows(rows_with_period)
-
-    def _refresh_employees_table(self):
-        idx = summarize_by_employee(self.rows)
-        q = getattr(self, "emp_filter_var", tk.StringVar(value="")).get().strip().lower()
-        rows = []
-        for fnr, d in idx.items():
-            navn = str(d["navn"])
-            if q and q not in fnr.lower() and q not in navn.lower(): continue
-            rows.append({"fnr": fnr, "navn": navn, "antall_poster": d["antall_poster"], "sum": d["sum"]})
-        rows.sort(key=lambda r: (-float(r["sum"]), r["navn"]))
-        self.tbl_emp.insert_rows(rows)
-
-    # ----- Koder -----
-    def _build_codes(self, root: ttk.Frame):
-        top = ttk.Frame(root); top.pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(top, text="Søk (kode):").pack(side=tk.LEFT)
-        self.code_filter_var = tk.StringVar(); ttk.Entry(top, textvariable=self.code_filter_var, width=40).pack(side=tk.LEFT, padx=6)
-        self.code_filter_var.trace_add("write", lambda *_: self._refresh_codes_table())
-        frame_tbl = ttk.Frame(root); frame_tbl.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        self.tbl_codes = Table(frame_tbl, [("kode","Kode / beskrivelse"),("antall_poster","Ant. poster"),("sum","Sum (NOK)")])
-        self.tbl_codes.set_column_format("sum", fmt_amount); self.tbl_codes.bind("<Double-1>", self._on_code_detail)
-
-    def _on_code_detail(self, _evt=None):
-        sel = self.tbl_codes.focus()
-        if not sel: return
-        kode = self.tbl_codes.item(sel, "values")[0]
-        self._open_code_detail_window(kode)
-
-    def _open_code_detail_window(self, kode: str):
-        win = tk.Toplevel(self); win.title(f"Detaljer — kode {kode}"); win.geometry("980x520")
-        data = [r for r in self.rows if str(r["kode"]) == str(kode)]
-        per_emp = summarize_by_employee(data)
-        rows_idx = [{"fnr": fnr, "navn": v["navn"], "antall_poster": v["antall_poster"], "sum": v["sum"]} for fnr, v in per_emp.items()]
-        rows_idx.sort(key=lambda r: (-float(r["sum"]), r["navn"]))
-        ttk.Label(win, text=f"Antall poster: {len(data)}  •  Sum: {fmt_amount(sum(float(r['beloep']) for r in data))}").pack(side=tk.TOP, anchor="w", padx=8, pady=8)
-        nb = ttk.Notebook(win); nb.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(0,8))
-        tab1 = ttk.Frame(nb); nb.add(tab1, text="Per ansatt")
-        f1 = ttk.Frame(tab1); f1.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        t1 = Table(f1, [("fnr","Fødselsnr"),("navn","Navn"),("antall_poster","Ant. poster"),("sum","Sum (NOK)")])
-        t1.set_column_format("sum", fmt_amount); t1.insert_rows(rows_idx)
-        tab2 = ttk.Frame(nb); nb.add(tab2, text="Rå linjer")
-        f2 = ttk.Frame(tab2); f2.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        t2 = Table(f2, [("fnr","Fødselsnr"),("navn","Navn"),("fordel","Fordel"),("beloep","Beløp"),("antall","Antall"),("orgnr","Orgnr")])
-        t2.set_column_format("beloep", fmt_amount)
-        t2.insert_rows([{ "fnr": r["fnr"], "navn": r["navn"], "fordel": r["fordel"], "beloep": r["beloep"], "antall": r["antall"], "orgnr": r["orgnr"]} for r in data])
-
-    def _refresh_codes_table(self):
-        sums = summarize_by_code(self.rows); counts = Counter([r["kode"] for r in self.rows])
-        q = getattr(self, "code_filter_var", tk.StringVar(value="")).get().strip().lower()
-        rows = []
-        for kode, s in sums.items():
-            if q and q not in str(kode).lower(): continue
-            rows.append({"kode": kode, "antall_poster": counts.get(kode, 0), "sum": s})
-        rows.sort(key=lambda r: (-float(r["sum"]), r["kode"]))
-        self.tbl_codes.insert_rows(rows)
-
-    # ----- Rådata -----
-    def _build_raw(self, root: ttk.Frame):
-        f = ttk.Frame(root); f.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        self.tbl_raw = Table(f, [("orgnr","Orgnr"),("fnr","Fødselsnr"),("navn","Navn"),("kode","Kode"),("fordel","Fordel"),("beloep","Beløp"),("antall","Antall"),("trekkpliktig","Trekkpl."),("aga","AGA"),("opptj_start","Opptj. start"),("opptj_slutt","Opptj. slutt")])
-        self.tbl_raw.set_column_format("beloep", fmt_amount)
-
-    # ----- Kontrolloppstilling -----
-    def _build_control(self, root: ttk.Frame):
-        bar = ttk.Frame(root); bar.pack(side=tk.TOP, fill=tk.X, pady=(8,6))
-        ttk.Button(bar, text="Last inn saldobalanse (CSV…)", command=self.on_load_gl).pack(side=tk.LEFT)
-        ttk.Button(bar, text="Auto-forslag mapping", command=self.on_auto_map).pack(side=tk.LEFT, padx=(8,0))
-        ttk.Button(bar, text="Sett kode…", command=self.on_set_code).pack(side=tk.LEFT, padx=(8,0))
-        ttk.Button(bar, text="Fjern mapping", command=self.on_clear_code).pack(side=tk.LEFT, padx=(8,0))
-        ttk.Button(bar, text="Nullstill mapping", command=self.on_reset_mapping).pack(side=tk.LEFT, padx=(8,0))
-        self.ctrl_status = ttk.Label(bar, text="Ingen saldobalanse lastet.", anchor="w"); self.ctrl_status.pack(side=tk.RIGHT, fill=tk.X, expand=True)
-
-        dash = ttk.Frame(root); dash.pack(side=tk.TOP, fill=tk.X, padx=8)
-        self.lab_a07 = ttk.Label(dash, text="A07: –"); self.lab_a07.pack(side=tk.LEFT, padx=8)
-        self.lab_gl  = ttk.Label(dash, text="GL (mappet): –"); self.lab_gl.pack(side=tk.LEFT, padx=8)
-        self.lab_diff= ttk.Label(dash, text="Diff: –"); self.lab_diff.pack(side=tk.LEFT, padx=8)
-        self.lab_unmapped = ttk.Label(dash, text="Uten mapping: –"); self.lab_unmapped.pack(side=tk.LEFT, padx=8)
-        self.lab_code_gap = ttk.Label(dash, text="Koder uten GL: –"); self.lab_code_gap.pack(side=tk.LEFT, padx=8)
-
-        ctrl = ttk.Frame(root); ctrl.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(4,0))
-        ttk.Label(ctrl, text="Regnskapsgrunnlag:").pack(side=tk.LEFT)
-        for val, txt in [("auto","Auto"),("ub","UB (utgående saldo)"),("endring","Endring (Debet−Kredit/UB−IB)"),("belop","Beløp (valgt kol.)")]:
-            ttk.Radiobutton(ctrl, text=txt, variable=self.gl_basis, value=val, command=self.refresh_control_tables).pack(side=tk.LEFT, padx=(6,0))
-
-        ttk.Label(ctrl, text="  •  Avviks-terskel:").pack(side=tk.LEFT, padx=(12,0))
-        ttk.Spinbox(ctrl, from_=0, to=10_000_000, increment=50, width=8, textvariable=self.diff_threshold, command=self.refresh_control_tables).pack(side=tk.LEFT)
-        ttk.Checkbutton(ctrl, text="Skjul konti med 0", variable=self.hide_zero, command=self.refresh_control_tables).pack(side=tk.LEFT, padx=8)
-        ttk.Checkbutton(ctrl, text="Vis kun uten mapping", variable=self.only_unmapped, command=self.refresh_control_tables).pack(side=tk.LEFT, padx=8)
-        ttk.Checkbutton(ctrl, text="Kompakt visning", variable=self.compact_view, command=self.refresh_control_tables).pack(side=tk.LEFT, padx=8)
-
-        ttk.Label(ctrl, text="  •  Min‑score:").pack(side=tk.LEFT, padx=(12,0))
-        ttk.Spinbox(ctrl, from_=0.00, to=1.00, increment=0.05, width=5, textvariable=self.min_score, command=self.refresh_control_tables).pack(side=tk.LEFT)
-        ttk.Checkbutton(ctrl, text="Tillat splitting (LP)", variable=self.allow_splits).pack(side=tk.LEFT, padx=12)
-        ttk.Button(ctrl, text="Optimaliser beløp (LP)", command=self.on_optimize_lp).pack(side=tk.LEFT, padx=8)
-
-        self.ctrl_nb = ttk.Notebook(root); self.ctrl_nb.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(6,8))
-        tabA = ttk.Frame(self.ctrl_nb); self.ctrl_nb.add(tabA, text="Konti & forslag")
-        topA = ttk.Frame(tabA); topA.pack(side=tk.TOP, fill=tk.X)
-        self.gl_search_var = tk.StringVar(); ttk.Label(topA, text="Søk konto/tekst:").pack(side=tk.LEFT)
-        ttk.Entry(topA, textvariable=self.gl_search_var, width=30).pack(side=tk.LEFT, padx=6)
-        self.gl_search_var.trace_add("write", lambda *_: self.refresh_control_tables())
-
-        # venstre (tabell) + høyre (detalj)
-        frame_tblA = ttk.Frame(tabA); frame_tblA.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        leftA = ttk.Frame(frame_tblA); leftA.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        rightA = ttk.Frame(frame_tblA, relief=tk.GROOVE, borderwidth=1); rightA.pack(side=tk.LEFT, fill=tk.Y, padx=(8,0))
-        self.tbl_gl = Table(leftA, [("konto","Konto"),("navn","Kontonavn"),("ib","IB"),("debet","Debet"),("kredit","Kredit"),("endring","Endring"),("ub","UB"),("basis","Basis"),("foreslatt","Foreslått kode"),("score","Score"),("begrunnelse","Begrunnelse")])
-        for c in ("ib","debet","kredit","endring","ub"): self.tbl_gl.set_column_format(c, fmt_amount)
-        self.tbl_gl.bind("<<TreeviewSelect>>", self._on_gl_row_selected)
-
-        # detaljpanel
-        ttk.Label(rightA, text="Detaljer / hurtigvalg", font=("TkDefaultFont", 10, "bold")).pack(side=tk.TOP, anchor="w", padx=8, pady=(6,2))
-        self.det_account = ttk.Label(rightA, text="Konto: –"); self.det_account.pack(side=tk.TOP, anchor="w", padx=8)
-        self.det_amount  = ttk.Label(rightA, text="Beløp (basis): –"); self.det_amount.pack(side=tk.TOP, anchor="w", padx=8, pady=(0,6))
-        ttk.Label(rightA, text="Valgt forslag:").pack(side=tk.TOP, anchor="w", padx=8)
-        self.det_best = ttk.Label(rightA, text="–", foreground="#2e7d32"); self.det_best.pack(side=tk.TOP, anchor="w", padx=8, pady=(0,6))
-        ttk.Separator(rightA, orient="horizontal").pack(side=tk.TOP, fill=tk.X, padx=6, pady=4)
-        ttk.Label(rightA, text="Alternativer (topp‑5):").pack(side=tk.TOP, anchor="w", padx=8)
-        self.det_alt_list = tk.Listbox(rightA, height=12, exportselection=False); self.det_alt_list.pack(side=tk.TOP, fill=tk.BOTH, expand=False, padx=8, pady=(2,6))
-        btns = ttk.Frame(rightA); btns.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0,8))
-        ttk.Button(btns, text="Bruk valgt", command=self._apply_selected_alt).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Fjern mapping", command=self.on_clear_code).pack(side=tk.LEFT, padx=6)
-
-        tabB = ttk.Frame(self.ctrl_nb); self.ctrl_nb.add(tabB, text="Avstemming pr kode")
-        topB = ttk.Frame(tabB); topB.pack(side=tk.TOP, fill=tk.X)
-        ttk.Checkbutton(topB, text="Vis bare avvik", variable=self.only_diff, command=self.refresh_control_tables).pack(side=tk.LEFT, padx=8, pady=(2,0))
-        frame_tblB = ttk.Frame(tabB); frame_tblB.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        self.tbl_ctrl_codes = Table(frame_tblB, [("kode","A07-kode"),("a07","A07 sum"),("gl","Regnskap (mappet)"),("diff","Diff (A07−GL)"),("ant_konti","# konti mappet")])
-        for c in ("a07","gl","diff"): self.tbl_ctrl_codes.set_column_format(c, fmt_amount)
-        self.tbl_ctrl_codes.bind("<Double-1>", self._on_ctrl_code_drill)
-
-        # --- NY fane: Board (DnD) ---
-        tabDND = ttk.Frame(self.ctrl_nb)
-        self.ctrl_nb.add(tabDND, text="Board (DnD)")
-
-        def _board_get_amount(acc: Dict[str,Any]) -> float:
-            return self._gl_amount(acc)[0]
-
-        def _on_drop(accno: str, code: str):
-            # Hvis koden er tom eller None, fjern mapping for denne kontoen; ellers sett
-            if code:
-                # Legg til eller erstatte mapping.  Vi bruker kun én kode per konto for nå
-                self.acc_to_codess[str(accno)] = [str(code)]
-            else:
-                try:
-                    self.acc_to_codess.pop(str(accno), None)
-                except Exception:
-                    pass
-            self.use_lp_assignment = False
-            self.refresh_control_tables()
-
-        def _req_suggestions():
-            self.on_auto_map()
-
-        self.board = AssignmentBoard(
-            tabDND,
-            get_amount_fn=_board_get_amount,
-            on_drop=_on_drop,
-            request_suggestions=_req_suggestions
-        )
-        self.board.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
-
-    # ----- Innstillinger -----
-    def _build_settings(self, root: ttk.Frame):
-        top = ttk.Frame(root); top.pack(side=tk.TOP, fill=tk.X, pady=(8,4))
-        # Load a global rulebook from a JSON file
-        ttk.Button(top, text="Last regelbok (JSON)…", command=self.on_load_rulebook_json).pack(side=tk.LEFT)
-        # Apply the current rulebook to suggest mappings
-        ttk.Button(top, text="Bruk regelbok → Auto‑forslag", command=self.on_auto_map).pack(side=tk.LEFT, padx=(8,0))
-        ttk.Button(top, text="Rediger valgt kode", command=self.on_edit_rule).pack(side=tk.LEFT, padx=(8,0))
-        # Save the entire rulebook (codes + aliases) as JSON
-        ttk.Button(top, text="Lagre regelbok (JSON)…", command=self.on_save_rulebook_json).pack(side=tk.LEFT, padx=(8,0))
-        # Knapp for å legge til en ny A07-kode
-        ttk.Button(top, text="Legg til A07-kode", command=self.on_add_rule).pack(side=tk.LEFT, padx=(8,0))
-        self.rulebook_info = ttk.Label(top, text=self._rulebook_status_text(), anchor="w"); self.rulebook_info.pack(side=tk.RIGHT, fill=tk.X, expand=True)
-
-        self.set_nb = ttk.Notebook(root); self.set_nb.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(4,8))
-        tab1 = ttk.Frame(self.set_nb); self.set_nb.add(tab1, text="A07‑koder")
-        f1 = ttk.Frame(tab1); f1.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        self.tbl_rule_codes = Table(f1, [
-            ("a07_code","A07‑kode"),("category","Kategori"),("basis","Basis"),
-            ("allowed","Tillatte kontoområder"),("keywords","Nøkkelord"),
-            ("boost","Boost‑konti"),("expected","Forventet tegn"),("special","Special‑add")
-        ])
-        tab2 = ttk.Frame(self.set_nb); self.set_nb.add(tab2, text="Aliases")
-        f2 = ttk.Frame(tab2); f2.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        self.tbl_rule_alias = Table(f2, [("canonical","Kanonisk"),("synonyms","Synonymer")])
-        self._refresh_settings_tables()
-
-    # ----- Preferanser/avslutning -----
-    def _on_close(self):
-        try:
-            self._save_prefs(
-                rulebook_path=self.rulebook_source,
-                compact_view=bool(self.compact_view.get()),
-                only_diff=bool(self.only_diff.get()),
-                only_unmapped=bool(self.only_unmapped.get())
-            )
-        except Exception:
-            pass
-        self.destroy()
-
-    # ---------- Regelbok-presentasjon ----------
-    def _rulebook_status_text(self) -> str:
-        if not self.rulebook: return "Regelbok: (ingen lastet)"
-        c = len(self.rulebook.get("codes", {})); a = len(self.rulebook.get("aliases", {})); src = self.rulebook.get("source","")
-        return f"Regelbok: {c} koder, {a} alias‑grupper  •  Kilde: {src or '(auto)'}"
-
-    def _format_allowed(self, intervals: List[Tuple[int,int]]) -> str:
-        if not intervals: return ""
-        parts = [f"{lo}" if lo==hi else f"{lo}-{hi}" for lo,hi in intervals]
-        return " | ".join(parts)
-
-    def _refresh_settings_tables(self):
-        rows = []
-        if self.rulebook:
-            for code, rule in self.rulebook.get("codes", {}).items():
-                es = int(rule.get("expected_sign", 0))
-                rows.append({
-                    "a07_code": code, "category": rule.get("category",""), "basis": rule.get("basis",""),
-                    "allowed": self._format_allowed(rule.get("allowed",[])),
-                    "keywords": ", ".join(sorted(rule.get("keywords", []))),
-                    "boost": ", ".join(sorted(rule.get("boost_accounts", []))),
-                    "expected": ("+" if es==1 else ("-" if es==-1 else "")),
-                    "special": json.dumps(rule.get("special_add", []), ensure_ascii=False),
-                })
-        rows.sort(key=lambda r: r["a07_code"]); self.tbl_rule_codes.insert_rows(rows)
-        rows2 = []
-        if self.rulebook:
-            for can, syns in sorted(self.rulebook.get("aliases", {}).items()):
-                rows2.append({"canonical": can, "synonyms": ", ".join(sorted(syns))})
-        self.tbl_rule_alias.insert_rows(rows2)
-        self.rulebook_info.config(text=self._rulebook_status_text())
-
-    # ---------- Event handlers ----------
-
-    def on_open_json(self):
-        path = filedialog.askopenfilename(title="Velg A07 JSON-fil", filetypes=[("JSON","*.json"),("Alle filer","*.*")])
-        if not path: return
-        try:
-            with open(path, "r", encoding="utf-8") as f: data = json.load(f)
-        except Exception as e:
-            messagebox.showerror("Feil ved lesing", f"Kunne ikke lese JSON: {e}"); return
-        parser = A07Parser()
-        rows, errors = parser.parse(data)
-        self.json_root = data; self.rows = rows; self.errors = errors; self._file_name = os.path.basename(path)
-        self.status.configure(text=f"Lest {len(rows)} rader. Feil: {len(errors)}")
-        if errors: messagebox.showwarning("Parsing", "\n".join(errors[:12]) + ("\n… (flere)" if len(errors)>12 else ""))
-        self._refresh_all_tabs()
-
-    def on_validate(self):
-        if not self.rows or not self.json_root:
-            messagebox.showinfo("Ingen data", "Last inn en A07 JSON først."); return
-        checks = validate_against_summary(self.rows, self.json_root)
-        if not checks: messagebox.showinfo("Ingen oppsummering", "Fant ikke 'oppsummerteVirksomheter' i JSON."); return
-        win = tk.Toplevel(self); win.title("Validering mot oppsummering"); win.geometry("720x480")
-        ttk.Label(win, text="Sammenligning av summer per kode:").pack(side=tk.TOP, anchor="w", padx=8, pady=8)
-        f = ttk.Frame(win); f.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(0,8))
-        tbl = Table(f, [("kode","Kode"),("detalj","Detaljsum"),("oppsummert","Oppsummert"),("diff","Diff")])
-        for c in ("detalj","oppsummert","diff"): tbl.set_column_format(c, fmt_amount)
-        rows = [{"kode":c,"detalj":d,"oppsummert":r,"diff":diff} for (c,d,r,diff) in checks]; rows.sort(key=lambda r: -abs(float(r["diff"])))
-        tbl.insert_rows(rows); ttk.Label(win, text=f"Total diff: {fmt_amount(sum(float(r['diff']) for r in rows))}").pack(side=tk.TOP, anchor="w", padx=8, pady=(0,8))
-
-    def on_export_current_table(self):
-        tab = self.nb.select(); widget = self.nametowidget(tab); target: Optional[Table] = None
-        def _find_table(w):
-            nonlocal target
-            if isinstance(w, Table): target = w; return
-            for ch in w.winfo_children(): _find_table(ch)
-        _find_table(widget)
-        if not target: messagebox.showinfo("Ingen tabell", "Aktiv fane inneholder ingen tabell å eksportere."); return
-        path = filedialog.asksaveasfilename(title="Lagre CSV", defaultextension=".csv", filetypes=[("CSV","*.csv")])
-        if not path: return
-        try: target.export_csv(path); messagebox.showinfo("Eksport", f"Skrev fil: {os.path.basename(path)}")
-        except Exception as e: messagebox.showerror("Feil ved eksport", str(e))
-
-    def on_load_gl(self):
-        path = filedialog.askopenfilename(title="Velg saldobalanse (CSV)", filetypes=[("CSV","*.csv"),("Alle filer","*.*")])
-        if not path: return
-        try:
-            rows, meta = read_gl_csv(path)
-        except Exception as e:
-            messagebox.showerror("Feil ved lesing", f"Kunne ikke lese CSV: {e}"); return
-        self.gl_accounts = rows; self.gl_meta = meta
-        self.acc_to_codess.clear(); self.auto_suggestions.clear()
-        self.use_lp_assignment = False; self.lp_assignment.clear(); self.lp_fixed.clear(); self.lp_amounts.clear()
-        self.ctrl_status.configure(text=(
-            f"Saldobalanse: {len(rows)} konti.  Kolonner: IB={'ja' if meta.get('ib') else 'nei'}, "
-            f"D={'ja' if meta.get('debet') else 'nei'}, K={'ja' if meta.get('kredit') else 'nei'}, "
-            f"Endr={'ja' if meta.get('endring') else 'nei'}, UB={'ja' if meta.get('ub') else 'nei'}  • Enc: {meta.get('encoding')} • Sep: '{meta.get('delimiter')}'"
-        ))
-        self.refresh_control_tables()
-
-    def on_auto_map(self):
-        if not self.gl_accounts: messagebox.showinfo("Mangler saldobalanse", "Last inn saldobalanse (CSV) først."); return
-        if not self.rows: messagebox.showinfo("Mangler A07", "Last inn A07 JSON først."); return
-        a07_sums = summarize_by_code(self.rows)
-        if self.rulebook and suggest_with_rulebook is not None:
-            suggestions = suggest_with_rulebook(self.gl_accounts, a07_sums, self.rulebook, min_score=float(self.min_score.get()))
-        else:
-            suggestions = fallback_suggest(self.gl_accounts, a07_sums, min_score=float(self.min_score.get()))
-        self.auto_suggestions = suggestions
-        for acc in self.gl_accounts:
-            accno = acc["konto"]
-            if accno in suggestions:
-                # Replace any existing mapping with a single‑code list
-                self.acc_to_codess[accno] = [suggestions[accno]["kode"]]
-        self.use_lp_assignment = False
-        # Etter at regelbok/fallback har foreslått koder, forsøk enkel beløpsmatch
-        try:
-            self._smart_amount_match(a07_sums)
-        except Exception:
-            pass
-        # Oppdater visningen etter auto‑mapping og beløpsmatch
-        self.refresh_control_tables()
-        # Kjør LP-optimalisering for å fordele beløp dersom den er tilgjengelig og splits er tillatt
-        try:
-            if HAVE_LP and self.allow_splits.get():
-                self.on_optimize_lp()
-        except Exception:
-            pass
-
-    def on_set_code(self):
-        sel = self.tbl_gl.selection()
-        if not sel: messagebox.showinfo("Velg konto", "Marker én eller flere konti i tabellen først."); return
-        codes = sorted(list(summarize_by_code(self.rows).keys()))
-        win = tk.Toplevel(self); win.title("Sett kode for valgt(e) konto(er)"); win.geometry("460x120")
-        ttk.Label(win, text=f"Velg A07-kode:").pack(side=tk.TOP, anchor="w", padx=10, pady=(10,6))
-        var = tk.StringVar(value=""); cb = ttk.Combobox(win, textvariable=var, values=[""]+codes, state="readonly"); cb.pack(side=tk.TOP, fill=tk.X, padx=10)
-        box = ttk.Frame(win); box.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
-        def ok():
-            val = var.get().strip()
-            for item in sel:
-                accno = self.tbl_gl.item(item, "values")[0]
-                if val:
-                    # Set a single‑code list for this account
-                    self.acc_to_codess[accno] = [val]
-                else:
-                    self.acc_to_codess.pop(accno, None)
-            self.use_lp_assignment = False
-            win.destroy(); self.refresh_control_tables()
-        ttk.Button(box, text="OK", command=ok).pack(side=tk.RIGHT); ttk.Button(box, text="Avbryt", command=win.destroy).pack(side=tk.RIGHT, padx=6)
-
-    def on_clear_code(self):
-        sel = self.tbl_gl.selection()
-        if not sel: messagebox.showinfo("Velg konto", "Marker konti du vil fjerne mapping for."); return
-        for item in sel:
-            accno = self.tbl_gl.item(item, "values")[0]
-            # Fjern mapping for denne kontoen (kan være én eller flere koder)
-            self.acc_to_codess.pop(accno, None)
-        self.use_lp_assignment = False
-        self.refresh_control_tables()
-
-    def on_reset_mapping(self):
-        if messagebox.askyesno("Nullstill mapping", "Fjern all mapping (manuell + auto + LP)?"):
-            self.acc_to_codess.clear(); self.auto_suggestions.clear()
-            self.use_lp_assignment = False; self.lp_assignment.clear(); self.lp_fixed.clear(); self.lp_amounts.clear()
-            self.refresh_control_tables()
-
-    # ----- Beløpsbasert automatching -----
-    def _smart_amount_match(self, a07_sums: Dict[str,float], tolerance: float | None = None) -> None:
-        """
-        Forsøk å matche GL‑konti til A07‑koder basert på likt beløp.
-
-        Denne funksjonen ser på alle koder i ``a07_sums`` som foreløpig ikke har
-        fått noe regnskapsbeløp (dvs. GL (mappet) = 0).  Hvis det finnes en
-        konto som ennå ikke er mappet, og kontobeløpet (i valgt basis) er
-        lik A07‑summen innenfor en toleranse, settes mappingen direkte.
-
-        Args:
-            a07_sums: Summer per A07‑kode fra A07‑rapporten.
-            tolerance: Maksimalt akseptert avvik i NOK mellom A07 og GL.  Hvis
-                ``None`` brukes ``self.diff_threshold.get()`` som terskel.
-        """
-        try:
-            thr = float(tolerance) if tolerance is not None else float(self.diff_threshold.get())
-        except Exception:
-            thr = 0.0
-        # Beregn GL-sum per kode med gjeldende mapping (uten LP)
-        gl_per_code: Dict[str, float] = defaultdict(float)
-        for acc in self.gl_accounts:
-            codes = self.acc_to_codess.get(acc["konto"])
-            if not codes:
-                continue
-            amt, _lbl = self._gl_amount(acc)
-            # Split amount equally among codes
-            try:
-                share = float(amt) / len(codes)
-            except Exception:
-                share = 0.0
-            for code in codes:
-                gl_per_code[code] += share
-        # Finn koder uten regnskap (GL-sum = 0 eller ikke i dict).  Sorter kodene
-        # etter absolutt A07-beløp slik at små beløp matches først.  Dette
-        # øker sjansen for nøyaktige beløpsmatcher (f.eks. 60 320) før store
-        # beløp (f.eks. 13 000 000).
-        unmapped_codes: List[Tuple[str, float]] = []
-        for code, a07_sum in a07_sums.items():
-            if gl_per_code.get(code, 0.0) != 0.0:
-                continue
-            try:
-                target = float(a07_sum)
-            except Exception:
-                continue
-            unmapped_codes.append((code, target))
-        # Sorter på absolutt verdi av A07-sum (minste først)
-        unmapped_codes.sort(key=lambda kv: abs(kv[1]))
-        for code, target in unmapped_codes:
-            # Let etter en umappet konto som matcher beløpet innenfor toleranse
-            matched = False
-            for acc in self.gl_accounts:
-                accno = acc["konto"]
-                if accno in self.acc_to_codess:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            for c in data.get("codes", []):
+                code = c.get("code", "").strip()
+                if not code:
                     continue
-                try:
-                    amt, _lbl = self._gl_amount(acc)
-                except Exception:
-                    continue
-                try:
-                    if abs(float(amt) - target) <= thr:
-                        # Sett mapping og gå videre til neste kode
-                        self.acc_to_codess[accno] = [code]
-                        matched = True
-                        break
-                except Exception:
-                    continue
-            # Hvis ingen enkeltkonto ble matchet, forsøk å kombinere to konti som sammen gir beløpet
-            if not matched:
-                # Samle alle umappede konti med beløp
-                remaining: List[Tuple[str, float]] = []
-                for acc2 in self.gl_accounts:
-                    accno2 = acc2["konto"]
-                    if accno2 in self.acc_to_codess:
-                        continue
+                name = c.get("name", code)
+                ranges = []
+                for r in c.get("account_ranges", []):
                     try:
-                        amt2, _lbl2 = self._gl_amount(acc2)
+                        a, b = int(r[0]), int(r[1])
+                        if a > b:
+                            a, b = b, a
+                        ranges.append((a, b))
                     except Exception:
                         continue
-                    remaining.append((accno2, float(amt2)))
-                n = len(remaining)
-                # Sjekk parvise kombinasjoner
-                for i in range(n):
-                    for j in range(i+1, n):
-                        acc_i, amt_i = remaining[i]
-                        acc_j, amt_j = remaining[j]
-                        try:
-                            if abs((amt_i + amt_j) - target) <= thr:
-                                # Kartlegg begge kontiene til koden
-                                self.acc_to_codess[acc_i] = [code]
-                                self.acc_to_codess[acc_j] = [code]
-                                matched = True
-                                break
-                        except Exception:
-                            continue
-                    if matched:
-                        break
-
-    # ---------- LP ----------
-    def on_optimize_lp(self):
-        if not HAVE_LP:
-            messagebox.showinfo("LP mangler", "PuLP/LP er ikke tilgjengelig i miljøet."); return
-        if not self.gl_accounts: messagebox.showinfo("Mangler saldobalanse", "Last inn saldobalanse (CSV) først."); return
-        if not self.rows: messagebox.showinfo("Mangler A07", "Last inn A07 JSON først."); return
-        if not self.rulebook:
-            messagebox.showinfo("Regelbok mangler", "Last regelbok under 'Innstillinger' først."); return
-
-        amounts: Dict[str,float] = {}
-        for acc in self.gl_accounts:
-            val, _ = self._gl_amount(acc)
-            amounts[str(acc["konto"])] = float(val)
-        self.lp_amounts = amounts
-
-        fixed = defaultdict(float); skip_edges = set()
-        for code, rule in self.rulebook.get("codes", {}).items():
-            for spec in rule.get("special_add", []):
-                accno = str(spec.get("account","")); basis = str(spec.get("basis","endring")).lower(); weight = float(spec.get("weight", 1.0))
-                for acc in self.gl_accounts:
-                    if str(acc.get("konto")) == accno:
-                        v = self._gl_amount_by_basis(acc, basis)
-                        fixed[code] += weight * v
-                        skip_edges.add((accno, code))
-                        break
-        self.lp_fixed = dict(fixed)
-
-        a07_raw = summarize_by_code(self.rows)
-        targets = {c: float(a07_raw.get(c,0.0) - fixed.get(c,0.0)) for c in set(a07_raw)|set(fixed)}
-
-        cands = generate_candidates_for_lp(self.gl_accounts, a07_raw, self.rulebook,
-                                           amounts_override=amounts,
-                                           min_name=0.25, min_score=float(self.min_score.get())-0.10,
-                                           top_k=3, skip_edges=skip_edges)
-        if not cands:
-            messagebox.showwarning("LP", "Fant ingen kandidater. Sjekk regelbok/Min‑score."); return
-
-        try:
-            assignment = solve_global_assignment_lp(
-                amounts, cands, targets,
-                allow_splits=bool(self.allow_splits.get()),
-                lambda_score=0.25, lambda_sign=0.05
-            )
-        except Exception as e:
-            messagebox.showerror("LP-feil", str(e)); return
-
-        self.lp_assignment = assignment; self.use_lp_assignment = True
-        self.acc_to_codess.clear()
-        for accno, parts in assignment.items():
-            if parts:
-                code = max(parts.items(), key=lambda kv: kv[1])[0]
-                self.acc_to_codess[accno] = [code]
-        self.refresh_control_tables()
-        messagebox.showinfo("Optimalisering", "LP‑løsning ferdig. Avstemmingstabellen er oppdatert.")
-
-    # ---------- Beregninger/refresh ----------
-
-    def _gl_amount(self, acc: Dict[str, Any]) -> Tuple[float, str]:
-        """
-        Return the amount and a label for a GL account based on the selected basis.
-
-        The user can choose between UB (utgående saldo), Endring (bevegelse), Beløp
-        (kolonne), or Auto.  In Auto‑modus bruker vi et enkelt heuristikk:
-
-        - For balansekonti (konto < 3000) benyttes Endring (bevegelse), siden
-          disse normalt representerer oppgjørsposter som avstemmes mot A07.
-        - For øvrige konti (5000‑ og 7000‑serien) benyttes UB (utgående saldo),
-          som er mest naturlig for kostnadsførte kontoer.
-
-        Args:
-            acc: Et dict med feltene "konto", "ub", "endring" og "belop".
-
-        Returns:
-            Tuple med (beløp, etikett) der etiketten viser hvilket grunnlag som ble brukt.
-        """
-        mode = self.gl_basis.get()
-        # Eksplisitt valg fra radioknappene
-        if mode == "ub":
-            return float(acc.get("ub", 0.0)), "UB"
-        if mode == "endring":
-            return float(acc.get("endring", 0.0)), "Endring"
-        if mode == "belop":
-            return float(acc.get("belop", 0.0)), "Beløp"
-        # Auto: bestem basis ut fra kontonummer (balanse vs resultat)
-        accno = str(acc.get("konto", ""))
-        digits = re.sub(r"\D+", "", accno)
-        try:
-            num = int(digits) if digits else None
-        except Exception:
-            num = None
-        # Balansekonti (1000-2999) bruker endring; ellers UB
-        if num is not None and num < 3000:
-            return float(acc.get("endring", acc.get("belop", 0.0))), "Auto:Endring"
-        return float(acc.get("ub", acc.get("belop", 0.0))), "Auto:UB"
-
-    def _gl_amount_by_basis(self, acc: Dict[str,Any], basis: str) -> float:
-        b = (basis or "endring").lower()
-        if b == "ub": return float(acc.get("ub",0.0))
-        if b == "belop": return float(acc.get("belop",0.0))
-        return float(acc.get("endring", acc.get("belop",0.0)))
-
-    # ----- Kandidat-filtrering -----
-    def _get_likely_accounts(self) -> List[Dict[str,Any]]:
-        """
-        Returner en liste over de GL‑kontoene som er mest relevante for matching.
-
-        Hvis en regelbok er lastet og LP‑hjelperne er tilgjengelige, bruker vi
-        ``generate_candidates_for_lp`` til å finne kontoer som har minst én
-        gyldig kandidatkode.  Ellers faller vi tilbake til å bruke de
-        kontoene som har fått et autoutkast fra regelbok/fallback.  Dette
-        forhindrer at irrelevante kontoer vises i DnD‑brettet.
-        """
-        try:
-            # Dersom vi har regelbok og LP-hjelpere, bygg kandidater per konto
-            if self.rulebook and HAVE_LP:
-                from a07_optimize import generate_candidates_for_lp
-                a07_sums = summarize_by_code(self.rows) if self.rows else {}
-                # Bruk valgt basis for beløp
-                amounts = {acc["konto"]: self._gl_amount(acc)[0] for acc in self.gl_accounts}
-                candidates = generate_candidates_for_lp(
-                    self.gl_accounts,
-                    a07_sums,
-                    self.rulebook,
-                    amounts_override=amounts,
-                    min_name=0.25,
-                    min_score=max(0.40, float(self.min_score.get()) - 0.10),
-                    top_k=1
+                expected_sign = c.get("expected_sign", None)
+                if expected_sign not in (-1, 0, 1, None):
+                    expected_sign = None
+                aliases = [str(x) for x in (c.get("aliases") or [])]
+                keywords = [str(x) for x in (c.get("keywords") or [])]
+                self.codes[code] = A07CodeDef(
+                    code=code, name=name,
+                    account_ranges=ranges,
+                    expected_sign=expected_sign,
+                    aliases=aliases, keywords=keywords
                 )
-                return [acc for acc in self.gl_accounts if str(acc.get("konto")) in candidates and candidates[str(acc.get("konto"))]]
-            else:
-                # Uten regelbok: returner kontoer som har et forslag fra fallback/autosuggestions
-                return [acc for acc in self.gl_accounts if acc.get("konto") in self.auto_suggestions]
-        except Exception:
-            # På feil, returner alle kontoer
-            return list(self.gl_accounts)
+        except Exception as e:
+            messagebox.showerror("Regelbok", f"Kunne ikke lese JSON:\n{e}")
 
-    def _set_compact_columns(self):
-        compact = bool(self.compact_view.get())
-        cols_hide = ["ib","debet","kredit","ub"]
-        for c in cols_hide:
-            try:
-                self.tbl_gl.column(c, width=(1 if compact else 120), stretch=(not compact))
-            except Exception:
-                pass
-
-    def _on_gl_row_selected(self, _evt=None):
-        sel = self.tbl_gl.focus()
-        if not sel:
-            return
-        vals = self.tbl_gl.item(sel, "values")
-        if not vals:
-            return
-        accno = str(vals[0])
-        self._refresh_gl_detail_panel(accno)
-
-    def _apply_selected_alt(self):
-        try:
-            idx = self.det_alt_list.curselection()
-            if not idx: return
-            line = self.det_alt_list.get(idx[0])
-            code = line.split()[0]
-            if hasattr(self, "_detail_accno") and self._detail_accno and code:
-                # When choosing an alternative code, replace any existing
-                # mappings with a single‑code list.  Using a list allows
-                # accounts to be mapped to multiple codes in the future.
-                self.acc_to_codess[self._detail_accno] = [code]
-                self.use_lp_assignment = False
-                self.refresh_control_tables()
-        except Exception:
-            pass
-
-    def _refresh_gl_detail_panel(self, accno: str):
-        self._detail_accno = accno
-        acc = None
-        for a in self.gl_accounts:
-            if str(a.get("konto")) == str(accno):
-                acc = a; break
-        if not acc:
-            self.det_account.config(text="Konto: –"); self.det_amount.config(text="Beløp (basis): –"); self.det_best.config(text="–")
-            self.det_alt_list.delete(0, tk.END); return
-
-        amt, lbl = self._gl_amount(acc)
-        self.det_account.config(text=f"Konto {accno} — {acc.get('navn','')}")
-        self.det_amount.config(text=f"{lbl}: {fmt_amount(amt)}")
-
-        sugg = self.auto_suggestions.get(accno, {})
-        # Retrieve chosen code from our multi-code mapping.  If the account
-        # has been mapped to one or more codes, display the first code
-        # in the list.  Otherwise fall back to the suggestion.
-        codes = self.acc_to_codess.get(accno)
-        if isinstance(codes, (list, tuple)):
-            chosen = codes[0] if codes else ""
-        else:
-            chosen = codes or sugg.get("kode", "")
-        best_txt = chosen or "–"
-        if sugg and chosen == sugg.get("kode",""):
-            sc = sugg.get("score", "")
-            best_txt += f"   ({sc:.3f})" if isinstance(sc,(float,int)) else ""
-        self.det_best.config(text=best_txt)
-
-        self.det_alt_list.delete(0, tk.END)
-        try:
-            if self.rulebook and HAVE_LP:
-                a07_sums = summarize_by_code(self.rows)
-                cands = generate_candidates_for_lp([acc], a07_sums, self.rulebook,
-                                                   amounts_override={accno: amt},
-                                                   min_name=0.20, min_score=max(0.30, float(self.min_score.get())-0.20),
-                                                   top_k=5, skip_edges=None).get(accno, [])
-                for (code, score, _a, reason) in cands:
-                    self.det_alt_list.insert(tk.END, f"{code}    {score:.3f}  — {reason}")
-        except Exception:
-            pass
-
-    def refresh_control_tables(self):
-        # Konti & forslag
-        q = getattr(self, "gl_search_var", tk.StringVar(value="")).get().strip().lower()
-        rowsA = []
-        for acc in self.gl_accounts:
-            s, lbl = self._gl_amount(acc)
-            if self.hide_zero.get() and abs(s) < 1e-9 and abs(float(acc.get("ub",0.0))) < 1e-9: continue
-            if q and (q not in str(acc["konto"]).lower()) and (q not in str(acc.get("navn","")).lower()): continue
-            sugg = self.auto_suggestions.get(acc["konto"], {})
-            codes = self.acc_to_codess.get(acc["konto"])
-            if isinstance(codes, (list, tuple)):
-                chosen = codes[0] if codes else ""
-            else:
-                chosen = codes or sugg.get("kode", "")
-            score = sugg.get("score","") if chosen == sugg.get("kode","") else ""
-            reason = sugg.get("reason","") if chosen == sugg.get("kode","") else ""
-            if self.use_lp_assignment and self.lp_assignment.get(acc["konto"]):
-                parts = self.lp_assignment[acc["konto"]]
-                top = sorted(parts.items(), key=lambda kv: -kv[1])[:2]
-                reason = (reason + " | " if reason else "") + "LP: " + ", ".join([f"{c} {p*100:.0f}%" for c,p in top])
-            tags = ["ok"] if chosen else (["muted"] if abs(s) < 1e-9 else ["warn"])
-            rowsA.append({
-                "konto": acc["konto"], "navn": acc.get("navn",""), "ib": acc.get("ib",0.0), "debet": acc.get("debet",0.0), "kredit": acc.get("kredit",0.0),
-                "endring": acc.get("endring",0.0), "ub": acc.get("ub",0.0), "basis": lbl, "foreslatt": chosen,
-                "score": f"{score:.3f}" if isinstance(score,(int,float)) else "", "begrunnelse": reason, "_tags": tags
+    def save(self) -> None:
+        p = Path(self.json_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "version": 1,
+            "codes": []
+        }
+        for code, d in sorted(self.codes.items(), key=lambda x: x[0]):
+            data["codes"].append({
+                "code": d.code,
+                "name": d.name,
+                "account_ranges": [[a, b] for (a, b) in d.account_ranges],
+                "expected_sign": d.expected_sign if d.expected_sign in (-1, 0, 1) else None,
+                "aliases": list(d.aliases or []),
+                "keywords": list(d.keywords or [])
             })
-        if self.only_unmapped.get():
-            rowsA = [r for r in rowsA if not r.get("foreslatt")]
-        rowsA.sort(key=lambda r: (r["foreslatt"] or "zzz", -abs(float(r["endring"])))); self.tbl_gl.insert_rows(rowsA)
-        self._set_compact_columns()
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def upsert_code(self, defn: A07CodeDef) -> None:
+        self.codes[defn.code] = defn
+
+    def remove_code(self, code: str) -> None:
+        if code in self.codes:
+            del self.codes[code]
+
+# --------------------------
+# Buckets (enkel/gruppe)
+# --------------------------
+
+@dataclass
+class Bucket:
+    """Samleboks for én eller flere A07-koder + tildelte GL-konti."""
+    bucket_id: str
+    title: str
+    codes: List[str] = field(default_factory=list)      # A07 code ids
+    accounts: Set[int] = field(default_factory=set)     # kontonr
+    target_amount: Decimal = field(default_factory=lambda: Decimal("0.00"))
+    expected_sign: Optional[int] = None                 # aggregeres “svakt”: hvis alle like
+    # computed
+    sum_gl: Decimal = field(default_factory=lambda: Decimal("0.00"))
+    diff: Decimal = field(default_factory=lambda: Decimal("0.00"))
+
+    def compute(self,
+                a07: Dict[str, A07Entry],
+                glindex: Dict[int, GLAccount],
+                metric_of: Dict[int, AmountMetric | None]) -> None:
+        # target = sum av kodenes beløp
+        tgt = Decimal("0.00")
+        signs = set()
+        for c in self.codes:
+            e = a07.get(c)
+            if not e:
+                continue
+            tgt += e.amount
+        self.target_amount = tgt
+
+        # sum(GL) = sum valgt metric for tildelte konti
+        sgl = Decimal("0.00")
+        for k in self.accounts:
+            acc = glindex.get(k)
+            if not acc:
+                continue
+            metric = metric_of.get(k)
+            sgl += amount_for_account(acc, metric=metric, override_default=(metric is None))
+        self.sum_gl = sgl
+        self.diff = (self.target_amount - self.sum_gl).quantize(Decimal("0.01"))
+
+
+# --------------------------
+# Beløps-først Solver
+# --------------------------
+
+class AmountFirstSolver:
+    """
+    Heuristikk:
+    1) Kandidater pr kode: kontointervall → tekst/alias → øvrig (scoring)
+    2) Single-eksakt (abs(target - acct) <= tol)
+    3) Par-kombinasjon (sum av 2 konti ≈ target)
+    4) Subset (inntil K=4 konti) på topp-k kandidater
+    5) Respektér brukte konti (ikke gjenbruk)
+    6) Sign-krav fra regelbok kan vekte noe ned, men blir ikke hard-stop hvis None
+    """
+
+    def __init__(self,
+                 gl_accounts: List[GLAccount],
+                 a07: Dict[str, A07Entry],
+                 defs: Dict[str, A07CodeDef],
+                 metric_of: Dict[int, AmountMetric | None],
+                 tolerance: Decimal = Decimal("5.00"),
+                 top_k: int = 12,
+                 pair_k: int = 8,
+                 subset_k: int = 4):
+        self.gl = gl_accounts
+        self.a07 = a07
+        self.defs = defs
+        self.metric_of = metric_of
+        self.tol = tolerance
+        self.top_k = max(4, top_k)
+        self.pair_k = max(4, pair_k)
+        self.subset_k = max(2, subset_k)
+
+        self.gl_index: Dict[int, GLAccount] = {int(g.konto): g for g in self.gl}
+        self.gl_tokens: Dict[int, List[str]] = {int(g.konto): g.tokens() for g in self.gl}
+        self.used_accounts: Set[int] = set()
+
+    def _amount(self, acc: GLAccount) -> Decimal:
+        metric = self.metric_of.get(int(acc.konto))
+        return amount_for_account(acc, metric=metric, override_default=(metric is None))
+
+    def _candidates_for_code(self, code: str) -> List[Tuple[int, float, Decimal]]:
+        """Returner liste [(konto, score, amount)] sortert synkende på score."""
+        d = self.defs.get(code)
+        tgt = self.a07[code].amount if code in self.a07 else Decimal("0.00")
+        if not d:
+            d = A07CodeDef(code=code, name=code)
+
+        cand: List[Tuple[int, float, Decimal]] = []
+        code_tokens = d.tokens()
+
+        for acc in self.gl:
+            k = int(acc.konto)
+            if k in self.used_accounts:
+                continue
+            amt = self._amount(acc)
+            score = 0.0
+            # Intervall gir stort løft
+            in_range = d.contains_account(k)
+            if in_range:
+                score += 2.5
+            # Tekstlig likhet
+            sim = jaccard(code_tokens, self.gl_tokens.get(k) or [])
+            if sim > 0.0:
+                score += (1.25 * sim)
+            # Beløpsnærhet
+            diff = abs((tgt - amt).copy_abs())
+            if diff <= self.tol:
+                score += 2.0
+            # Eksakt-ish treff
+            if diff <= Decimal("0.00"):
+                score += 3.0
+            # Sign
+            if d.expected_sign in (-1, 1):
+                good = sign_ok(amt, d.expected_sign)
+                score += (0.25 if good else -0.25)
+
+            # Grunnscore hvis helt uten noe: liten terskel for å komme med
+            score += 0.01
+            cand.append((k, score, amt))
+
+        cand.sort(key=lambda x: (-x[1], abs((tgt - x[2]).copy_abs())))
+        return cand
+
+    def _pick_single(self, code: str, tgt: Decimal, cand: List[Tuple[int, float, Decimal]]) -> Optional[int]:
+        for (k, score, amt) in cand[: self.top_k]:
+            if abs((tgt - amt).copy_abs()) <= self.tol:
+                return k
+        return None
+
+    def _pick_pair(self, code: str, tgt: Decimal, cand: List[Tuple[int, float, Decimal]]) -> Optional[Tuple[int, int]]:
+        arr = cand[: self.pair_k]
+        n = len(arr)
+        for i in range(n):
+            ki, si, ai = arr[i]
+            for j in range(i + 1, n):
+                kj, sj, aj = arr[j]
+                s = ai + aj
+                if abs((tgt - s).copy_abs()) <= self.tol:
+                    return (ki, kj)
+        return None
+
+    def _subset_sum_k(self,
+                      tgt: Decimal,
+                      arr: List[Tuple[int, float, Decimal]],
+                      max_k: int = 4) -> Optional[List[int]]:
+        """
+        Enkel backtracking for inntil max_k elementer (begrenset for å holde raskt).
+        Returnerer liste med kontoer.
+        """
+        arr2 = arr[: self.top_k]
+        values = [(k, amt) for (k, _, amt) in arr2]
+
+        best = None
+
+        def dfs(start: int, chosen: List[int], sum_amt: Decimal, left_k: int):
+            nonlocal best
+            diff = (tgt - sum_amt).copy_abs()
+            if diff <= self.tol:
+                best = list(chosen)
+                return True
+            if left_k == 0 or start >= len(values):
+                return False
+            # Grei pruning: hvis vi allerede er forbi, stopp
+            for i in range(start, len(values)):
+                k, a = values[i]
+                if k in self.used_accounts:
+                    continue
+                chosen.append(k)
+                if dfs(i + 1, chosen, sum_amt + a, left_k - 1):
+                    return True
+                chosen.pop()
+            return False
+
+        for k in range(3, max_k + 1):
+            if dfs(0, [], Decimal("0.00"), k):
+                return best
+        return None
+
+    def solve_into_buckets(self, buckets: Dict[str, Bucket]) -> Dict[str, Set[int]]:
+        """
+        Returnerer forslag {bucket_id: {konti}}. Respekterer self.used_accounts.
+        """
+        # Lag arbeidsrekkefølge – start med størst beløp (vanskeligst)
+        order = sorted(
+            [b for b in buckets.values()],
+            key=lambda b: abs(b.target_amount.copy_abs()),
+            reverse=True
+        )
+        result: Dict[str, Set[int]] = {}
+
+        for b in order:
+            tgt = b.target_amount
+            # Kandidater = union av kandidater pr kode
+            all_cand: Dict[int, Tuple[float, Decimal]] = {}
+            for code in b.codes:
+                cand = self._candidates_for_code(code)
+                for (k, s, a) in cand:
+                    prev = all_cand.get(k)
+                    if not prev or s > prev[0]:
+                        all_cand[k] = (s, a)
+            # sortert liste
+            cand_list = [(k, s, a) for (k, (s, a)) in all_cand.items()]
+            cand_list.sort(key=lambda x: (-x[1], abs((tgt - x[2]).copy_abs())))
+
+            # 1) Single
+            single = self._pick_single("|".join(b.codes), tgt, cand_list)
+            if single is not None:
+                self.used_accounts.add(single)
+                result.setdefault(b.bucket_id, set()).add(single)
+                continue
+            # 2) Par
+            pair = self._pick_pair("|".join(b.codes), tgt, cand_list)
+            if pair:
+                for k in pair:
+                    self.used_accounts.add(k)
+                    result.setdefault(b.bucket_id, set()).add(k)
+                continue
+            # 3) Subset inntil 4
+            subset = self._subset_sum_k(tgt, cand_list, max_k=self.subset_k)
+            if subset:
+                for k in subset:
+                    self.used_accounts.add(k)
+                    result.setdefault(b.bucket_id, set()).add(k)
+                continue
+            # Ingen forslag – hopp
+        return result
+
+# --------------------------
+# GUI
+# --------------------------
+
+class A07App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(APP_TITLE)
+        self.root.minsize(APP_MIN_W, APP_MIN_H)
+
+        # Dataområder
+        self.gl_accounts: List[GLAccount] = []
+        self.a07_entries: Dict[str, A07Entry] = {}
+        self.rulebook = RulebookJSON(DEFAULT_RULEBOOK_PATH)
+        self.rulebook.load()
+
+        # Indekser
+        self.gl_index: Dict[int, GLAccount] = {}
+
+        # Mapping / board state
+        self.metric_for_account: Dict[int, Optional[AmountMetric]] = {}  # None = bruk default
+        self.buckets: Dict[str, Bucket] = {}   # bucket_id -> Bucket
+        self.code_to_bucket: Dict[str, str] = {}  # code -> bucket_id
+        self.acc_to_bucket: Dict[int, str] = {}   # konto -> bucket_id
+
+        # GUI state
+        self.only_likely = tk.BooleanVar(value=True)
+        self.metric_mode = tk.StringVar(value="DEFAULT")  # DEFAULT/UB/BEV/IB
+        self.tolerance = tk.StringVar(value="5,00")
+        self.rulebook_path = tk.StringVar(value=self.rulebook.json_path)
+
+        # Bygg GUI
+        self._build_menu_toolbar()
+        self._build_body()
+
+        self._refresh_all()
+
+    # --- GUI bygg ---
+
+    def _build_menu_toolbar(self):
+        top = ttk.Frame(self.root)
+        top.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
+
+        # Regelbok sti
+        ttk.Label(top, text="Regelbok JSON:").pack(side=tk.LEFT)
+        self.ent_rule = ttk.Entry(top, width=60, textvariable=self.rulebook_path)
+        self.ent_rule.pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="Velg ...", command=self.on_choose_rulebook).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Last regelbok", command=self.on_load_rulebook).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Lagre regelbok", command=self.on_save_rulebook).pack(side=tk.LEFT, padx=12)
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        ttk.Button(top, text="Legg til A07‑kode", command=self.on_add_code).pack(side=tk.LEFT, padx=4)
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        ttk.Button(top, text="Last A07 CSV", command=self.on_load_a07).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Last GL CSV", command=self.on_load_gl).pack(side=tk.LEFT, padx=4)
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        # Metric valg
+        ttk.Label(top, text="Beløpsgrunnlag:").pack(side=tk.LEFT)
+        for label, val in [("Default", "DEFAULT"), ("UB", "UB"), ("Bev", "BEV"), ("IB", "IB")]:
+            ttk.Radiobutton(top, text=label, value=val, variable=self.metric_mode,
+                            command=self._refresh_all).pack(side=tk.LEFT)
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        ttk.Label(top, text="Toleranse (kr):").pack(side=tk.LEFT)
+        self.ent_tol = ttk.Entry(top, width=6, textvariable=self.tolerance)
+        self.ent_tol.pack(side=tk.LEFT)
+        ttk.Checkbutton(top, text="Kun sannsynlige konti", variable=self.only_likely,
+                        command=self._refresh_lists).pack(side=tk.LEFT, padx=10)
+
+        ttk.Button(top, text="Auto‑forslag mapping", command=self.on_auto_map).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(top, text="Tøm board", command=self.on_clear_board).pack(side=tk.RIGHT, padx=4)
+
+    def _build_body(self):
+        body = ttk.Frame(self.root)
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # Venstre: A07‑koder
+        left = ttk.Frame(body)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 4), pady=8)
+
+        ttk.Label(left, text="A07‑koder").pack(anchor="w")
+        cols = ("code", "name", "amount")
+        self.tv_codes = ttk.Treeview(left, columns=cols, show="headings", selectmode="extended", height=18)
+        for c, w in [("code", 120), ("name", 280), ("amount", 120)]:
+            self.tv_codes.heading(c, text=c.upper())
+            self.tv_codes.column(c, width=w, anchor="w" if c != "amount" else "e")
+        self.tv_codes.pack(fill=tk.BOTH, expand=True)
+        self.tv_codes.bind("<<TreeviewSelect>>", lambda e: self._refresh_accounts())
+        self._adopt_dnd_source(self.tv_codes)
+
+        btns = ttk.Frame(left)
+        btns.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(btns, text="Lag gruppe av valgte", command=self.on_group_selected_codes).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Fjern valgt kode/gruppe fra board", command=self.on_remove_selected_buckets).pack(side=tk.LEFT, padx=8)
+
+        # Midten: Board (Buckets)
+        mid = ttk.Frame(body)
+        mid.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=8)
+
+        ttk.Label(mid, text="Board (Buckets – koder ↔ GL)").pack(anchor="w")
+        cols_b = ("bucket", "target", "sumgl", "diff", "n_codes", "n_acc")
+        self.tv_board = ttk.Treeview(mid, columns=cols_b, show="headings", height=18, selectmode="browse")
+        for c, w, a in [
+            ("bucket", 260, "w"),
+            ("target", 120, "e"),
+            ("sumgl", 120, "e"),
+            ("diff", 120, "e"),
+            ("n_codes", 80, "center"),
+            ("n_acc", 80, "center"),
+        ]:
+            self.tv_board.heading(c, text=c.upper())
+            self.tv_board.column(c, width=w, anchor=a)
+        self.tv_board.pack(fill=tk.BOTH, expand=True)
+
+        # farger
+        self.tv_board.tag_configure("ok", background="#e9ffe9")      # grønnlig
+        self.tv_board.tag_configure("warn", background="#fff7d9")    # gul
+        self.tv_board.tag_configure("empty", foreground="#999999")   # grå
+
+        self._adopt_dnd_target(self.tv_board)
+
+        # Høyre: GL-konti
+        right = ttk.Frame(body)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 8), pady=8)
+
+        ttk.Label(right, text="GL‑konti (tilgjengelige)").pack(anchor="w")
+        cols_g = ("konto", "navn", "ub", "bev", "ib")
+        self.tv_gl = ttk.Treeview(right, columns=cols_g, show="headings", height=18, selectmode="extended")
+        self.tv_gl.heading("konto", text="KONTO")
+        self.tv_gl.column("konto", width=90, anchor="center")
+        self.tv_gl.heading("navn", text="NAVN")
+        self.tv_gl.column("navn", width=260, anchor="w")
+        self.tv_gl.heading("ub", text="UB")
+        self.tv_gl.column("ub", width=120, anchor="e")
+        self.tv_gl.heading("bev", text="BEV")
+        self.tv_gl.column("bev", width=120, anchor="e")
+        self.tv_gl.heading("ib", text="IB")
+        self.tv_gl.column("ib", width=120, anchor="e")
+        self.tv_gl.pack(fill=tk.BOTH, expand=True)
+        self._adopt_dnd_source(self.tv_gl)
+
+        # Context menus
+        self._build_context_menus()
+
+    def _build_context_menus(self):
+        # Board: høyreklikk
+        self.menu_board = tk.Menu(self.root, tearoff=0)
+        self.menu_board.add_command(label="Fjern valgte GL‑konto(er) fra bucket", command=self.on_ctx_remove_accounts_from_bucket)
+        self.menu_board.add_command(label="Fjern hele bucket (koder blir tilgjengelige igjen)", command=self.on_ctx_remove_bucket)
+
+        # GL: høyreklikk
+        self.menu_gl = tk.Menu(self.root, tearoff=0)
+        self.menu_gl.add_command(label="Sett metric = Default", command=lambda: self._ctx_set_metric(None))
+        self.menu_gl.add_command(label="Sett metric = UB", command=lambda: self._ctx_set_metric(AmountMetric.UB))
+        self.menu_gl.add_command(label="Sett metric = BEV", command=lambda: self._ctx_set_metric(AmountMetric.BEV))
+        self.menu_gl.add_command(label="Sett metric = IB", command=lambda: self._ctx_set_metric(AmountMetric.IB))
+
+        # Bind
+        self.tv_board.bind("<Button-3>", self._popup_board)
+        self.tv_gl.bind("<Button-3>", self._popup_gl)
+
+    # --- DnD hjelpere ---
+
+    def _adopt_dnd_source(self, widget: ttk.Treeview):
+        if TkinterDnD is None:
+            return
         try:
-            sel = self.tbl_gl.focus()
-            if sel:
-                accno = str(self.tbl_gl.item(sel, 'values')[0])
-                self._refresh_gl_detail_panel(accno)
+            widget.drag_source_register(1, DND_TEXT)
+            widget.dnd_bind("<<DragInitCmd>>", self._on_drag_init)
+            widget.dnd_bind("<<DragEndCmd>>", self._on_drag_end)
         except Exception:
             pass
 
-        # Avstemming pr kode
-        a07 = summarize_by_code(self.rows)
-        gl_per_code: Dict[str,float] = defaultdict(float); code_to_accounts: Dict[str,int] = defaultdict(int)
-
-        if self.use_lp_assignment and self.lp_assignment:
-            for accno, parts in self.lp_assignment.items():
-                amt = self.lp_amounts.get(accno, 0.0)
-                for code, frac in parts.items():
-                    gl_per_code[code] += amt * float(frac)
-                    code_to_accounts[code] += 1
-            for code, fx in self.lp_fixed.items():
-                gl_per_code[code] += float(fx)
-        else:
-            for acc in self.gl_accounts:
-                codes = self.acc_to_codess.get(acc["konto"])
-                if not codes:
-                    continue
-                amt, _ = self._gl_amount(acc)
-                try:
-                    share = float(amt) / len(codes)
-                except Exception:
-                    share = 0.0
-                for code in codes:
-                    gl_per_code[code] += share
-                    code_to_accounts[code] += 1
-            if self.rulebook:
-                for code, rule in self.rulebook.get("codes", {}).items():
-                    for spec in rule.get("special_add", []):
-                        accno = str(spec.get("account","")); basis = str(spec.get("basis","endring")).lower(); weight = float(spec.get("weight", 1.0))
-                        # Skip if account is already mapped in our multi-code mapping
-                        if accno in self.acc_to_codess:
-                            continue
-                        for acc in self.gl_accounts:
-                            if str(acc.get("konto")) == accno:
-                                gl_per_code[code] += weight * self._gl_amount_by_basis(acc, basis)
-
-        all_codes = set(a07)|set(gl_per_code)
-        rowsB = []
-        total_a07 = 0.0; total_gl = 0.0; thr = self.diff_threshold.get()
-        for code in sorted(all_codes):
-            a = a07.get(code,0.0); g = gl_per_code.get(code,0.0); d = a - g
-            total_a07 += a; total_gl += g
-            tag = "ok" if abs(d) <= thr else ("warn" if abs(d) <= 5*thr else "bad")
-            rowsB.append({"kode": code, "a07": a, "gl": g, "diff": d, "ant_konti": code_to_accounts.get(code,0), "_tags":[tag]})
-        if self.only_diff.get():
-            rowsB = [r for r in rowsB if abs(float(r["diff"])) > thr]
-        rowsB.sort(key=lambda r: -abs(float(r["diff"]))); self.tbl_ctrl_codes.insert_rows(rowsB)
-        self.lab_a07.configure(text=f"A07: {fmt_amount(total_a07)}"); self.lab_gl.configure(text=f"GL (mappet): {fmt_amount(total_gl)}"); self.lab_diff.configure(text=f"Diff: {fmt_amount(total_a07-total_gl)}")
-        unmapped = [acc for acc in self.gl_accounts if acc["konto"] not in self.acc_to_codess]
-        self.lab_unmapped.configure(text=f"Uten mapping: {len([a for a in unmapped if not(self.hide_zero.get() and abs(self._gl_amount(a)[0])<1e-9)])}")
-        self.lab_code_gap.configure(text=f"Koder uten GL: {len([c for c in a07 if gl_per_code.get(c,0.0)==0.0])}")
-
-        # --- Oppdater DnD‑brettet ---
-        # Filtrer kontolisten til de mest sannsynlige kontoene før vi sender
-        # dem til brettet.  Dette gjør at kun relevante kontoer vises og at
-        # brukerens søk og regelbokfiler ikke drukner i irrelevante konti.
+    def _adopt_dnd_target(self, widget: ttk.Treeview):
+        if TkinterDnD is None:
+            return
         try:
-            if hasattr(self, "board"):
-                # Hent kun kontoer som har en kandidatkode via regelbok
-                accounts_for_board = self._get_likely_accounts()
-                # Pass the currently selected basis (auto, ub, endring, belop) so that
-                # the board can display which basis is being used.
-                current_basis = str(self.gl_basis.get() or "endring").lower()
-                # Convert our mapping (list of codes) to a single‑code mapping for the
-                # DnD board by taking the first code in each list.  This board
-                # implementation currently expects a ``Dict[str,str]``.
-                mapping_for_board: Dict[str,str] = {}
-                for accno, codes in self.acc_to_codess.items():
-                    if isinstance(codes, (list, tuple)) and codes:
-                        mapping_for_board[accno] = codes[0]
-                    elif isinstance(codes, str):
-                        mapping_for_board[accno] = codes
-                self.board.supply_data(
-                    accounts=accounts_for_board,
-                    acc_to_code=mapping_for_board,
-                    suggestions=self.auto_suggestions,
-                    a07_sums=a07,
-                    diff_threshold=float(self.diff_threshold.get()),
-                    only_unmapped=bool(self.only_unmapped.get()),
-                    basis=current_basis,
-                )
+            widget.drop_target_register(DND_TEXT)
+            widget.dnd_bind("<<DropEnter>>", lambda e: e.action)
+            widget.dnd_bind("<<DropPosition>>", lambda e: e.action)
+            widget.dnd_bind("<<DropLeave>>", lambda e: e.action)
+            widget.dnd_bind("<<Drop>>", self._on_drop_to_board)
         except Exception:
             pass
 
-    def _refresh_overview(self):
-        self.ov_file.configure(text=f"Fil: {getattr(self,'_file_name','–')}")
-        uniq_clients = len(set(r["orgnr"] for r in self.rows)); uniq_emp = len(set(r["fnr"] for r in self.rows))
-        total_rows = len(self.rows); total_amount = sum(float(r["beloep"]) for r in self.rows)
-        self.ov_labels["clients"].configure(text=f"Virksomheter: {uniq_clients}")
-        self.ov_labels["employees"].configure(text=f"Ansatte: {uniq_emp}")
-        self.ov_labels["rows"].configure(text=f"Antall inntektslinjer: {total_rows}")
-        self.ov_labels["sum"].configure(text=f"Total beløp (alle koder): {fmt_amount(total_amount)}")
-        sums = summarize_by_code(self.rows); rows = [{"kode":k, "sum":v} for k,v in sums.items()]
-        rows.sort(key=lambda r: (-float(r["sum"]), r["kode"])); self.tbl_codes_overview.insert_rows(rows)
+    def _on_drag_init(self, event):
+        # Kommer fra tv_codes eller tv_gl
+        w = event.widget
+        sel = w.selection()
+        if not sel:
+            return (None, 0, 0)
+        payload_ids = ",".join(sel)
+        return ((DND_TEXT, DND_TEXT), tk.DND_TEXT, payload_ids)
 
-    def _refresh_all_tabs(self):
-        self._refresh_overview(); self._refresh_employees_table(); self._refresh_codes_table(); self.tbl_raw.insert_rows(self.rows); self.refresh_control_tables()
+    def _on_drag_end(self, event):
+        pass
 
-    def _on_ctrl_code_drill(self, _=None):
-        sel = self.tbl_ctrl_codes.focus()
-        if not sel: return
-        kode = self.tbl_ctrl_codes.item(sel,"values")[0]
-        a07_data = [r for r in self.rows if str(r["kode"]) == str(kode)]
-        gl_data = []
-        if self.use_lp_assignment and self.lp_assignment:
-            for acc in self.gl_accounts:
-                accno = str(acc["konto"])
-                if kode in self.lp_assignment.get(accno, {}):
-                    amt = self.lp_amounts.get(accno, 0.0) * float(self.lp_assignment[accno][kode])
-                    lbl = self._gl_amount(acc)[1]
-                    gl_data.append({"konto": acc["konto"], "navn": acc.get("navn",""), "belop": amt, "basis": f"{lbl}·LP"})
-        else:
-            for acc in self.gl_accounts:
-                if kode in (self.acc_to_codess.get(acc["konto"], []) if isinstance(self.acc_to_codess.get(acc["konto"]), (list, tuple)) else [self.acc_to_codess.get(acc["konto"])]):
-                    amt,lbl = self._gl_amount(acc)
-                    gl_data.append({"konto": acc["konto"], "navn": acc.get("navn",""), "belop": amt, "basis": lbl})
-        win = tk.Toplevel(self); win.title(f"Drilldown — {kode}"); win.geometry("1000x560")
-        header = ttk.Label(win, text=f"A07 sum: {fmt_amount(sum(float(r['beloep']) for r in a07_data))}  •  GL (mappet): {fmt_amount(sum(g['belop'] for g in gl_data))}")
-        header.pack(side=tk.TOP, anchor="w", padx=8, pady=8)
-        nb = ttk.Notebook(win); nb.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(0,8))
-        tabA = ttk.Frame(nb); nb.add(tabA, text="GL-konti (mappet)")
-        fA = ttk.Frame(tabA); fA.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        tA = Table(fA, [("konto","Konto"),("navn","Kontonavn"),("basis","Basis"),("belop","Beløp")]); tA.set_column_format("belop", fmt_amount); tA.insert_rows(gl_data)
-        tabB = ttk.Frame(nb); nb.add(tabB, text="A07-detaljer")
-        fB = ttk.Frame(tabB); fB.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        tB = Table(fB, [("fnr","Fødselsnr"),("navn","Navn"),("fordel","Fordel"),("beloep","Beløp"),("antall","Antall"),("orgnr","Orgnr")]); tB.set_column_format("beloep", fmt_amount)
-        tB.insert_rows([{ "fnr": r["fnr"], "navn": r["navn"], "fordel": r["fordel"], "beloep": r["beloep"], "antall": r["antall"], "orgnr": r["orgnr"]} for r in a07_data])
-
-    # ----- Regelbok -----
-    def on_load_rulebook_excel(self):
-        if load_rulebook is None:
-            messagebox.showwarning("Regelbok", "a07_rulebook.py mangler – kan ikke laste."); return
-        path = filedialog.askopenfilename(title="Velg regelbok (Excel)", filetypes=[("Excel","*.xlsx"),("Alle filer","*.*")])
-        if not path: return
+    def _on_drop_to_board(self, event):
+        # Motta id’er fra kilder. Finn bucket i board som brukes (eller bruk valgt).
+        sel = self.tv_board.selection()
+        if not sel:
+            messagebox.showwarning("DnD", "Velg en bucket i board før du slipper.")
+            return
+        bucket_id = sel[0]
+        bucket = self.buckets.get(bucket_id)
+        if not bucket:
+            return
+        src = event.widget
+        data = event.data or ""
         try:
-            self.rulebook = load_rulebook(path); self.rulebook_source = path; self._refresh_settings_tables()
-            self._save_prefs(rulebook_path=path)
-            messagebox.showinfo("Regelbok", f"Lest: {os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("Feil ved lesing", str(e))
-
-    def on_load_rulebook_csvdir(self):
-        if load_rulebook is None:
-            messagebox.showwarning("Regelbok", "a07_rulebook.py mangler – kan ikke laste."); return
-        d = filedialog.askdirectory(title="Velg mappe med a07_codes.csv og aliases.csv")
-        if not d: return
-        try:
-            self.rulebook = load_rulebook(d); self.rulebook_source = d; self._refresh_settings_tables()
-            self._save_prefs(rulebook_path=d)
-            messagebox.showinfo("Regelbok", f"Lest CSV-mappe: {d}")
-        except Exception as e:
-            messagebox.showerror("Feil ved lesing", str(e))
-
-    def on_load_rulebook_json(self):
-        """Open a JSON rulebook file and load it using load_rulebook().
-
-        This handler mirrors the behaviour of ``on_load_rulebook_excel`` and
-        ``on_load_rulebook_csvdir`` but for JSON files.  It allows the user
-        to select a single JSON file containing a global rule set and
-        loads it via the patched ``load_rulebook`` function in ``a07_rulebook``.
-        The loaded rules and aliases are stored in ``self.rulebook`` and
-        the source path is saved in user preferences for auto‑loading on
-        subsequent runs.
-        """
-        if load_rulebook is None:
-            messagebox.showwarning("Regelbok", "a07_rulebook.py mangler – kan ikke laste.");
-            return
-        path = filedialog.askopenfilename(
-            title="Velg regelbok (JSON)",
-            filetypes=[("JSON", "*.json"), ("Alle filer", "*.*")]
-        )
-        if not path:
-            return
-        try:
-            rb = load_rulebook(path)
-        except Exception as e:
-            # Present a friendlier error message if this is a JSON parse error
-            emsg = str(e)
-            if "Expecting value" in emsg or "line" in emsg:
-                messagebox.showerror(
-                    "Feil ved innlasting",
-                    "JSON-filen kunne ikke leses. Sjekk at den er gyldig JSON eller lag en ny regelbok.\n\n" + emsg,
-                )
-            else:
-                messagebox.showerror("Feil ved innlasting", emsg)
-            return
-        # If load succeeded, update state
-        self.rulebook = rb
-        self.rulebook_source = path
-        self._refresh_settings_tables()
-        self._save_prefs(rulebook_path=path)
-        messagebox.showinfo("Regelbok", f"Lest: {os.path.basename(path)}")
-
-    def on_export_rulebook_excel(self):
-        """Export the currently loaded rulebook to an Excel file.
-
-        The exported file will contain two sheets: ``a07_codes`` and ``aliases``.
-        This function reconstructs a ``RuleBook`` instance from the
-        in-memory dictionary representation (``self.rulebook``) and uses
-        the ``export_to_excel`` helper in ``rule_storage.RuleBook`` to
-        write the Excel file.  If no rulebook is loaded, the user is
-        notified.  Requires pandas and a working Excel writer engine.
-        """
-        if not self.rulebook:
-            messagebox.showinfo("Eksporter", "Ingen regelbok lastet.")
-            return
-        # Ask user for target path
-        path = filedialog.asksaveasfilename(
-            title="Eksporter regelbok til Excel",
-            defaultextension=".xlsx",
-            filetypes=[("Excel","*.xlsx"), ("Alle filer","*.*")]
-        )
-        if not path:
-            return
-        try:
-            # Build a RuleBook from the in-memory dict
-            from rule_storage import RuleBook, Rule  # type: ignore
+            ids = [x for x in data.split(",") if x]
         except Exception:
-            messagebox.showerror("Eksporter", "Kan ikke importere rule_storage – mangler modul.")
+            ids = []
+        if not ids:
             return
-        rb = RuleBook()
-        # Populate rules
-        for code, r in self.rulebook.get("codes", {}).items():
-            # Reconstruct allowed_ranges as a list of expression strings
-            intervals = r.get("allowed", [])
-            # Flatten numeric intervals into a single expression string separated by ' | '
-            parts: List[str] = []
-            for lo, hi in intervals:
-                parts.append(str(lo) if lo == hi else f"{lo}-{hi}")
-            allowed_ranges = [" | ".join(parts)] if parts else []
-            rule_obj = Rule(
-                code=code,
-                label=str(r.get("label", "")),
-                category=str(r.get("category", "wage")),
-                basis=str(r.get("basis", "auto")),
-                allowed_ranges=allowed_ranges,
-                keywords=list(r.get("keywords", [])),
-                boost_accounts=list(r.get("boost_accounts", [])),
-                expected_sign=int(r.get("expected_sign", 0) or 0),
-                special_add=list(r.get("special_add", [])),
-            )
-            rb.add_rule(rule_obj)
-        # Populate aliases
-        for can, syns in self.rulebook.get("aliases", {}).items():
-            for syn in syns:
+
+        if src == self.tv_gl:
+            # Legg konti til bucket
+            konti = []
+            for iid in ids:
                 try:
-                    rb.add_alias(can, syn)
+                    konto = int(self.tv_gl.set(iid, "konto"))
                 except Exception:
                     continue
+                konti.append(konto)
+            self._assign_accounts_to_bucket(bucket_id, konti)
+        elif src == self.tv_codes:
+            # Legg koder til bucket (om det er en ren kode-bucket – gruppér ellers)
+            codes = []
+            for iid in ids:
+                code = self.tv_codes.set(iid, "code")
+                if code:
+                    codes.append(code)
+            self._add_codes_to_bucket(bucket_id, codes)
+
+    def _popup_board(self, event):
         try:
-            rb.export_to_excel(path)
-            messagebox.showinfo("Eksporter", f"Regelbok lagret til {os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("Eksporter", str(e))
+            iid = self.tv_board.identify_row(event.y)
+            if iid:
+                self.tv_board.selection_set(iid)
+            self.menu_board.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu_board.grab_release()
 
-    def on_save_rulebook_json(self):
-        """Save the entire rulebook (codes and aliases) to a JSON file.
+    def _popup_gl(self, event):
+        try:
+            self.menu_gl.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu_gl.grab_release()
 
-        This function writes the current in-memory rulebook structure to a
-        single JSON file.  It converts numeric interval tuples back into
-        human-readable range expressions (joined by ``|``) and serialises
-        sets into lists.  The resulting JSON can be used as a global
-        rulebook for other clients.  It does not rely on the overrides
-        mechanism and therefore preserves aliases and all code fields.
-        """
-        if not self.rulebook:
-            messagebox.showinfo("Lagre", "Ingen regelbok lastet.")
-            return
-        path = filedialog.asksaveasfilename(
-            title="Lagre regelbok (JSON)",
+    def _ctx_set_metric(self, m: Optional[AmountMetric]):
+        # Set metric for selected accounts in GL list
+        sels = self.tv_gl.selection()
+        for iid in sels:
+            konto = safe_int(self.tv_gl.set(iid, "konto"))
+            if konto:
+                self.metric_for_account[konto] = m
+        self._refresh_board()  # recompute diffs
+
+    # --- I/O handlers ---
+
+    def on_choose_rulebook(self):
+        p = filedialog.asksaveasfilename(
+            title="Velg/angi regelbok JSON",
+            initialdir=os.path.dirname(self.rulebook_path.get()),
+            initialfile=os.path.basename(self.rulebook_path.get()),
             defaultextension=".json",
             filetypes=[("JSON", "*.json"), ("Alle filer", "*.*")]
         )
-        if not path:
+        if p:
+            self.rulebook_path.set(p)
+
+    def on_load_rulebook(self):
+        self.rulebook = RulebookJSON(self.rulebook_path.get())
+        self.rulebook.load()
+        messagebox.showinfo("Regelbok", f"Lest {len(self.rulebook.codes)} koder.")
+        self._refresh_all()
+
+    def on_save_rulebook(self):
+        self.rulebook.json_path = self.rulebook_path.get()
+        self.rulebook.save()
+        messagebox.showinfo("Regelbok", f"Lagret {len(self.rulebook.codes)} koder til\n{self.rulebook.json_path}")
+
+    def on_add_code(self):
+        dlg = CodeDialog(self.root, self.rulebook.codes)
+        self.root.wait_window(dlg.top)
+        if dlg.result:
+            self.rulebook.upsert_code(dlg.result)
+            self._refresh_codes()
+
+    def on_load_a07(self):
+        p = filedialog.askopenfilename(
+            title="Velg A07 aggregert CSV (kode, navn, beløp)",
+            filetypes=[("CSV", "*.csv"), ("Alle filer", "*.*")]
+        )
+        if not p:
             return
         try:
-            # Build full rulebook dict
-            codes_out: Dict[str, Any] = {}
-            for code, rule in self.rulebook.get("codes", {}).items():
-                # Convert numeric intervals back to range expressions
-                intervals = rule.get("allowed", []) or []
-                parts: List[str] = []
-                for lo, hi in intervals:
-                    parts.append(str(lo) if lo == hi else f"{lo}-{hi}")
-                # Allowed ranges as list; if multiple intervals, join with ' | '
-                allowed_ranges = [" | ".join(parts)] if parts else []
-                codes_out[code] = {
-                    "code": code,
-                    "label": str(rule.get("label", "")),
-                    "category": str(rule.get("category", "wage")),
-                    "basis": str(rule.get("basis", "auto")),
-                    "allowed_ranges": allowed_ranges,
-                    # Convert sets to lists for JSON
-                    "keywords": list(rule.get("keywords", [])),
-                    "boost_accounts": list(rule.get("boost_accounts", [])),
-                    "expected_sign": int(rule.get("expected_sign", 0) or 0),
-                    "special_add": rule.get("special_add", []) or [],
-                }
-            aliases_out: Dict[str, List[str]] = {}
-            for can, syns in self.rulebook.get("aliases", {}).items():
-                aliases_out[can] = list(syns)
-            obj = {"rules": codes_out, "aliases": aliases_out, "source": path}
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(obj, f, ensure_ascii=False, indent=2)
-            messagebox.showinfo("Lagre", f"Regelbok lagret som {os.path.basename(path)}")
+            entries = read_a07_csv(p)
         except Exception as e:
-            messagebox.showerror("Lagre", str(e))
-
-    # ----- Legg til ny A07-kode -----
-    def on_add_rule(self) -> None:
-        """Åpne et vindu hvor brukeren kan opprette en ny A07‑kode.
-
-        Den nye koden legges direkte inn i den aktive regelboken.  Hvis
-        ingen regelbok er lastet, vises en informasjonstekst.  Dialogen
-        samler inn kode, beskrivelse, kategori, basis, kontointervaller,
-        nøkkelord, boost‑konti og forventet fortegn.  Special‑add kan
-        legges inn som JSON i et tekstfelt.  Etter lagring oppdateres
-        tabellen i regelbokfanen.
-        """
-        if not self.rulebook or "codes" not in self.rulebook:
-            messagebox.showinfo("Regelbok mangler", "Last eller opprett en regelbok før du legger til koder.")
+            messagebox.showerror("A07", f"Feil ved lesing: {e}")
             return
-        win = tk.Toplevel(self)
-        win.title("Legg til A07‑kode")
-        win.geometry("520x360")
-        # Felter for input
-        ttk.Label(win, text="A07‑kode:").grid(row=0, column=0, sticky="w", padx=8, pady=(8,2))
-        code_var = tk.StringVar(); ttk.Entry(win, textvariable=code_var).grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Label(win, text="Beskrivelse:").grid(row=1, column=0, sticky="w", padx=8, pady=(2,2))
-        label_var = tk.StringVar(); ttk.Entry(win, textvariable=label_var).grid(row=1, column=1, sticky="ew", padx=8)
-        ttk.Label(win, text="Kategori:").grid(row=2, column=0, sticky="w", padx=8, pady=(2,2))
-        cat_var = tk.StringVar(value="wage"); ttk.Entry(win, textvariable=cat_var).grid(row=2, column=1, sticky="ew", padx=8)
-        ttk.Label(win, text="Basis (auto|ub|endring|belop):").grid(row=3, column=0, sticky="w", padx=8, pady=(2,2))
-        basis_var = tk.StringVar(value="endring"); ttk.Entry(win, textvariable=basis_var).grid(row=3, column=1, sticky="ew", padx=8)
-        ttk.Label(win, text="Kontointervaller (f.eks. 5000-5399|2940):").grid(row=4, column=0, sticky="w", padx=8, pady=(2,2))
-        allowed_var = tk.StringVar(); ttk.Entry(win, textvariable=allowed_var).grid(row=4, column=1, sticky="ew", padx=8)
-        ttk.Label(win, text="Nøkkelord (komma‑separert):").grid(row=5, column=0, sticky="w", padx=8, pady=(2,2))
-        keywords_var = tk.StringVar(); ttk.Entry(win, textvariable=keywords_var).grid(row=5, column=1, sticky="ew", padx=8)
-        ttk.Label(win, text="Boost‑konti (komma‑separert):").grid(row=6, column=0, sticky="w", padx=8, pady=(2,2))
-        boost_var = tk.StringVar(); ttk.Entry(win, textvariable=boost_var).grid(row=6, column=1, sticky="ew", padx=8)
-        ttk.Label(win, text="Forventet fortegn (+/-/blank):").grid(row=7, column=0, sticky="w", padx=8, pady=(2,2))
-        sign_var = tk.StringVar(value=""); ttk.Entry(win, textvariable=sign_var, width=5).grid(row=7, column=1, sticky="w", padx=8)
-        ttk.Label(win, text="Special‑add (JSON):").grid(row=8, column=0, sticky="nw", padx=8, pady=(2,2))
-        special_text = tk.Text(win, height=3, width=40); special_text.grid(row=8, column=1, sticky="ew", padx=8)
-        win.columnconfigure(1, weight=1)
+        self.a07_entries = {e.code: e for e in entries}
+        # Opprett “default buckets” for hver kode (om ikke eksisterer)
+        for code, e in self.a07_entries.items():
+            if code in self.code_to_bucket:
+                continue
+            b_id = f"k:{code}"
+            self.buckets[b_id] = Bucket(
+                bucket_id=b_id,
+                title=f"{code} – {e.name or code}",
+                codes=[code]
+            )
+            self.code_to_bucket[code] = b_id
+        self._refresh_all()
 
-        def save_new_code():
-            code = code_var.get().strip()
-            if not code:
-                messagebox.showerror("Ugyldig kode", "A07‑kode kan ikke være tom.")
-                return
-            label = label_var.get().strip() or code
-            category = cat_var.get().strip() or "wage"
-            basis = basis_var.get().strip().lower() or "endring"
-            allowed_ranges = []
-            allowed_str = allowed_var.get().strip()
-            if allowed_str:
-                for term in allowed_str.split("|"):
-                    term = term.strip()
-                    if term:
-                        allowed_ranges.append(term)
-            keywords = [k.strip() for k in keywords_var.get().split(",") if k.strip()]
-            boost_accounts = [b.strip() for b in boost_var.get().split(",") if b.strip()]
-            sign_txt = sign_var.get().strip()
-            if sign_txt == "+":
-                expected_sign = 1
-            elif sign_txt == "-":
-                expected_sign = -1
+    def on_load_gl(self):
+        p = filedialog.askopenfilename(
+            title="Velg Saldobalanse CSV",
+            filetypes=[("CSV", "*.csv"), ("Alle filer", "*.*")]
+        )
+        if not p:
+            return
+        try:
+            rows = read_gl_csv(p)
+        except Exception as e:
+            messagebox.showerror("GL", f"Feil ved lesing: {e}")
+            return
+        self.gl_accounts = rows
+        self.gl_index = {int(g.konto): g for g in self.gl_accounts}
+        self.metric_for_account.clear()
+        self._refresh_all()
+
+    # --- Board/buckets ---
+
+    def on_group_selected_codes(self):
+        sels = self.tv_codes.selection()
+        codes = []
+        for iid in sels:
+            code = self.tv_codes.set(iid, "code")
+            if code:
+                codes.append(code)
+        if len(codes) < 2:
+            messagebox.showwarning("Gruppe", "Velg minst to A07‑koder for å lage en gruppe.")
+            return
+        name = simpledialog.askstring("Ny gruppe", "Navn på gruppen (valgfritt):", initialvalue="Gruppe")
+        if not name:
+            name = f"Gruppe ({len(codes)} koder)"
+        # Opprett bucket
+        bid = self._new_group_bucket(codes, name)
+        # Merk ny bucket valgt
+        self.tv_board.selection_set(bid)
+        self._refresh_board()
+
+    def _new_group_bucket(self, codes: List[str], name: str) -> str:
+        # Fjern koder fra tidligere buckets, legg i ny
+        for c in codes:
+            old = self.code_to_bucket.get(c)
+            if old and old in self.buckets:
+                self.buckets[old].codes = [x for x in self.buckets[old].codes if x != c]
+                if not self.buckets[old].codes and not self.buckets[old].accounts:
+                    del self.buckets[old]
+            self.code_to_bucket.pop(c, None)
+
+        bid = f"g:{abs(hash(tuple(sorted(codes))))}"
+        self.buckets[bid] = Bucket(bucket_id=bid, title=name, codes=codes)
+        for c in codes:
+            self.code_to_bucket[c] = bid
+        return bid
+
+    def _assign_accounts_to_bucket(self, bucket_id: str, konti: Sequence[int]) -> None:
+        b = self.buckets.get(bucket_id)
+        if not b:
+            return
+        for k in konti:
+            # hvis konto allerede brukt i annen bucket: fjern derfra
+            old = self.acc_to_bucket.get(k)
+            if old and old in self.buckets and old != bucket_id:
+                self.buckets[old].accounts.discard(k)
+            b.accounts.add(k)
+            self.acc_to_bucket[k] = bucket_id
+        self._refresh_board()
+        self._refresh_lists()
+
+    def _add_codes_to_bucket(self, bucket_id: str, codes: Sequence[str]) -> None:
+        b = self.buckets.get(bucket_id)
+        if not b:
+            return
+        for c in codes:
+            old = self.code_to_bucket.get(c)
+            if old and old in self.buckets and old != bucket_id:
+                self.buckets[old].codes = [x for x in self.buckets[old].codes if x != c]
+            if c not in b.codes:
+                b.codes.append(c)
+            self.code_to_bucket[c] = bucket_id
+        self._refresh_board()
+        self._refresh_lists()
+
+    def on_remove_selected_buckets(self):
+        # Fjern hele bucket eller code-bucket for valgte codes i venstre liste
+        sels_b = self.tv_board.selection()
+        if sels_b:
+            for bid in sels_b:
+                self._remove_bucket(bid)
+        else:
+            sels_c = self.tv_codes.selection()
+            for iid in sels_c:
+                code = self.tv_codes.set(iid, "code")
+                bid = self.code_to_bucket.get(code)
+                if bid:
+                    self._remove_bucket(bid)
+        self._refresh_all()
+
+    def _remove_bucket(self, bucket_id: str):
+        b = self.buckets.get(bucket_id)
+        if not b:
+            return
+        # Frigi koder
+        for c in b.codes:
+            self.code_to_bucket.pop(c, None)
+            # legg tilbake som egen bucket
+            if c in self.a07_entries:
+                nbid = f"k:{c}"
+                self.buckets[nbid] = Bucket(bucket_id=nbid, title=f"{c} – {self.a07_entries[c].name or c}", codes=[c])
+                self.code_to_bucket[c] = nbid
+        # Frigi konti
+        for k in list(b.accounts):
+            self.acc_to_bucket.pop(k, None)
+        # Slett
+        del self.buckets[bucket_id]
+
+    def on_ctx_remove_accounts_from_bucket(self):
+        sels_b = self.tv_board.selection()
+        if not sels_b:
+            return
+        bid = sels_b[0]
+        b = self.buckets.get(bid)
+        if not b:
+            return
+        # Finn markerte konti i GL-lista og fjern fra bucket
+        remove_k: Set[int] = set()
+        for iid in self.tv_gl.selection():
+            k = safe_int(self.tv_gl.set(iid, "konto"))
+            if k:
+                remove_k.add(k)
+        if not remove_k:
+            # alternativ: fjern alle konti i bucket
+            if messagebox.askyesno("Fjern", "Ingen konti valgt i GL-lista.\nFjerne alle konti fra denne bucket?"):
+                remove_k = set(b.accounts)
+        for k in remove_k:
+            b.accounts.discard(k)
+            self.acc_to_bucket.pop(k, None)
+        self._refresh_board()
+        self._refresh_lists()
+
+    def on_ctx_remove_bucket(self):
+        sels_b = self.tv_board.selection()
+        for bid in sels_b:
+            self._remove_bucket(bid)
+        self._refresh_all()
+
+    # --- Auto-map ---
+
+    def on_auto_map(self):
+        # Oppdater buckets' target før solving
+        self._compute_buckets()
+        # init metric-of med global preferanse
+        self._apply_global_metric()
+        tol = self._read_tolerance()
+        solver = AmountFirstSolver(
+            gl_accounts=self.gl_accounts,
+            a07=self.a07_entries,
+            defs=self.rulebook.codes,
+            metric_of=self.metric_for_account,
+            tolerance=tol,
+            top_k=14,
+            pair_k=10,
+            subset_k=4
+        )
+        # marker brukte konti (allerede i buckets)
+        solver.used_accounts = set(self.acc_to_bucket.keys())
+
+        suggestions = solver.solve_into_buckets(self.buckets)
+        # anvend forslag
+        for bid, konti in suggestions.items():
+            self._assign_accounts_to_bucket(bid, konti)
+        # re-calc
+        self._refresh_board()
+        self._refresh_lists()
+        messagebox.showinfo("Auto‑forslag", "Auto‑mapping fullført.")
+
+    # --- Refresh UI ---
+
+    def _apply_global_metric(self):
+        mode = self.metric_mode.get().upper()
+        if mode == "DEFAULT":
+            # Fjern per-konto overstyring
+            self.metric_for_account = {k: None for k in self.metric_for_account.keys()}
+        else:
+            m = AmountMetric.UB if mode == "UB" else AmountMetric.BEV if mode == "BEV" else AmountMetric.IB
+            # Sett for alle *brukte* konti – tilgjengelige konti får normal default ved bruk
+            for k in list(self.acc_to_bucket.keys()):
+                self.metric_for_account[k] = m
+
+    def _read_tolerance(self) -> Decimal:
+        s = self.tolerance.get().strip().replace(" ", "").replace(".", "").replace(",", ".")
+        try:
+            x = Decimal(s)
+        except Exception:
+            x = Decimal("5.00")
+        return x.quantize(Decimal("0.01"))
+
+    def _compute_buckets(self):
+        # Oppdater target/sum/diff for alle buckets
+        for b in self.buckets.values():
+            b.compute(self.a07_entries, self.gl_index, self.metric_for_account)
+
+    def _refresh_all(self):
+        self._compute_buckets()
+        self._refresh_codes()
+        self._refresh_board()
+        self._refresh_accounts()
+
+    def _refresh_codes(self):
+        self.tv_codes.delete(*self.tv_codes.get_children())
+        # vis koder (ikke grupper) + grupper som egne rader (med leading ★)
+        # Vi holder tv_codes til rene A07-koder (ikke grupper) for enklere valg
+        for code, e in sorted(self.a07_entries.items(), key=lambda x: x[0]):
+            iid = code
+            self.tv_codes.insert("", "end", iid=iid, values=(e.code, e.name, fmt_amount_spaced(e.amount)))
+        # marker koder som er i en gruppe? (kun ved behov)
+        # (kan evt. addere tag for "in_group")
+
+    def _refresh_board(self):
+        self._compute_buckets()
+        self.tv_board.delete(*self.tv_board.get_children())
+        for bid, b in sorted(self.buckets.items(), key=lambda x: x[0]):
+            tags = []
+            if b.accounts:
+                if abs(b.diff.copy_abs()) <= self._read_tolerance():
+                    tags.append("ok")
+                else:
+                    tags.append("warn")
             else:
-                expected_sign = 0
-            # Parse special_add JSON
-            special_raw = special_text.get("1.0", "end").strip()
-            if special_raw:
-                try:
-                    special_add = json.loads(special_raw)
-                    if not isinstance(special_add, list):
-                        raise ValueError("Special‑add må være en liste av objekter.")
-                except Exception as e:
-                    messagebox.showerror("Ugyldig JSON", f"Klarte ikke å parse Special‑add: {e}")
-                    return
-            else:
-                special_add = []
-            # Legg koden inn i regelboken
-            self.rulebook.setdefault("codes", {})[code] = {
-                "code": code,
-                "label": label,
-                "category": category,
-                "basis": basis,
-                "allowed_ranges": allowed_ranges,
-                "keywords": keywords,
-                "boost_accounts": boost_accounts,
-                "expected_sign": expected_sign,
-                "special_add": special_add,
-            }
-            # Oppdater aliases med koden og nøkkelord som synonymer
-            if keywords:
-                canonical = code
-                syns = list(set(keywords + [code]))
-                self.rulebook.setdefault("aliases", {}).setdefault(canonical, [])
-                for syn in syns:
-                    if syn not in self.rulebook["aliases"][canonical]:
-                        self.rulebook["aliases"][canonical].append(syn)
-            self._refresh_settings_tables()
-            win.destroy()
+                tags.append("empty")
+            self.tv_board.insert(
+                "", "end", iid=bid,
+                values=(
+                    b.title,
+                    fmt_amount_spaced(b.target_amount),
+                    fmt_amount_spaced(b.sum_gl),
+                    fmt_amount_spaced(b.diff),
+                    len(b.codes),
+                    len(b.accounts)
+                ),
+                tags=tags
+            )
 
-        # knapper
-        btn_frame = ttk.Frame(win)
-        btn_frame.grid(row=9, column=0, columnspan=2, sticky="e", padx=8, pady=10)
-        ttk.Button(btn_frame, text="Lagre", command=save_new_code).pack(side=tk.RIGHT)
-        ttk.Button(btn_frame, text="Avbryt", command=win.destroy).pack(side=tk.RIGHT, padx=(6,0))
+    def _refresh_accounts(self):
+        # Filtrer GL etter sannsynlige for *valgt* bucket (eller union av valgte koder)
+        self.tv_gl.delete(*self.tv_gl.get_children())
+        if not self.gl_accounts:
+            return
 
-    # ----- Regelbok-editor -----
-    def on_edit_rule(self):
-        if not self.rulebook:
-            messagebox.showinfo("Regelbok", "Last en regelbok først (Excel/CSV)."); return
-        sel = self.tbl_rule_codes.focus()
-        if not sel:
-            messagebox.showinfo("Velg kode", "Marker en A07‑kode i tabellen."); return
-        values = self.tbl_rule_codes.item(sel,"values")
-        code = str(values[0]); rule = dict(self.rulebook.get("codes", {}).get(code, {}))
+        likely_set: Optional[Set[int]] = None
+        if self.only_likely.get():
+            # lag "sannsynlige" basert på markerte koder (A07-lista) eller valgt bucket
+            codes = self._selected_codes()
+            if not codes:
+                # hvis board har valgt bucket – bruk dens koder
+                bsel = self.tv_board.selection()
+                if bsel:
+                    bid = bsel[0]
+                    b = self.buckets.get(bid)
+                    if b:
+                        codes = list(b.codes)
+            likely_set = self._likely_accounts_for_codes(codes)
 
-        win = tk.Toplevel(self); win.title(f"Rediger regel — {code}"); win.geometry("680x560")
-        frm = ttk.Frame(win); frm.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=12, pady=10)
+        for g in self.gl_accounts:
+            k = int(g.konto)
+            # skjul konti som allerede er brukt i en bucket
+            if k in self.acc_to_bucket:
+                continue
+            if likely_set is not None and k not in likely_set:
+                continue
+            ub = amount_for_account(g, metric=AmountMetric.UB)
+            bev = amount_for_account(g, metric=AmountMetric.BEV)
+            ib = amount_for_account(g, metric=AmountMetric.IB)
+            self.tv_gl.insert("", "end", iid=f"acc:{k}",
+                              values=(k, g.navn, fmt_amount_spaced(ub), fmt_amount_spaced(bev), fmt_amount_spaced(ib)))
+
+    def _refresh_lists(self):
+        self._refresh_accounts()
+        self._refresh_board()
+
+    def _selected_codes(self) -> List[str]:
+        codes = []
+        for iid in self.tv_codes.selection():
+            code = self.tv_codes.set(iid, "code")
+            if code:
+                codes.append(code)
+        return codes
+
+    def _likely_accounts_for_codes(self, codes: Sequence[str]) -> Set[int]:
+        if not codes:
+            return set(int(g.konto) for g in self.gl_accounts)
+        # union av intervaller + litt tekstmatcher
+        res: Set[int] = set()
+        for code in codes:
+            d = self.rulebook.codes.get(code)
+            c_toks = d.tokens() if d else []
+            for g in self.gl_accounts:
+                k = int(g.konto)
+                if d and d.contains_account(k):
+                    res.add(k)
+                    continue
+                # tekst
+                if c_toks:
+                    sim = jaccard(c_toks, g.tokens())
+                    if sim >= 0.15:
+                        res.add(k)
+        return res
+
+    # --- kommandoer topp ---
+
+    def on_clear_board(self):
+        self.code_to_bucket.clear()
+        self.acc_to_bucket.clear()
+        self.metric_for_account.clear()
+        self.buckets.clear()
+        # recreate code buckets
+        for code, e in self.a07_entries.items():
+            b_id = f"k:{code}"
+            self.buckets[b_id] = Bucket(
+                bucket_id=b_id, title=f"{code} – {e.name or code}", codes=[code]
+            )
+            self.code_to_bucket[code] = b_id
+        self._refresh_all()
+
+# --------------------------
+# Dialog for ny/endre kode
+# --------------------------
+
+class CodeDialog:
+    def __init__(self, parent, existing: Dict[str, A07CodeDef], code: Optional[str] = None):
+        self.top = tk.Toplevel(parent)
+        self.top.title("A07‑kode – ny/endre")
+        self.top.transient(parent)
+        self.top.grab_set()
+        self.result: Optional[A07CodeDef] = None
+
+        self.existing = existing
+        self.var_code = tk.StringVar(value=code or "")
+        self.var_name = tk.StringVar(value="")
+        self.var_ranges = tk.StringVar(value="")
+        self.var_sign = tk.StringVar(value="none")
+        self.var_alias = tk.StringVar(value="")
+        self.var_keywords = tk.StringVar(value="")
+
+        # Layout
+        frm = ttk.Frame(self.top, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        r = 0
+        ttk.Label(frm, text="Kode:").grid(row=r, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.var_code, width=30).grid(row=r, column=1, sticky="w")
+        r += 1
+        ttk.Label(frm, text="Navn:").grid(row=r, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.var_name, width=50).grid(row=r, column=1, sticky="we")
+        r += 1
+        ttk.Label(frm, text="Kontointervall (eks. 5000-5999|2900-2949|7000):").grid(row=r, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.var_ranges, width=50).grid(row=r, column=1, sticky="we")
+        r += 1
+        ttk.Label(frm, text="Forventet fortegn:").grid(row=r, column=0, sticky="w")
+        frm_sign = ttk.Frame(frm)
+        frm_sign.grid(row=r, column=1, sticky="w")
+        for txt, val in [("Ingen", "none"), ("Positiv (+)", "pos"), ("Negativ (−)", "neg")]:
+            ttk.Radiobutton(frm_sign, text=txt, value=val, variable=self.var_sign).pack(side=tk.LEFT, padx=3)
+        r += 1
+        ttk.Label(frm, text="Alias (|‑separert):").grid(row=r, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.var_alias, width=50).grid(row=r, column=1, sticky="we")
+        r += 1
+        ttk.Label(frm, text="Nøkkelord (|‑separert):").grid(row=r, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.var_keywords, width=50).grid(row=r, column=1, sticky="we")
+        r += 1
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=r, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(btns, text="Lagre", command=self.on_save).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Avbryt", command=self.top.destroy).pack(side=tk.LEFT, padx=6)
+
         frm.columnconfigure(1, weight=1)
 
-        def _row(r, label, var, hint=""):
-            ttk.Label(frm, text=label).grid(row=r, column=0, sticky="w", padx=4, pady=4)
-            ent = ttk.Entry(frm, textvariable=var); ent.grid(row=r, column=1, sticky="ew", padx=4, pady=4)
-            if hint: ttk.Label(frm, text=hint, foreground="#777").grid(row=r, column=2, sticky="w")
-            return ent
+    def on_save(self):
+        code = self.var_code.get().strip()
+        if not code:
+            messagebox.showwarning("Kode", "Kode mangler.")
+            return
+        name = self.var_name.get().strip() or code
+        ranges = parse_account_ranges(self.var_ranges.get())
+        sign = self.var_sign.get()
+        expected_sign = None
+        if sign == "pos":
+            expected_sign = 1
+        elif sign == "neg":
+            expected_sign = -1
+        aliases = [x.strip() for x in self.var_alias.get().split("|") if x.strip()]
+        keywords = [x.strip() for x in self.var_keywords.get().split("|") if x.strip()]
+        self.result = A07CodeDef(
+            code=code, name=name, account_ranges=ranges,
+            expected_sign=expected_sign, aliases=aliases, keywords=keywords
+        )
+        self.top.destroy()
 
-        def _format_allowed(intervals):
-            if not intervals: return ""
-            return " | ".join([f"{lo}-{hi}" if lo!=hi else f"{lo}" for lo,hi in intervals])
+# --------------------------
+# main
+# --------------------------
 
-        v_category = tk.StringVar(value=rule.get("category","wage"))
-        v_basis    = tk.StringVar(value=rule.get("basis","auto"))
-        v_allowed  = tk.StringVar(value=_format_allowed(rule.get("allowed",[])))
-        v_keywords = tk.StringVar(value=", ".join(sorted(rule.get("keywords", []))))
-        v_boost    = tk.StringVar(value=", ".join(sorted(rule.get("boost_accounts", []))))
-        es = int(rule.get("expected_sign", 0))
-        v_exp      = tk.StringVar(value=("+" if es==1 else ("-" if es==-1 else "")))
-        v_special  = tk.StringVar(value=json.dumps(rule.get("special_add", []), ensure_ascii=False))
-
-        _row(0, "Kategori:", v_category)
-        _row(1, "Basis (auto|ub|endring|beløp):", v_basis)
-        _row(2, "Tillatte kontoområder:", v_allowed, "f.eks. 5000-5399 | 7100-7199")
-        _row(3, "Nøkkelord (kommaseparert):", v_keywords)
-        _row(4, "Boost‑konti (kommaseparert):", v_boost, "f.eks. 2940, 5290")
-        _row(5, "Forventet tegn (+/−/tom):", v_exp, "bruk + eller −")
-        ttk.Label(frm, text="Special‑add (JSON‑liste):").grid(row=6, column=0, sticky="nw", padx=4, pady=4)
-        txt = tk.Text(frm, height=7); txt.grid(row=6, column=1, columnspan=2, sticky="nsew", padx=4, pady=4)
-        txt.insert("1.0", v_special.get())
-
-        def _parse_allowed(expr: str):
-            if not expr.strip(): return []
-            parts = re.split(r"[|,;]+", expr)
-            out = []
-            for p in parts:
-                p = p.strip()
-                if not p: continue
-                if "-" in p:
-                    a,b = p.split("-",1)
-                    a = re.sub(r"\D+","",a); b = re.sub(r"\D+","",b)
-                    if a and b: out.append((int(a), int(b)))
-                else:
-                    v = re.sub(r"\D+","",p)
-                    if v: out.append((int(v), int(v)))
-            return out
-
-        def save_and_close():
-            allowed  = _parse_allowed(v_allowed.get())
-            keywords = set(t.strip() for t in v_keywords.get().split(",") if t.strip())
-            boosts   = set(re.sub(r"\D+","",t) for t in v_boost.get().split(",") if t.strip())
-            exp      = v_exp.get().strip()
-            esv      = 1 if exp == "+" else (-1 if exp == "-" else 0)
-            try:
-                special = json.loads(txt.get("1.0","end").strip() or "[]")
-            except Exception as ex:
-                messagebox.showerror("JSON‑feil", f"Special‑add må være gyldig JSON‑liste. {ex}")
-                return
-
-            rb = self.rulebook
-            rb["codes"].setdefault(code, {})
-            rb["codes"][code].update({
-                "category": v_category.get().strip() or "wage",
-                "basis": v_basis.get().strip().lower() or "auto",
-                "allowed": allowed,
-                "keywords": keywords,
-                "boost_accounts": boosts,
-                "expected_sign": esv,
-                "special_add": special,
-            })
-            self.rulebook_overrides.setdefault("codes", {})[code] = rb["codes"][code]
-            self._refresh_settings_tables(); self.refresh_control_tables()
-            win.destroy()
-
-        btns = ttk.Frame(win); btns.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=10)
-        ttk.Button(btns, text="Lagre", command=save_and_close).pack(side=tk.RIGHT)
-        ttk.Button(btns, text="Avbryt", command=win.destroy).pack(side=tk.RIGHT, padx=6)
-
-    def on_save_rulebook_overrides(self):
-        if not self.rulebook_overrides:
-            messagebox.showinfo("Ingen endringer", "Det finnes ingen lokale endringer å lagre."); return
-        path = filedialog.asksaveasfilename(title="Lagre lokale regelendringer (JSON)", defaultextension=".json", filetypes=[("JSON","*.json")])
-        if not path: return
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.rulebook_overrides, f, ensure_ascii=False, indent=2)
-            messagebox.showinfo("Lagret", f"Skrev {os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("Feil ved lagring", str(e))
-
-    def on_load_rulebook_overrides(self):
-        path = filedialog.askopenfilename(title="Velg lokale regelendringer (JSON)", filetypes=[("JSON","*.json")])
-        if not path: return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                overrides = json.load(f)
-            self.rulebook_overrides = overrides
-            if not self.rulebook: self.rulebook = {"codes": {}, "aliases": {}, "source": "(overrides)"}
-            for code, rule in (overrides.get("codes") or {}).items():
-                self.rulebook["codes"][code] = {**(self.rulebook.get("codes", {}).get(code, {})), **rule}
-            for can, syns in (overrides.get("aliases") or {}).items():
-                self.rulebook["aliases"][can] = set(syns)
-            self._refresh_settings_tables(); self.refresh_control_tables()
-            messagebox.showinfo("Lastet", f"Innlasting OK: {os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("Feil ved innlasting", str(e))
-
-# --------------------------- main ---------------------------
+def main():
+    # Start Tk (DnD root hvis tilgjengelig)
+    if TkinterDnD is not None:
+        root = TkinterDnD.Tk()
+    else:
+        root = tk.Tk()
+    app = A07App(root)
+    root.mainloop()
 
 if __name__ == "__main__":
-    A07App().mainloop()
+    main()

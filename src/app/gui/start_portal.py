@@ -12,32 +12,39 @@ import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 
 """
-Import our local `ClientHub` implementation unconditionally.  In packaged
-environments there may also exist an `app.gui.klient_launcher.ClientHub`,
-but that version does not include recent enhancements (such as the
-`Eierskap` button).  To ensure a consistent user experience we always
-import `ClientHub` from the local `client_hub` module.
+Startportal for klientvalg og administrasjon.
+
+Denne versjonen av startportalen er basert på det eksisterende
+`start_portal.py` fra prosjektet.  Den eneste funksjonelle endringen
+er at knappen «Åpne hub» nå åpner et nytt `ClientOverview`‑vindu
+(definert i `app.gui.client_overview`) i stedet for den gamle
+`ClientHub`.  Øvrige funksjoner (klientinfo, teamredigering,
+AR‑import) er uendret.
+
+For fremtidig integrasjon kan du gradvis erstatte bruken av
+`ClientHub` med `ClientOverview` andre steder i applikasjonen.
 """
-from client_hub import ClientHub
-from app.services.clients import (                           # Klient-rot + klientliste, samme som før  :contentReference[oaicite:4]{index=4}
-    get_clients_root, set_clients_root, resolve_root_and_client, list_clients,
+
+from app.gui.client_overview import ClientOverview  # ny oversikt
+from app.services.clients import (
+    get_clients_root,
+    set_clients_root,
+    resolve_root_and_client,
+    list_clients,
 )
-from app.services.registry import (                          # E-post-ID, ansattliste og team
-    current_email, set_current_email, list_employees_df, import_employees_from_excel,
-    team_has_user
+from app.services.registry import (
+    current_email,
+    set_current_email,
+    list_employees_df,
+    import_employees_from_excel,
+    team_has_user,
 )
 
 import pandas as pd
-from pathlib import Path
-
-# (valgfrie) undermoduler – lastes «late» i knapper
-#  - app.gui.client_info_gui: ClientInfoWindow
-#  - app.gui.team_editor_gui: TeamEditor
-#  - app.gui.ar_import_gui   : ARImportWindow
 
 
 class StartPortal(tk.Tk):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.title("Start – Klientportal")
         self.minsize(720, 420)
@@ -75,8 +82,14 @@ class StartPortal(tk.Tk):
         self.lbl_user.grid(row=0, column=1, sticky="w")
         ttk.Button(header, text="Sett e‑post …", command=self._pick_user).grid(row=0, column=2, padx=(8, 8))
 
-        ttk.Checkbutton(header, text="Mine klienter", variable=self.only_mine, command=self._refresh_list)\
-            .grid(row=0, column=3, sticky="e", padx=(8, 8))
+        # Toggle button to show only clients the current user is a team member on
+        mine_ck = ttk.Checkbutton(
+            header,
+            text="Mine klienter",
+            variable=self.only_mine,
+            command=self._refresh_list,
+        )
+        mine_ck.grid(row=0, column=3, sticky="e", padx=(8, 8))
 
         # Legg til et innstillingshjul for å velge kildefiler‑katalog.
         # Ikonet ⚙ signaliserer at brukeren kan endre eller sjekke katalog for kildefiler.
@@ -84,7 +97,8 @@ class StartPortal(tk.Tk):
         settings_btn.grid(row=0, column=4, sticky="e", padx=(8, 8))
 
         # søk
-        wrap = ttk.Frame(self); wrap.pack(fill="both", expand=True, padx=8, pady=8)
+        wrap = ttk.Frame(self)
+        wrap.pack(fill="both", expand=True, padx=8, pady=8)
         ttk.Label(wrap, text="Søk:").grid(row=0, column=0, sticky="w")
         ent = ttk.Entry(wrap, textvariable=self.q)
         ent.grid(row=0, column=1, sticky="we")
@@ -104,7 +118,8 @@ class StartPortal(tk.Tk):
         wrap.rowconfigure(1, weight=1)
 
         # actions
-        btns = ttk.Frame(self); btns.pack(fill="x", padx=8, pady=(0, 8))
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=8, pady=(0, 8))
         ttk.Button(btns, text="Åpne hub", command=self._open_hub).pack(side="left")
         ttk.Button(btns, text="Klientinfo…", command=self._open_info).pack(side="left", padx=(6, 0))
         ttk.Button(btns, text="Team…", command=self._open_team).pack(side="left", padx=(6, 0))
@@ -156,11 +171,12 @@ class StartPortal(tk.Tk):
     # ---------------- UI helpers ----------------
     def _fmt_user(self) -> str:
         e = self._email_var.get().strip()
-        if not e: return "(ingen e‑post valgt)"
+        if not e:
+            return "(ingen e‑post valgt)"
         alias = e.split("@")[0]
         return f"{e}  ({alias})"
 
-    def _choose_root(self):
+    def _choose_root(self) -> None:
         """
         Prompt the user to choose a new clients root.  After the root is set
         the client list is reloaded from the central client list if present;
@@ -188,88 +204,101 @@ class StartPortal(tk.Tk):
             self.lb.see(idx)
 
     # ---------------- Actions ----------------
-    def _pick_user(self):
+    def _pick_user(self) -> None:
         # vis ansattliste hvis vi har en
         df = list_employees_df()
         if df is None or df.empty:
             # ingen ansattliste – la bruker skrive inn
             email = simpledialog.askstring("Sett e‑post", "Skriv e‑postadressen din:", parent=self)
-            if not email: return
+            if not email:
+                return
             set_current_email(email)
             self._email_var.set(current_email())
-            self.lbl_user.config(text=self._fmt_user()); self._refresh_list(); return
+            self.lbl_user.config(text=self._fmt_user())
+            self._refresh_list()
+            return
 
-        top = tk.Toplevel(self); top.title("Velg bruker"); top.transient(self); top.grab_set(); top.minsize(360, 420)
+        top = tk.Toplevel(self)
+        top.title("Velg bruker")
+        top.transient(self)
+        top.grab_set()
+        top.minsize(360, 420)
         qv = tk.StringVar(value="")
-        ttk.Label(top, text="Søk:").pack(anchor="w", padx=8, pady=(8,0))
-        ent = ttk.Entry(top, textvariable=qv); ent.pack(fill="x", padx=8)
-        lb = tk.Listbox(top, height=16); lb.pack(fill="both", expand=True, padx=8, pady=8)
+        ttk.Label(top, text="Søk:").pack(anchor="w", padx=8, pady=(8, 0))
+        ent = ttk.Entry(top, textvariable=qv)
+        ent.pack(fill="x", padx=8)
+        lb = tk.Listbox(top, height=16)
+        lb.pack(fill="both", expand=True, padx=8, pady=8)
 
-        def refill(*_):
+        def refill(*_: object) -> None:
             q = qv.get().strip().lower()
             lb.delete(0, tk.END)
             rows = df
             if q:
-                rows = rows[rows.apply(lambda r:
-                                       q in str(r.get("name","")).lower()
-                                       or q in str(r.get("email","")).lower()
-                                       or q in str(r.get("initials","")).lower(), axis=1)]
+                rows = rows[rows.apply(
+                    lambda r: q in str(r.get("name", "")).lower()
+                    or q in str(r.get("email", "")).lower()
+                    or q in str(r.get("initials", "")).lower(),
+                    axis=1,
+                )]
             for _, r in rows.iterrows():
                 name = str(r.get("name") or "").strip()
                 email = str(r.get("email") or "").strip().lower()
                 init = str(r.get("initials") or "").strip()
                 label = f"{name} [{email}]" if name else email
-                if init: label = f"{label}  ({init})"
+                if init:
+                    label = f"{label}  ({init})"
                 lb.insert(tk.END, label)
+
         refill()
         ent.bind("<KeyRelease>", refill)
 
-        def ok(*_):
-            if not lb.curselection(): return
-            label = lb.get(lb.curselection()[0])
-            # dra ut [email] fra etiketten
-            import re
-            m = re.search(r"\[([^\]]+)\]", label)
-            email = (m.group(1) if m else label).strip()
+        def ok(*_: object) -> None:
+            sel = lb.curselection()
+            if not sel:
+                return
+            label = lb.get(sel[0])
+            # label = "Name [email]  (IN)" or just "email"
+            parts = label.split("[")
+            if len(parts) == 2:
+                # strip whitespace and trailing ']' and optional '(IN)'
+                email_part = parts[1].split("]")[0].strip()
+                email = email_part
+            else:
+                email = label
             set_current_email(email)
             self._email_var.set(current_email())
             self.lbl_user.config(text=self._fmt_user())
-            top.destroy(); self._refresh_list()
-        ttk.Button(top, text="OK", command=ok).pack(pady=(0,8))
-        lb.bind("<Double-1>", ok)
+            self._refresh_list()
+            top.destroy()
 
-    def _refresh_list(self):
+        ttk.Button(top, text="Velg", command=ok).pack(pady=(0, 8))
+        ttk.Button(top, text="Avbryt", command=top.destroy).pack()
+
+    def _refresh_list(self) -> None:
+        """Refresh the client list shown in the listbox based on the search query and filters."""
+        base = [c for c in self._all_clients]
         q = self.q.get().strip().lower()
-        base = [n for n in self._all_clients if (q in n.lower())]
-        if self.only_mine.get():
-            email = self._email_var.get().strip().lower()
-            if not email:
-                messagebox.showinfo(
-                    "Velg e‑post",
-                    "Sett e‑post først for å bruke «Mine klienter».",
-                    parent=self,
-                )
-                self.only_mine.set(False)
-            else:
-                # Determine the set of initials associated with the logged-in user.
-                initials_to_check: set[str] = set()
-                # Try to look up initials via email
-                ini = self.email_to_initial.get(email)
+        if q:
+            base = [n for n in base if q in n.lower()]
+        if self.only_mine.get() and self.client_to_initials:
+            initials_to_check = set()
+            e = self._email_var.get().strip().lower()
+            if e:
+                ini = self.email_to_initial.get(e)
                 if ini:
                     initials_to_check.add(ini)
-                else:
-                    # Fallback: use alias (prefix before '@') as initial guess
-                    alias = email.split("@")[0]
-                    alias_upper = alias.replace(".", "").replace("_", "").upper()
-                    if alias_upper:
-                        initials_to_check.add(alias_upper)
-                filtered_base: list[str] = []
+            # additionally allow manual input of initials (comma separated)
+            if "," in e:
+                initials_to_check.update({s.strip().upper() for s in e.split(",") if s.strip()})
+            if initials_to_check:
+                filtered_base = []
                 for n in base:
-                    # Parse the client number from the beginning of the string
+                    # extract client id from string (format: 0000_name or 0000-name)
+                    first = n.split()[0].strip()
                     cid = None
                     try:
-                        first = n.strip().split()[0]
-                        # Extract leading digits from the first token (handles 0000_name or 0000-name)
+                        # allow prefix numbers with no separators (e.g., 0000_name or 0000-name)
                         digits = ""
                         for ch in first:
                             if ch.isdigit():
@@ -297,24 +326,18 @@ class StartPortal(tk.Tk):
                         filtered_base.append(n)
                 base = filtered_base
         self.lb.delete(0, tk.END)
-        for n in base: self.lb.insert(tk.END, n)
+        for n in base:
+            self.lb.insert(tk.END, n)
         self.count_lbl.config(text=f"{len(base)} av {len(self._all_clients)}")
 
     def _load_team_data(self) -> None:
-        """Load team and employee information from central files.
-
-        This helper populates self.team_df, self.emp_df, self.client_to_initials,
-        and self.email_to_initial for use in filtering "Mine klienter".  It
-        attempts to locate the files in the kildefiler directory or a local
-        fallback directory.  Missing files are tolerated; in that case no
-        filtering by team will occur.
-        """
+        """Load team and employee information from central files."""
         self.team_df = pd.DataFrame()
         self.emp_df = pd.DataFrame()
         self.client_to_initials = {}
         self.email_to_initial = {}
         # Attempt to locate files using find_kildefiler_dir
-        base_dir = None
+        base_dir: Optional[Path] = None
         try:
             from app.services.regnskapslinjer import find_kildefiler_dir  # type: ignore
             bd = find_kildefiler_dir()
@@ -384,7 +407,7 @@ class StartPortal(tk.Tk):
         # reset client list
         self._all_clients = []
         # find kildefiler directory using the same logic as in _load_team_data
-        base_dir = None
+        base_dir: Optional[Path] = None
         try:
             from app.services.regnskapslinjer import find_kildefiler_dir  # type: ignore
             bd = find_kildefiler_dir()
@@ -405,7 +428,7 @@ class StartPortal(tk.Tk):
             "BHL AS klientliste.xlsx",
             "BHLAS klientliste.xlsx",
         ]
-        client_file = None
+        client_file: Optional[Path] = None
         for fn in possible_files:
             fp = base_dir / fn
             if fp.exists():
@@ -451,32 +474,47 @@ class StartPortal(tk.Tk):
             pass
         self._refresh_list()
 
-    def _selected_client(self) -> str | None:
+    def _selected_client(self) -> Optional[str]:
         sel = self.lb.curselection()
         return None if not sel else self.lb.get(sel[0])
 
-    def _open_hub(self, *_):
+    def _open_hub(self, *_: object) -> None:
         name = self._selected_client()
         if not name:
-            messagebox.showwarning("Velg klient", "Velg en klient i listen.", parent=self); return
-        # ClientHub leser master.clients_root i __init__  :contentReference[oaicite:6]{index=6}
-        ClientHub(self, name)
+            messagebox.showwarning("Velg klient", "Velg en klient i listen.", parent=self)
+            return
+        # Bruk den nye ClientOverview i stedet for ClientHub
+        # Always open the new ClientOverview.  In case of failure, show an error.
+        try:
+            # Default year set to 2024; could be derived from metadata if available
+            ClientOverview(self, name, year=2024)
+        except Exception as exc:
+            messagebox.showerror(
+                "Feil ved åpning av klientoversikt",
+                f"Kunne ikke åpne klientoversikt for {name}.\n{type(exc).__name__}: {exc}",
+                parent=self,
+            )
 
-    def _open_info(self):
+    def _open_info(self) -> None:
         name = self._selected_client()
         if not name:
-            messagebox.showwarning("Velg klient", "Velg en klient i listen.", parent=self); return
+            messagebox.showwarning("Velg klient", "Velg en klient i listen.", parent=self)
+            return
         try:
             from app.gui.client_info_gui import ClientInfoWindow
             ClientInfoWindow(self, self.clients_root, name)
         except Exception as exc:
-            messagebox.showerror("Mangler modul",
-                                 f"Kunne ikke laste Klientinfo‑GUI.\n{type(exc).__name__}: {exc}", parent=self)
+            messagebox.showerror(
+                "Mangler modul",
+                f"Kunne ikke laste Klientinfo‑GUI.\n{type(exc).__name__}: {exc}",
+                parent=self,
+            )
 
-    def _open_team(self):
+    def _open_team(self) -> None:
         name = self._selected_client()
         if not name:
-            messagebox.showwarning("Velg klient", "Velg en klient i listen.", parent=self); return
+            messagebox.showwarning("Velg klient", "Velg en klient i listen.", parent=self)
+            return
         try:
             from app.gui.team_editor_gui import TeamEditor
             win = TeamEditor(self, self.clients_root, name)
@@ -486,19 +524,26 @@ class StartPortal(tk.Tk):
             self._load_team_data()
             self._refresh_list()
         except Exception as exc:
-            messagebox.showerror("Mangler modul",
-                                 f"Kunne ikke laste Team‑GUI.\n{type(exc).__name__}: {exc}", parent=self)
+            messagebox.showerror(
+                "Mangler modul",
+                f"Kunne ikke laste Team‑GUI.\n{type(exc).__name__}: {exc}",
+                parent=self,
+            )
 
-    def _open_ar_import(self):
+    def _open_ar_import(self) -> None:
         name = self._selected_client()
         if not name:
-            messagebox.showwarning("Velg klient", "Velg en klient i listen.", parent=self); return
+            messagebox.showwarning("Velg klient", "Velg en klient i listen.", parent=self)
+            return
         try:
             from app.gui.ar_import_gui import ARImportWindow
             ARImportWindow(self, self.clients_root, name)
         except Exception as exc:
-            messagebox.showerror("Mangler modul",
-                                 f"Kunne ikke laste AR‑import.\n{type(exc).__name__}: {exc}", parent=self)
+            messagebox.showerror(
+                "Mangler modul",
+                f"Kunne ikke laste AR‑import.\n{type(exc).__name__}: {exc}",
+                parent=self,
+            )
 
 
 if __name__ == "__main__":

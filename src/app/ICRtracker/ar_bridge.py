@@ -1,160 +1,255 @@
 # -*- coding: utf-8 -*-
 """
 ar_bridge.py
-----------------
-Bro mot den eksisterende aksjonærregister-implementasjonen (DuckDB) i
-`app.aksjonærregister.db`. Denne filen oversetter dataene til samme
-feltnavn/format som ICR-tracker/matcher forventer, slik at resten av
-koden kan være uendret.
+-------------
+Robust bro mot aksjonærregister-modulen i prosjektet.
 
-Forventet prosjektstruktur:
-  src/
-    app/
-      __init__.py
-      aksjonærregister/        <-- legg merke til 'æ'
-        __init__.py
-        db.py                  <-- har open_conn, search_companies, get_owners_full, get_children_agg_company
-      ICRtracker/
-        ar_bridge.py (denne fila)
+Gir et stabilt API uansett om modulen heter:
+  - app.aksjonærregister (med 'æ'), eller
+  - app.aksjonaerregister (ascii-fallback)
+
+Og uansett om den eksporterer:
+  - get_owners_full / get_owners
+  - companies_owned_by / get_children_agg_company / get_children_for_company
+  - open_conn(db_path?) / open_conn()
+
+Offentlig API i denne filen:
+  - open_db(db_path: Optional[pathlib.Path]) -> "conn"
+  - get_owners(conn, orgnr: str) -> List[Dict]
+  - companies_owned_by(conn, orgnr: str) -> List[Dict]
+  - normalize_orgnr(s: str) -> str
 """
 
 from __future__ import annotations
 
+import sys
 import re
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-# ---- Importer AR-modulen (med korrekt mappenavn 'aksjonærregister').
-#      Vi beholder en fallback til 'aksjonaerregister' hvis noen maskiner har ascii-navn. ----
-try:
-    from app.aksjonærregister.db import (  # type: ignore
-        open_conn as _open_conn,
-        search_companies as _search_companies,
-        get_owners_full as _get_owners_full,
-        get_children_agg_company as _get_children_agg_company,
-    )
-except Exception:
-    # Fallback til ascii-mappe ('aksjonaerregister') dersom det navnet brukes i repoet på en annen maskin
-    from app.aksjonaerregister.db import (  # type: ignore
-        open_conn as _open_conn,
-        search_companies as _search_companies,
-        get_owners_full as _get_owners_full,
-        get_children_agg_company as _get_children_agg_company,
-    )
+# ---- Finn <prosjektrot>/src slik at "app" kan importeres når filen kjøres isolert ----
+if __name__ == "__main__" and __package__ is None:
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        if (parent / "app" / "__init__.py").exists():
+            sys.path.insert(0, str(parent))
+            break
 
-
-# ------------------------- Normalisering -------------------------
-
-def normalize_orgnr(val) -> str:
-    """Til kun sifre (fjerner NO-, mellomrom, tegn osv.)."""
-    if val is None:
-        return ""
-    return re.sub(r"\D+", "", str(val))
-
-
-def normalize_name(val) -> str:
-    """Trim + kollaps mellomrom."""
-    if val is None:
-        return ""
-    return " ".join(str(val).strip().split())
-
-
-# ------------------------- DB-tilkobling -------------------------
-
-def open_db(_db_path_ignored=None):
-    """
-    Signaturkompatibel med registry_db.open_db, men bruker AR-modulens open_conn.
-    _db_path_ignored: beholdes kun for kompatibilitet; stien styres av AR-modulens settings.
-    """
-    return _open_conn()
-
-
-# --------------------------- Oppslag ----------------------------
-
-def search_name_candidates(conn, name: str, limit: int = 50) -> List[Tuple[str, str]]:
-    """
-    Navnesøk mot AR: returner [(navn, orgnr)] for kandidater.
-    Bruker eksisterende search_companies(by='navn'), som returnerer [(company_orgnr, company_name)].
-    """
-    term = normalize_name(name)
-    if not term:
-        return []
-    rows = _search_companies(conn, term, by="navn", limit=limit)
-    # oversett til [(navn, orgnr)]
-    out: List[Tuple[str, str]] = []
-    for r in rows:
-        org = str(r[0]) if r and len(r) > 0 and r[0] is not None else ""
-        nam = str(r[1]) if r and len(r) > 1 and r[1] is not None else ""
-        if org and nam:
-            out.append((nam, org))
-    return out
-
-
-def get_company_name(conn, orgnr: str) -> Optional[str]:
-    """
-    Hent selskapsnavn for orgnr fra shareholders-tabellen (første treff).
-    """
+# ---- Importer aksjonærregister-modul – både æ/ae-varianter støttes ----
+_ar_mod = None
+_ar_err: Optional[BaseException] = None
+for dotted in ("app.aksjonærregister.db", "app.aksjonaerregister.db", "app.aksjonærregister", "app.aksjonaerregister"):
     try:
-        row = conn.execute(
-            "SELECT company_name FROM shareholders WHERE company_orgnr=? LIMIT 1",
-            [normalize_orgnr(orgnr)],
-        ).fetchone()
-        if row is None:
+        _ar_mod = __import__(dotted, fromlist=["*"])
+        break
+    except Exception as e:
+        _ar_err = e
+        _ar_mod = None
+
+if _ar_mod is None:
+    # Vi lar import-feilen boble først når noen kaller open_db/get_owners/companies_owned_by
+    pass
+
+
+# ----------------------------- Hjelpefunksjoner -----------------------------
+
+def normalize_orgnr(s: Any) -> str:
+    """Behold kun siffer (eller 4-sifret år/person-ID når det er det som brukes)."""
+    if s is None:
+        return ""
+    return re.sub(r"\D+", "", str(s))
+
+
+def _ensure_ar_loaded():
+    if _ar_mod is None:
+        raise RuntimeError(
+            "Fant ikke aksjonærregister-modulen. "
+            "Sjekk at 'src/app/aksjonærregister' (eller 'aksjonaerregister') finnes og kan importeres. "
+            f"Original importfeil: {_ar_err!r}"
+        )
+
+
+def _as_float(x: Any) -> Optional[float]:
+    try:
+        if x is None or x == "":
             return None
-        # DuckDB kan returnere tuple/Row – støtt begge
-        return row[0] if not isinstance(row, dict) else row.get("company_name")
+        return float(x)
     except Exception:
         return None
 
 
-def get_owners(conn, company_orgnr: str) -> List[Dict[str, object]]:
-    """
-    Eiere av gitt selskap – tilpasset til feltnavn ICR-tracker/matcher forventer.
-    Bruker get_owners_full(...) fra AR-modulen.
-
-    Forventet rekkefølge fra AR (se db.py):
-      owner_orgnr, owner_name, share_class, owner_country, owner_zip_place,
-      shares_owner_num, shares_company_num, ownership_pct
-    """
-    rows = _get_owners_full(conn, normalize_orgnr(company_orgnr))
-    out: List[Dict[str, object]] = []
-    for r in rows:
-        owner_orgnr  = str(r[0]) if r and len(r) > 0 and r[0] is not None else ""
-        owner_name   = r[1] if r and len(r) > 1 and r[1] is not None else ""
-        shares_owner = r[5] if r and len(r) > 5 else None
-        pct          = r[7] if r and len(r) > 7 else None
-        sh_type      = "company" if owner_orgnr else "person"
-        out.append({
-            "company_orgnr":       normalize_orgnr(company_orgnr),
-            "shareholder_orgnr":   normalize_orgnr(owner_orgnr),
-            "shareholder_name":    normalize_name(owner_name),
-            "shareholder_type":    sh_type,
-            "stake_percent":       pct,
-            "shares":              shares_owner,
-        })
-    return out
+def _as_int(x: Any) -> Optional[int]:
+    try:
+        if x is None or x == "":
+            return None
+        return int(x)
+    except Exception:
+        return None
 
 
-def companies_owned_by(conn, shareholder_orgnr: str) -> List[Dict[str, object]]:
+# ----------------------------- Offentlig API -----------------------------
+
+def open_db(db_path: Optional[Path] = None):
     """
-    Selskaper som eies (helt/delvis) av gitt orgnr – felter matcher matcher.py/tracker.py:
+    Åpner en tilkobling til aksjonærregisteret via modulens 'open_conn'.
+    Støtter både signatur uten og med sti-parameter.
+    Returnerer et "conn"-objekt (duckdb-tilkobling el.l.).
+    """
+    _ensure_ar_loaded()
+
+    # flertydig API: noen varianter eksporterer underpakke "db" (med open_conn), noen på toppnivå
+    ar = _ar_mod
+    if hasattr(_ar_mod, "db"):
+        ar = _ar_mod.db  # type: ignore[attr-defined]
+
+    if not hasattr(ar, "open_conn"):
+        raise RuntimeError("Aksjonærregister-modulen mangler funksjonen 'open_conn'.")
+
+    open_conn = getattr(ar, "open_conn")
+    try:
+        # prøv med path-parameter
+        return open_conn(db_path)
+    except TypeError:
+        # prøv uten path-parameter
+        return open_conn()
+
+
+def get_owners(conn, company_orgnr: str) -> List[Dict[str, Any]]:
+    """
+    Henter direkte eiere (aksjonærer) for et gitt selskap.
+    Returnerer liste av dict med normaliserte felt:
+      shareholder_orgnr, shareholder_name, shareholder_type, stake_percent, shares
+    """
+    _ensure_ar_loaded()
+    ar = _ar_mod
+    if hasattr(_ar_mod, "db"):
+        ar = _ar_mod.db  # type: ignore[attr-defined]
+
+    org = normalize_orgnr(company_orgnr)
+
+    rows: List[Dict[str, Any]] = []
+
+    # 1) Prioritér "rike" API-er først
+    if hasattr(ar, "get_owners_full"):
+        raw = ar.get_owners_full(conn, org)
+        for r in raw:
+            rows.append({
+                "shareholder_orgnr": normalize_orgnr(r.get("owner_orgnr") or r.get("shareholder_orgnr") or r.get("orgnr") or ""),
+                "shareholder_name": r.get("owner_name") or r.get("shareholder_name") or r.get("name") or "",
+                "shareholder_type": r.get("owner_type") or r.get("shareholder_type") or r.get("type") or "",
+                "stake_percent": _as_float(r.get("stake_percent") or r.get("percent") or r.get("ownership_pct")),
+                "shares": _as_int(r.get("shares") or r.get("share_count")),
+            })
+        return rows
+
+    # 2) Vanlig "get_owners"
+    if hasattr(ar, "get_owners"):
+        raw = ar.get_owners(conn, org)
+        for r in raw:
+            rows.append({
+                "shareholder_orgnr": normalize_orgnr(r.get("owner_orgnr") or r.get("shareholder_orgnr") or r.get("orgnr") or ""),
+                "shareholder_name": r.get("owner_name") or r.get("shareholder_name") or r.get("name") or "",
+                "shareholder_type": r.get("owner_type") or r.get("shareholder_type") or r.get("type") or "",
+                "stake_percent": _as_float(r.get("stake_percent") or r.get("percent") or r.get("ownership_pct")),
+                "shares": _as_int(r.get("shares") or r.get("share_count")),
+            })
+        return rows
+
+    # 3) Fallback: prøv generisk SQL (tabellnavn kan variere; dette er kun nødløsning)
+    try:
+        # Eksempelnavn: holdings / shareholders
+        q = """
+        SELECT
+          COALESCE(owner_orgnr, shareholder_orgnr, '') AS owner_id,
+          COALESCE(owner_name, shareholder_name, name, '') AS owner_name,
+          COALESCE(owner_type, shareholder_type, type, '') AS owner_type,
+          COALESCE(stake_percent, percent, ownership_pct, NULL) AS pct,
+          COALESCE(shares, share_count, NULL) AS shares
+        FROM holdings
+        WHERE normalize_orgnr(company_orgnr) = ?
+        """
+        cur = conn.execute(q, [org])  # type: ignore[attr-defined]
+        for owner_id, owner_name, owner_type, pct, shares in cur.fetchall():
+            rows.append({
+                "shareholder_orgnr": normalize_orgnr(owner_id),
+                "shareholder_name": owner_name or "",
+                "shareholder_type": owner_type or "",
+                "stake_percent": _as_float(pct),
+                "shares": _as_int(shares),
+            })
+        return rows
+    except Exception:
+        # siste utvei: tom
+        return []
+
+
+def companies_owned_by(conn, company_orgnr: str) -> List[Dict[str, Any]]:
+    """
+    Henter direkte eide selskaper for et gitt selskap.
+    Returnerer liste av dict med normaliserte felt:
       company_orgnr, company_name, stake_percent, shares
-
-    Bruker get_children_agg_company(...) fra AR-modulen.
-
-    Forventet rekkefølge fra AR (se db.py):
-      company_orgnr, company_name, shares_owner_num, shares_company_num, ownership_pct
     """
-    rows = _get_children_agg_company(conn, normalize_orgnr(shareholder_orgnr))
-    out: List[Dict[str, object]] = []
-    for r in rows:
-        co_org  = str(r[0]) if r and len(r) > 0 and r[0] is not None else ""
-        co_name = r[1] if r and len(r) > 1 and r[1] is not None else ""
-        shares  = r[2] if r and len(r) > 2 else None
-        pct     = r[4] if r and len(r) > 4 else None
-        out.append({
-            "company_orgnr": normalize_orgnr(co_org),
-            "company_name":  normalize_name(co_name),
-            "stake_percent": pct,
-            "shares":        shares,
-        })
-    return out
+    _ensure_ar_loaded()
+    ar = _ar_mod
+    if hasattr(_ar_mod, "db"):
+        ar = _ar_mod.db  # type: ignore[attr-defined]
+
+    org = normalize_orgnr(company_orgnr)
+    rows: List[Dict[str, Any]] = []
+
+    # 1) Prefererte API-er
+    if hasattr(ar, "companies_owned_by"):
+        raw = ar.companies_owned_by(conn, org)
+        for r in raw:
+            rows.append({
+                "company_orgnr": normalize_orgnr(r.get("company_orgnr") or r.get("orgnr") or ""),
+                "company_name": r.get("company_name") or r.get("name") or "",
+                "stake_percent": _as_float(r.get("stake_percent") or r.get("percent") or r.get("ownership_pct")),
+                "shares": _as_int(r.get("shares") or r.get("share_count")),
+            })
+        return rows
+
+    if hasattr(ar, "get_children_agg_company"):
+        raw = ar.get_children_agg_company(conn, org)
+        for r in raw:
+            rows.append({
+                "company_orgnr": normalize_orgnr(r.get("company_orgnr") or r.get("orgnr") or ""),
+                "company_name": r.get("company_name") or r.get("name") or "",
+                "stake_percent": _as_float(r.get("stake_percent") or r.get("percent") or r.get("ownership_pct")),
+                "shares": _as_int(r.get("shares") or r.get("share_count")),
+            })
+        return rows
+
+    if hasattr(ar, "get_children_for_company"):
+        raw = ar.get_children_for_company(conn, org)
+        for r in raw:
+            rows.append({
+                "company_orgnr": normalize_orgnr(r.get("company_orgnr") or r.get("orgnr") or ""),
+                "company_name": r.get("company_name") or r.get("name") or "",
+                "stake_percent": _as_float(r.get("stake_percent") or r.get("percent") or r.get("ownership_pct")),
+                "shares": _as_int(r.get("shares") or r.get("share_count")),
+            })
+        return rows
+
+    # 2) Fallback SQL (best-effort)
+    try:
+        q = """
+        SELECT
+          COALESCE(child_orgnr, company_orgnr, orgnr, '') AS c_org,
+          COALESCE(child_name, company_name, name, '') AS c_name,
+          COALESCE(stake_percent, percent, ownership_pct, NULL) AS pct,
+          COALESCE(shares, share_count, NULL) AS shares
+        FROM holdings
+        WHERE normalize_orgnr(owner_orgnr) = ?
+        """
+        cur = conn.execute(q, [org])  # type: ignore[attr-defined]
+        for c_org, c_name, pct, shares in cur.fetchall():
+            rows.append({
+                "company_orgnr": normalize_orgnr(c_org),
+                "company_name": c_name or "",
+                "stake_percent": _as_float(pct),
+                "shares": _as_int(shares),
+            })
+        return rows
+    except Exception:
+        return []

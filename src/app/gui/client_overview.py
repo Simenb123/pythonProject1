@@ -16,8 +16,9 @@ the details of source file management.  The `KildefilerView` (see
 ``Kildefiler`` button, while the other areas can be implemented
 later.
 
-Usage:
-    from client_overview import ClientOverview
+Usage::
+
+    from app.gui.client_overview import ClientOverview
     root = tk.Tk(); ClientOverview(root, client_name="9762 Vitamail AS").mainloop()
 
 This file does not make any assumptions about the surrounding
@@ -29,13 +30,13 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk
-from typing import Dict, Callable
+from typing import Dict
 
 try:
-    # VersionsPanel will be used in the Kildefiler view
-    from app.gui.widgets.versions_panel import VersionsPanel  # type: ignore
+    # Import KildefilerView lazily to avoid circular dependencies
+    from .kildefiler_view import KildefilerView  # type: ignore
 except Exception:
-    VersionsPanel = None  # type: ignore
+    KildefilerView = None  # type: ignore
 
 
 class ClientOverview(tk.Toplevel):
@@ -58,7 +59,7 @@ class ClientOverview(tk.Toplevel):
         self.client_name = client_name
         self.year_var = tk.IntVar(value=year)
 
-        # Containers
+        # Root container
         root_frame = ttk.Frame(self, padding=10)
         root_frame.grid(row=0, column=0, sticky="nsew")
         root_frame.columnconfigure(1, weight=1)
@@ -156,10 +157,8 @@ class ClientOverview(tk.Toplevel):
         # Create view on first use
         if self._views.get(label) is None:
             if label == "Kildefiler":
-                try:
-                    from kildefiler_view import KildefilerView  # type: ignore
-                except Exception:
-                    # If import fails, show placeholder
+                # Attempt to import KildefilerView from our package
+                if KildefilerView is None:
                     fv = ttk.Frame(self._content_frame)
                     ttk.Label(fv, text="Kildefiler-modulen ikke tilgjengelig.").pack(pady=20)
                 else:
@@ -185,7 +184,6 @@ class ClientOverview(tk.Toplevel):
 
 if __name__ == "__main__":
     # Simple test harness for interactive development
-    import sys
     root = tk.Tk()
     root.withdraw()  # hide root window
     co = ClientOverview(root, client_name="1234 Eksempel AS", year=2024)
