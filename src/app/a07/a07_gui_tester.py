@@ -163,7 +163,6 @@ class AssignmentBoard(A07Board):
         except Exception:
             pass
 
-
 # ---------- Regelbok / fallback / LP ----------
 try:
     from a07_rulebook import load_rulebook, suggest_with_rulebook
@@ -890,7 +889,11 @@ class A07App(BaseTk):
         self.gl_accounts = rows; self.gl_meta = meta
         self.acc_to_codess.clear(); self.auto_suggestions.clear()
         self.use_lp_assignment = False; self.lp_assignment.clear(); self.lp_fixed.clear(); self.lp_amounts.clear()
-        self.ctrl_status.configure(text=f"Saldobalanse: {len(rows)} konti.  Kolonner: IB={'ja' if meta.get('ib') else 'nei'}, D={'ja' if meta.get('debet') else 'nei'}, K={'ja' if meta.get('kredit') else 'nei'}, Endr={'ja' if meta.get('endring') else 'nei'}, UB={'ja' if meta.get('ub') else 'nei'}  • Enc: {meta.get('encoding')} • Sep: '{meta.get('delimiter')}'")
+        self.ctrl_status.configure(text=(
+            f"Saldobalanse: {len(rows)} konti.  Kolonner: IB={'ja' if meta.get('ib') else 'nei'}, "
+            f"D={'ja' if meta.get('debet') else 'nei'}, K={'ja' if meta.get('kredit') else 'nei'}, "
+            f"Endr={'ja' if meta.get('endring') else 'nei'}, UB={'ja' if meta.get('ub') else 'nei'}  • Enc: {meta.get('encoding')} • Sep: '{meta.get('delimiter')}'"
+        ))
         self.refresh_control_tables()
 
     def on_auto_map(self):
@@ -1010,10 +1013,10 @@ class A07App(BaseTk):
         for code, target in unmapped_codes:
             # Let etter en umappet konto som matcher beløpet innenfor toleranse
             matched = False
-        for acc in self.gl_accounts:
-            accno = acc["konto"]
-            if accno in self.acc_to_codess:
-                continue
+            for acc in self.gl_accounts:
+                accno = acc["konto"]
+                if accno in self.acc_to_codess:
+                    continue
                 try:
                     amt, _lbl = self._gl_amount(acc)
                 except Exception:
@@ -1032,7 +1035,7 @@ class A07App(BaseTk):
                 remaining: List[Tuple[str, float]] = []
                 for acc2 in self.gl_accounts:
                     accno2 = acc2["konto"]
-                    if accno2 in self.acc_to_codes:
+                    if accno2 in self.acc_to_codess:
                         continue
                     try:
                         amt2, _lbl2 = self._gl_amount(acc2)
@@ -1228,14 +1231,6 @@ class A07App(BaseTk):
         except Exception:
             pass
 
-
-def _get_first_code(self, accno: str) -> str:
-    """Returner første valgte kode for kontoen (hvis listen brukes), ellers tom streng."""
-    v = self.acc_to_codes.get(accno)
-    if isinstance(v, (list, tuple)):
-        return v[0] if v else ""
-    return v or ""
-
     def _refresh_gl_detail_panel(self, accno: str):
         self._detail_accno = accno
         acc = None
@@ -1364,7 +1359,7 @@ def _get_first_code(self, accno: str) -> str:
             rowsB = [r for r in rowsB if abs(float(r["diff"])) > thr]
         rowsB.sort(key=lambda r: -abs(float(r["diff"]))); self.tbl_ctrl_codes.insert_rows(rowsB)
         self.lab_a07.configure(text=f"A07: {fmt_amount(total_a07)}"); self.lab_gl.configure(text=f"GL (mappet): {fmt_amount(total_gl)}"); self.lab_diff.configure(text=f"Diff: {fmt_amount(total_a07-total_gl)}")
-        unmapped = [acc for acc in self.gl_accounts if acc["konto"] not in self.acc_to_codes]
+        unmapped = [acc for acc in self.gl_accounts if acc["konto"] not in self.acc_to_codess]
         self.lab_unmapped.configure(text=f"Uten mapping: {len([a for a in unmapped if not(self.hide_zero.get() and abs(self._gl_amount(a)[0])<1e-9)])}")
         self.lab_code_gap.configure(text=f"Koder uten GL: {len([c for c in a07 if gl_per_code.get(c,0.0)==0.0])}")
 
@@ -1390,7 +1385,7 @@ def _get_first_code(self, accno: str) -> str:
                         mapping_for_board[accno] = codes
                 self.board.supply_data(
                     accounts=accounts_for_board,
-                    acc_to_codes=mapping_for_board,
+                    acc_to_code=mapping_for_board,
                     suggestions=self.auto_suggestions,
                     a07_sums=a07,
                     diff_threshold=float(self.diff_threshold.get()),
@@ -1429,7 +1424,7 @@ def _get_first_code(self, accno: str) -> str:
                     gl_data.append({"konto": acc["konto"], "navn": acc.get("navn",""), "belop": amt, "basis": f"{lbl}·LP"})
         else:
             for acc in self.gl_accounts:
-                if kode in (self.acc_to_codes.get(acc["konto"], []) if isinstance(self.acc_to_codes.get(acc["konto"]), (list, tuple, set)) else [self.acc_to_codes.get(acc["konto"])]) :
+                if kode in (self.acc_to_codess.get(acc["konto"], []) if isinstance(self.acc_to_codess.get(acc["konto"]), (list, tuple)) else [self.acc_to_codess.get(acc["konto"])]):
                     amt,lbl = self._gl_amount(acc)
                     gl_data.append({"konto": acc["konto"], "navn": acc.get("navn",""), "belop": amt, "basis": lbl})
         win = tk.Toplevel(self); win.title(f"Drilldown — {kode}"); win.geometry("1000x560")
